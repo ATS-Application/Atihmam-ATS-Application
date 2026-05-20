@@ -84,9 +84,9 @@ export default function StatusTransitionModal({ candidate, onClose }) {
             />
 
             <div className="flex gap-3 justify-end">
-              <button className="btn-secondary" onClick={onClose}>Annuler</button>
+              <button className="btn-secondary rounded-full text-xs w-30" onClick={onClose}>Annuler</button>
               <button
-                className="btn-primary"
+                className="btn-primary rounded-full text-xs w-30 h-10"
                 onClick={handleSubmit}
                 disabled={!selected || isPending}
               >

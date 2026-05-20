@@ -7,6 +7,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # 👈 This prevents extra variables from crashing your app!
     )
 
     # Supabase
@@ -27,7 +28,6 @@ class Settings(BaseSettings):
     drive_folder_id: str = ""
     webhook_base_url: str = "http://localhost:8000"
 
-   #Replaced Redis with Valkey for better performance and reliability
     # Valkey / Celery
     valkey_url: str = "valkey://localhost:6379/0"
 

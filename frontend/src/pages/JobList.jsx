@@ -30,11 +30,11 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
         onChange={(e) => setRequirements(e.target.value)}
       />
       <div className="flex gap-2 justify-end">
-        <button className="btn-secondary" onClick={onCancel}>
+        <button className="btn-secondary rounded-full text-sm w-30 h-10" onClick={onCancel}>
           <X size={15} /> Annuler
         </button>
         <button
-          className="btn-primary"
+          className="btn-primary rounded-full text-sm w-30 h-10"
           disabled={!title || isPending}
           onClick={() => onSubmit({ title, description, requirements })}
         >
@@ -62,7 +62,7 @@ export default function JobList() {
           <h1 className="text-2xl font-bold text-gray-900">Postes</h1>
           <p className="text-gray-500 text-sm mt-1">{jobs.length} poste(s) actif(s)</p>
         </div>
-        <button className="btn-primary" onClick={() => setShowCreate(true)}>
+        <button className="btn-primary rounded-full text-xs w-30 h-10" onClick={() => setShowCreate(true)}>
           <Plus size={16} /> Nouveau poste
         </button>
       </div>
@@ -110,7 +110,7 @@ export default function JobList() {
                       </p>
                     )}
                   </div>
-                  <div className="flex gap-1 ml-4 flex-shrink-0">
+                  <div className="flex gap-1 ml-4 shrink-0">
                     <button
                       onClick={() => setEditingId(job.id)}
                       className="p-1.5 text-gray-400 hover:text-primary-600 hover:bg-primary-50 rounded transition-colors"

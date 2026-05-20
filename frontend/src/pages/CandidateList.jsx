@@ -52,15 +52,15 @@ export default function CandidateList() {
         </div>
         <div className="flex gap-2">
           <button
-            className="btn-secondary"
+            className="btn-primary w-75 rounded-full text-xs"
             onClick={() => syncDrive()}
             disabled={isSyncing}
           >
             <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
             {isSyncing ? "Sync..." : "Sync Drive"}
           </button>
-          <button className="btn-primary" onClick={() => setShowUpload(true)}>
-            <Upload size={16} />
+          <button className="btn-secondary rounded-full text-xs" onClick={() => setShowUpload(true)}>
+            <Upload size={14} className="w-75" />
             Uploader un CV
           </button>
         </div>

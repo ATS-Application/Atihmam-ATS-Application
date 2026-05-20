@@ -60,10 +60,10 @@ export default function CandidateDetail() {
           <ScoreBadge score={candidate.score} />
           <StatusBadge status={candidate.status} />
           <button
-            className="btn-secondary"
+            className="btn-secondary rounded-full text-xs w-30"
             onClick={() => setShowTransition(true)}
           >
-            <GitBranch size={15} />
+            <GitBranch size={15} className="w-25" />
             Changer statut
           </button>
         </div>
@@ -83,7 +83,7 @@ export default function CandidateDetail() {
                 href={candidate.cv_file_url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="btn-secondary w-full justify-center mt-2"
+                className="btn-secondary w-full justify-center mt-2 rounded-full text-xs"
               >
                 <ExternalLink size={15} />
                 Voir le CV

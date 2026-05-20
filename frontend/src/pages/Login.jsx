@@ -45,7 +45,7 @@ export default function Login() {
               required
             />
           </div>
-          <button type="submit" className="btn-primary w-full justify-center mt-2" disabled={isPending}>
+          <button type="submit" className="btn-primary rounded-full text-sm w-75 h-10 justify-center mt-2" disabled={isPending}>
             {isPending ? "Connexion..." : "Se connecter"}
           </button>
         </form>
