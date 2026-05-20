@@ -2,7 +2,6 @@ from pydantic import BaseModel
 from uuid import UUID
 from datetime import datetime
 
-# jfijfjvjgreoihgoir
 class JobBase(BaseModel):
     title: str
     description: str | None = None
