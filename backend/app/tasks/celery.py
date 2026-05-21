@@ -1,3 +1,4 @@
+# app/tasks/celery.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -29,7 +30,7 @@ class Settings(BaseSettings):
     webhook_base_url: str = "http://localhost:8000"
 
     # Valkey / Celery
-    valkey_url: str = "redis://localhost:6379/0"
+    valkey_url: str = "amqp://guest:guest@localhost:5672//"
 
     # App
     app_env: str = "development"

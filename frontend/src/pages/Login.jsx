@@ -4,11 +4,16 @@ import { useLogin } from "../hooks/useAuth";
 export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const { mutate, isPending } = useLogin();
+  // FIX 12 — Surface auth errors to the user. The original form called
+  // mutate() and silently swallowed failures — a wrong password showed
+  // nothing. useLogin must expose an error state; wire it here.
+  const { mutate, isPending, error } = useLogin();
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    mutate({ email, password });
+    // FIX 13 — Trim email before sending; trailing spaces in autofilled
+    // email fields are a common cause of spurious "invalid credentials" errors.
+    mutate({ email: email.trim(), password });
   };
 
   return (
@@ -21,31 +26,55 @@ export default function Login() {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label
+              htmlFor="email"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
               Email
             </label>
             <input
+              id="email"
               type="email"
               className="input"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
               autoFocus
+              // FIX 14 — Disable autocomplete for the password manager to
+              // fill correctly; "username" maps to email in most browsers.
+              autoComplete="username"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label
+              htmlFor="password"
+              className="block text-sm font-medium text-gray-700 mb-1"
+            >
               Mot de passe
             </label>
             <input
+              id="password"
               type="password"
               className="input"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
+              autoComplete="current-password"
             />
           </div>
-          <button type="submit" className="btn-primary rounded-full text-sm w-75 h-10 justify-center mt-2" disabled={isPending}>
+
+          {/* FIX 12 (continued) — Show error message below the fields */}
+          {error && (
+            <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">
+              {error.message ?? "Identifiants incorrects. Veuillez réessayer."}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            className="btn-primary rounded-full text-sm w-full h-10 justify-center mt-2"
+            disabled={isPending}
+          >
             {isPending ? "Connexion..." : "Se connecter"}
           </button>
         </form>

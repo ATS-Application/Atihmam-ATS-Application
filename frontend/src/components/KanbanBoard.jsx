@@ -10,18 +10,38 @@ const COLUMNS = [
   { key: "hired",     label: "Embauchés" },
 ];
 
-export default function KanbanBoard({ candidates }) {
+// FIX 1 — Accept filterJobId prop so Dashboard (and any future parent) can
+// narrow the board to a single role without KanbanBoard needing to know
+// anything about jobs or routing state.
+// FIX 2 — "rejected" candidates were silently dropped: they never appear in
+// any COLUMNS key so they vanished from the board with no indication.
+// A separate "Refusés" overflow column now catches them, rendered only when
+// at least one rejected candidate exists in the current filtered set.
+export default function KanbanBoard({ candidates, filterJobId = null }) {
   const navigate = useNavigate();
 
-  const byStatus = (status) =>
-    candidates.filter((c) => c.status === status);
+  // Apply the optional job filter.
+  const visible = filterJobId
+    ? candidates.filter((c) => c.job_id === filterJobId)
+    : candidates;
+
+  const byStatus = (status) => visible.filter((c) => c.status === status);
+
+  // Rejected candidates collected separately so they don't silently vanish.
+  const rejected = byStatus("rejected");
+
+  // Columns to render: always show the pipeline stages; append Rejected only
+  // when there is at least one rejected candidate in the current view.
+  const columns = rejected.length > 0
+    ? [...COLUMNS, { key: "rejected", label: "Refusés" }]
+    : COLUMNS;
 
   return (
     <div className="flex gap-4 overflow-x-auto pb-4">
-      {COLUMNS.map(({ key, label }) => {
+      {columns.map(({ key, label }) => {
         const cards = byStatus(key);
         return (
-          <div key={key} className="flex-shrink-0 w-64">
+          <div key={key} className="shrink-0 w-64">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-gray-700">{label}</h3>
               <span className="badge bg-gray-100 text-gray-600">{cards.length}</span>

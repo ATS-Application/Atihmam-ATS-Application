@@ -2,12 +2,13 @@ import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { ArrowLeft, ExternalLink, GitBranch } from "lucide-react";
 import { useCandidate } from "../hooks/useCandidates";
+import { useJobs } from "../hooks/useJobs";
 import StatusBadge from "../components/StatusBadge";
 import ScoreBadge from "../components/ScoreBadge";
 import StatusTransitionModal from "../components/StatusTransitionModal";
 
 function InfoRow({ label, value }) {
-  if (!value) return null;
+  if (value == null || value === "") return null;
   return (
     <div>
       <p className="text-xs font-medium text-gray-500 uppercase tracking-wide">{label}</p>
@@ -20,6 +21,9 @@ export default function CandidateDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { data: candidate, isLoading } = useCandidate(id);
+  // FIX 6 — Load jobs so we can show which role this candidate applied for.
+  // Previously the detail page had no indication of the linked job.
+  const { data: jobs = [] } = useJobs();
   const [showTransition, setShowTransition] = useState(false);
 
   if (isLoading) {
@@ -38,6 +42,19 @@ export default function CandidateDetail() {
     );
   }
 
+  // FIX 6 (continued) — Resolve job name from id.
+  const linkedJob = jobs.find((j) => j.id === candidate.job_id);
+
+  // FIX 7 — The original raw JSON block rendered ai_extracted_data.summary
+  // twice: once in the "Résumé IA" card and again inside the raw JSON blob.
+  // Strip summary from the raw display so it is shown exactly once.
+  const rawWithoutSummary = candidate.ai_extracted_data
+    ? (() => {
+        const { summary: _omit, ...rest } = candidate.ai_extracted_data;
+        return rest;
+      })()
+    : null;
+
   return (
     <div className="p-8 max-w-4xl">
       {/* Header */}
@@ -55,15 +72,21 @@ export default function CandidateDetail() {
             {candidate.full_name || "Candidat sans nom"}
           </h1>
           <p className="text-gray-500 mt-1">{candidate.current_position || "—"}</p>
+          {/* FIX 6 — Show linked job name under the position */}
+          {linkedJob && (
+            <p className="text-xs text-primary-600 font-medium mt-1">
+              Poste : {linkedJob.title}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <ScoreBadge score={candidate.score} />
           <StatusBadge status={candidate.status} />
           <button
-            className="btn-secondary rounded-full text-xs w-30"
+            className="btn-secondary rounded-full text-xs"
             onClick={() => setShowTransition(true)}
           >
-            <GitBranch size={15} className="w-25" />
+            <GitBranch size={15} />
             Changer statut
           </button>
         </div>
@@ -76,7 +99,18 @@ export default function CandidateDetail() {
             <h2 className="text-sm font-semibold text-gray-900">Informations</h2>
             <InfoRow label="Email"       value={candidate.email} />
             <InfoRow label="Téléphone"   value={candidate.phone} />
-            <InfoRow label="Expérience"  value={candidate.experience_years != null ? `${candidate.experience_years} ans` : null} />
+            <InfoRow
+              label="Expérience"
+              value={
+                candidate.experience_years != null
+                  ? `${candidate.experience_years} an${candidate.experience_years !== 1 ? "s" : ""}`
+                  : null
+              }
+            />
+            {/* FIX 6 — Surface the linked job inside the info card too */}
+            {linkedJob && (
+              <InfoRow label="Poste ciblé" value={linkedJob.title} />
+            )}
 
             {candidate.cv_file_url && (
               <a
@@ -92,7 +126,7 @@ export default function CandidateDetail() {
           </div>
 
           {/* Skills */}
-          {candidate.skills?.length > 0 && (
+          {(candidate.skills ?? []).length > 0 && (
             <div className="card p-5">
               <h2 className="text-sm font-semibold text-gray-900 mb-3">Compétences</h2>
               <div className="flex flex-wrap gap-1.5">
@@ -116,13 +150,23 @@ export default function CandidateDetail() {
           )}
 
           <div className="card p-5">
-            <h2 className="text-sm font-semibold text-gray-900 mb-3">Données extraites par l'IA</h2>
-            {candidate.ai_extracted_data ? (
+            <h2 className="text-sm font-semibold text-gray-900 mb-3">
+              Données extraites par l'IA
+            </h2>
+            {/* FIX 7 — Show the filtered object (summary removed) so it
+                doesn't duplicate the card above. Show a fallback when empty. */}
+            {rawWithoutSummary && Object.keys(rawWithoutSummary).length > 0 ? (
               <pre className="text-xs text-gray-600 bg-gray-50 rounded-lg p-4 overflow-auto max-h-80">
-                {JSON.stringify(candidate.ai_extracted_data, null, 2)}
+                {JSON.stringify(rawWithoutSummary, null, 2)}
               </pre>
+            ) : candidate.ai_extracted_data ? (
+              <p className="text-sm text-gray-400">
+                Aucune donnée structurée supplémentaire.
+              </p>
             ) : (
-              <p className="text-sm text-gray-400">Traitement IA en cours ou non effectué.</p>
+              <p className="text-sm text-gray-400">
+                Traitement IA en cours ou non effectué.
+              </p>
             )}
           </div>
         </div>
