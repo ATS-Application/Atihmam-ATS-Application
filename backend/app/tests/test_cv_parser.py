@@ -1,0 +1,1 @@
+# app/tests/test_candidates.py

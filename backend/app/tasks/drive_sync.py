@@ -1,4 +1,3 @@
-# tasks/drive_sync.py
 import re
 import os
 from celery import shared_task
@@ -14,33 +13,122 @@ from app.db.supabase_client import get_supabase_admin
 from app.config import get_settings
 
 
-# Exceptions that signal a permanent failure — retrying will never help.
 _PERMANENT_ERRORS = (
-    ValueError,       # e.g. empty CV text, malformed data
-    PermissionError,  # service account lost access to the file
+    ValueError,
+    PermissionError,
 )
 
 
 def sanitize_filename(filename: str) -> str:
-    """Removes non-ASCII characters, spaces, and special symbols 
-    to prevent Supabase Storage 400 InvalidKey errors.
-    """
     name, ext = os.path.splitext(filename)
-    # Replace spaces with underscores
     name = name.replace(" ", "_")
-    # Strip out any remaining characters outside alphanumeric, underscores, dots, or hyphens
     name = re.sub(r"[^a-zA-Z0-9_.-]", "", name)
     return f"{name}{ext}"
 
 
+def _compute_score(
+    supabase,
+    extracted: dict,
+    job_id: str | None,
+) -> tuple[float, str | None]:
+
+    resolved_job_id = job_id
+
+    try:
+        # ------------------------------------------------
+        # SPECIFIC JOB
+        # ------------------------------------------------
+        if resolved_job_id:
+            job_resp = (
+                supabase.table("jobs")
+                .select("id, title, requirements")
+                .eq("id", resolved_job_id)
+                .single()
+                .execute()
+            )
+
+            if not job_resp.data:
+                return 0.0, None
+
+            job = job_resp.data
+
+            raw_score = score_candidate(
+                cv_data=extracted,
+                job_title=job["title"],
+                job_requirements=job.get(
+                    "requirements",
+                    "",
+                ),
+            )
+
+            score = float(raw_score or 0)
+
+            print(f"[ATS SCORE] {score}")
+
+            return score, resolved_job_id
+
+        # ------------------------------------------------
+        # AUTO MATCH BEST JOB
+        # ------------------------------------------------
+        jobs_resp = (
+            supabase.table("jobs")
+            .select("id, title, requirements")
+            .eq("is_active", True)
+            .execute()
+        )
+
+        jobs = jobs_resp.data or []
+
+        if not jobs:
+            return 0.0, None
+
+        best_score = 0.0
+        best_job_id = None
+
+        for job in jobs:
+
+            try:
+                raw_score = score_candidate(
+                    cv_data=extracted,
+                    job_title=job["title"],
+                    job_requirements=job.get(
+                        "requirements",
+                        "",
+                    ),
+                )
+
+                score = float(raw_score or 0)
+
+                print(
+                    f"[JOB SCORE] "
+                    f"{job['title']} => {score}"
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best_job_id = job["id"]
+
+            except Exception as e:
+                print(
+                    f"[SCORING ERROR] "
+                    f"{job['title']} => {e}"
+                )
+
+        return best_score, best_job_id
+
+    except Exception as e:
+        print(f"[COMPUTE SCORE ERROR] {e}")
+        return 0.0, None
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
-    """Pipeline for a single Drive file:
+    """
+    Pipeline for a single Drive file:
     idempotency check → download → upload to Storage → AI parse → score → insert candidate.
     """
     supabase = get_supabase_admin()
     try:
-        # Fast-path: skip download entirely if already processed.
         existing = (
             supabase.table("candidates")
             .select("id")
@@ -52,8 +140,6 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
 
         metadata = get_file_metadata(drive_file_id)
         raw_file_name = metadata.get("name", f"{drive_file_id}.pdf")
-        
-        # FIX: Sanitize the filename to eliminate spaces and special symbols
         file_name = sanitize_filename(raw_file_name)
         pdf_bytes = download_file_bytes(drive_file_id)
 
@@ -67,8 +153,6 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
 
         raw_text = extract_text_from_bytes(pdf_bytes)
         if not raw_text.strip():
-            # If the PDF is completely blank or an unreadable image scan, update status
-            # to let the UI know why it has no name, then raise ValueError to halt cleanly.
             try:
                 fallback_payload = {
                     "full_name": "Document non lisible",
@@ -83,31 +167,17 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
                 pass
             raise ValueError(f"Empty text extracted from Drive file {drive_file_id}")
 
-        # AI extraction receives the full text.
         extracted = extract_cv_info(raw_text)
 
-        score = None
-        if job_id:
-            job_resp = (
-                supabase.table("jobs")
-                .select("title, requirements")
-                .eq("id", job_id)
-                .single()
-                .execute()
-            )
-            if job_resp.data:
-                score = score_candidate(
-                    cv_data=extracted,
-                    job_title=job_resp.data["title"],
-                    job_requirements=job_resp.data.get("requirements", ""),
-                )
+        # Always attempt scoring — falls back to best active job when job_id is None
+        score, resolved_job_id = _compute_score(supabase, extracted, job_id)
 
         candidate_payload = {
             "full_name": extracted.get("full_name") or "Sans nom",
             "email": extracted.get("email"),
             "phone": extracted.get("phone"),
             "current_position": extracted.get("current_position"),
-            "skills": extracted.get("skills", []),
+            "skills": extracted.get("skills") or [],
             "experience_years": extracted.get("experience_years"),
             "cv_file_url": cv_url,
             "cv_raw_text": raw_text[:50_000],
@@ -115,10 +185,10 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
             "drive_file_id": drive_file_id,
             "status": "applied",
         }
-        if job_id:
-            candidate_payload["job_id"] = job_id
+        if resolved_job_id:
+            candidate_payload["job_id"] = resolved_job_id
         if score is not None:
-            candidate_payload["score"] = score
+            candidate_payload["score"] = float(score or 0)
 
         try:
             response = supabase.table("candidates").insert(candidate_payload).execute()
@@ -129,7 +199,7 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
 
         return {"status": "processed", "candidate_id": response.data[0]["id"]}
 
-    except _PERMANENT_ERRORS as exc:
+    except _PERMANENT_ERRORS:
         raise
 
     except Exception as exc:
@@ -199,3 +269,35 @@ def renew_drive_webhook():
     """Renews the Drive webhook channel before expiration. Runs every 12h via Beat."""
     from app.services.webhook_manager import ensure_webhook_registered
     return ensure_webhook_registered()
+
+
+@shared_task
+def backfill_scores():
+    """One-shot backfill: scores existing candidates that have NULL score."""
+    supabase = get_supabase_admin()
+
+    rows = (
+        supabase.table("candidates")
+        .select("id, ai_extracted_data, job_id")
+        .is_("score", "null")
+        .not_.is_("ai_extracted_data", "null")
+        .execute()
+    )
+
+    updated = 0
+    for row in rows.data:
+        score, resolved_job_id = _compute_score(
+            supabase,
+            row["ai_extracted_data"],
+            row.get("job_id"),
+        )
+        if score is not None:
+            supabase.table("candidates").update(
+                {
+                    "score": score,
+                    "job_id": row.get("job_id") or resolved_job_id,
+                }
+            ).eq("id", row["id"]).execute()
+            updated += 1
+
+    return {"updated": updated, "total": len(rows.data)}
