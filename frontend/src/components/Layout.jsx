@@ -1,11 +1,14 @@
+// frontend/src/components/Layout.jsx
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
-import { LayoutDashboard, Users, Briefcase, LogOut } from "lucide-react";
+import { LayoutDashboard, Users, Briefcase, FileText, LogOut } from "lucide-react";
 import { useLogout } from "../hooks/useAuth";
 
 const navItems = [
   { to: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/candidates", icon: Users,           label: "Candidats" },
   { to: "/jobs",       icon: Briefcase,       label: "Postes" },
+  // { to: "/posts",      icon: FileText,        label: "Post Ciblé" },
+  { to: "/analytics",  icon: LogOut,          label: "Analyse" },
 ];
 
 export default function Layout() {
@@ -39,6 +42,7 @@ export default function Layout() {
       {/* Sidebar */}
       <aside className="w-64 bg-white border-r border-gray-200 flex flex-col sticky top-0 h-screen shrink-0">
         <div className="px-6 py-5 border-b border-gray-200">
+          <img src="./src/assets/atihmam_logo.png" alt="ATS Platform Logo" className="h-30 w-75" />
           <h1 className="text-xl font-bold text-primary-600">ATS Platform</h1>
           <p className="text-xs text-gray-500 mt-0.5">Applicant Tracking System</p>
         </div>

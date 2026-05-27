@@ -1,3 +1,4 @@
+# backend/app/core/state_machine.py
 from fastapi import HTTPException, status
 from app.models.candidate import CandidateStatus, ALLOWED_TRANSITIONS
 

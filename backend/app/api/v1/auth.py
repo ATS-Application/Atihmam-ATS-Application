@@ -1,3 +1,4 @@
+# backend/app/api/v1/auth.py
 from fastapi import APIRouter, HTTPException, status
 from app.models.user import UserLogin, UserRegister, TokenResponse
 from app.core.security import create_access_token

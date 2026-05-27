@@ -1,4 +1,4 @@
-# app/tasks/celery.py
+# backend/app/tasks/celery.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 

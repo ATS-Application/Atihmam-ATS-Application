@@ -1,3 +1,4 @@
+# backend/app/models/user.py
 from pydantic import BaseModel, EmailStr
 from uuid import UUID
 

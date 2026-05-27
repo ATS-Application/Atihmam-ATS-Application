@@ -1,3 +1,4 @@
+# backend/app/tasks/candidate_task.py
 from app.services.cv_parser import (
     extract_text_from_bytes,
 )

@@ -20,7 +20,7 @@ def test_gemini():
     print("\n========== TESTING GEMINI ==========")
     try:
         genai.configure(api_key=settings.gemini_api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3.5-flash")
         response = model.generate_content(TEST_PROMPT)
         print("✅ Gemini works!")
         print("Response:", response.text)

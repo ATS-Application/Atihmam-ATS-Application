@@ -1,83 +1,100 @@
+// frontend/src/pages/Login.jsx
 import { useState } from "react";
 import { useLogin } from "../hooks/useAuth";
 
 export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  // FIX 12 — Surface auth errors to the user. The original form called
-  // mutate() and silently swallowed failures — a wrong password showed
-  // nothing. useLogin must expose an error state; wire it here.
   const { mutate, isPending, error } = useLogin();
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    // FIX 13 — Trim email before sending; trailing spaces in autofilled
-    // email fields are a common cause of spurious "invalid credentials" errors.
     mutate({ email: email.trim(), password });
   };
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
-      <div className="card w-full max-w-sm p-8">
-        <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-primary-600">ATS Platform</h1>
-          <p className="text-sm text-gray-500 mt-1">Connectez-vous pour continuer</p>
+      <div className="w-full max-w-sm">
+
+        {/* Logo card */}
+        <div className="flex flex-col items-center mb-8">
+          <img
+            src="./src/assets/atihmam_logo.png"
+            alt="Atihmam Conseils"
+            className="h-14 w-auto object-contain"
+            draggable={false}
+          />
+          <p className="text-xs text-gray-400 mt-3 tracking-widest uppercase">
+            Plateforme ATS
+          </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label
-              htmlFor="email"
-              className="block text-sm font-medium text-gray-700 mb-1"
-            >
-              Email
-            </label>
-            <input
-              id="email"
-              type="email"
-              className="input"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              autoFocus
-              // FIX 14 — Disable autocomplete for the password manager to
-              // fill correctly; "username" maps to email in most browsers.
-              autoComplete="username"
-            />
-          </div>
-          <div>
-            <label
-              htmlFor="password"
-              className="block text-sm font-medium text-gray-700 mb-1"
-            >
-              Mot de passe
-            </label>
-            <input
-              id="password"
-              type="password"
-              className="input"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              autoComplete="current-password"
-            />
-          </div>
+        {/* Form card */}
+        <div className="bg-white rounded-xl border border-gray-200 p-8 shadow-sm">
+          <h1 className="text-sm font-semibold text-gray-900 mb-1">Connexion</h1>
+          <p className="text-xs text-gray-400 mb-6">
+            Connectez-vous pour accéder au tableau de bord.
+          </p>
 
-          {/* FIX 12 (continued) — Show error message below the fields */}
-          {error && (
-            <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">
-              {error.message ?? "Identifiants incorrects. Veuillez réessayer."}
-            </p>
-          )}
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label
+                htmlFor="email"
+                className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5"
+              >
+                Email
+              </label>
+              <input
+                id="email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+                autoFocus
+                autoComplete="username"
+                className="w-full h-10 px-3 rounded-lg border border-gray-200 bg-white text-sm text-gray-900 outline-none transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100 placeholder:text-gray-300"
+                placeholder="vous@exemple.com"
+              />
+            </div>
 
-          <button
-            type="submit"
-            className="btn-primary rounded-full text-sm w-full h-10 justify-center mt-2"
-            disabled={isPending}
-          >
-            {isPending ? "Connexion..." : "Se connecter"}
-          </button>
-        </form>
+            <div>
+              <label
+                htmlFor="password"
+                className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5"
+              >
+                Mot de passe
+              </label>
+              <input
+                id="password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+                className="w-full h-10 px-3 rounded-lg border border-gray-200 bg-white text-sm text-gray-900 outline-none transition-colors focus:border-gray-400 focus:ring-2 focus:ring-gray-100 placeholder:text-gray-300"
+                placeholder="••••••••"
+              />
+            </div>
+
+            {error && (
+              <p className="text-xs text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">
+                {error.message ?? "Identifiants incorrects. Veuillez réessayer."}
+              </p>
+            )}
+
+            <button
+              type="submit"
+              disabled={isPending}
+              className="w-full h-10 rounded-lg bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed mt-2"
+            >
+              {isPending ? "Connexion…" : "Se connecter"}
+            </button>
+          </form>
+        </div>
+
+        <p className="text-center text-xs text-gray-300 mt-6">
+          © {new Date().getFullYear()} Atihmam Conseils
+        </p>
       </div>
     </div>
   );

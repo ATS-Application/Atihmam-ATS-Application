@@ -1,3 +1,4 @@
+// frontend/src/pages/CandidateDetail.jsx
 import { useState, useMemo, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
@@ -145,9 +146,12 @@ export default function CandidateDetail() {
     try {
       setIsOpeningCV(true);
 
+      const filePath = candidate.cv_file_url
+        ?.split("/storage/v1/object/public/cvs/")[1];
+
       const { data, error } = await supabase.storage
         .from("cvs")
-        .createSignedUrl(candidate.cv_file_url, 60);
+        .createSignedUrl(filePath, 3600);
 
       if (error) {
         console.error("CV access error:", error);

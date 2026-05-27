@@ -1,4 +1,4 @@
-# app/core/celery_config.py
+# backend/app/core/celery_config.py
 import os
 from celery import Celery
 

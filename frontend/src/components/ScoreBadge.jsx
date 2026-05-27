@@ -1,3 +1,4 @@
+// frontend/src/components/ScoreBadge.jsx
 export default function ScoreBadge({
   score,
 }) {

@@ -1,29 +1,57 @@
-import re
+# backend/app/tasks/drive_sync.py
+
 import os
+import re
+
 from celery import shared_task
-from app.services.drive_service import (
-    download_file_bytes,
-    list_pdf_files,
-    list_new_pdf_files_since,
-    get_file_metadata,
-)
-from app.services.cv_parser import extract_text_from_bytes
-from app.services.ai_service import extract_cv_info, score_candidate
-from app.db.supabase_client import get_supabase_admin
+from googleapiclient.errors import HttpError
+
 from app.config import get_settings
-
-
-_PERMANENT_ERRORS = (
-    ValueError,
-    PermissionError,
+from app.db.supabase_client import get_supabase_admin
+from app.services.ai_service import extract_cv_info, score_candidate
+from app.services.cv_parser import extract_text_from_bytes
+from app.services.drive_service import (
+    _get_drive_service,
+    download_file_bytes,
+    get_file_metadata,
+    list_new_pdf_files_since,
+    list_pdf_files,
 )
 
+_PERMANENT_ERRORS = (ValueError, PermissionError)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def sanitize_filename(filename: str) -> str:
     name, ext = os.path.splitext(filename)
-    name = name.replace(" ", "_")
-    name = re.sub(r"[^a-zA-Z0-9_.-]", "", name)
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "", name.replace(" ", "_"))
     return f"{name}{ext}"
+
+
+def _extract_scalar_score(raw) -> float:
+    """
+    Normalize whatever score_candidate returns into a float.
+
+    compute_candidate_score returns a rich dict — we extract
+    the "score" key.  Also handles plain int/float for safety.
+    """
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, dict):
+        for key in ("score", "total", "final_score", "overall", "total_score"):
+            val = raw.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        for val in raw.values():
+            if isinstance(val, (int, float)):
+                return float(val)
+    return 0.0
 
 
 def _compute_score(
@@ -31,104 +59,114 @@ def _compute_score(
     extracted: dict,
     job_id: str | None,
 ) -> tuple[float, str | None]:
+    """
+    Score a candidate against a specific job or all active jobs (best match).
 
-    resolved_job_id = job_id
-
+    Returns (score, resolved_job_id).
+    Never raises — returns (0.0, None) on any failure so the pipeline
+    can continue even if scoring is unavailable.
+    """
     try:
-        # ------------------------------------------------
-        # SPECIFIC JOB
-        # ------------------------------------------------
-        if resolved_job_id:
-            job_resp = (
+        if job_id:
+            row = (
                 supabase.table("jobs")
                 .select("id, title, requirements")
-                .eq("id", resolved_job_id)
+                .eq("id", job_id)
                 .single()
                 .execute()
             )
-
-            if not job_resp.data:
+            if not row.data:
                 return 0.0, None
 
-            job = job_resp.data
-
-            raw_score = score_candidate(
+            job = row.data
+            raw = score_candidate(
                 cv_data=extracted,
                 job_title=job["title"],
-                job_requirements=job.get(
-                    "requirements",
-                    "",
-                ),
+                job_requirements=job.get("requirements", ""),
             )
+            score = _extract_scalar_score(raw)
+            print(f"[ATS SCORE] job={job_id} score={score}")
+            return score, job_id
 
-            score = float(raw_score or 0)
-
-            print(f"[ATS SCORE] {score}")
-
-            return score, resolved_job_id
-
-        # ------------------------------------------------
-        # AUTO MATCH BEST JOB
-        # ------------------------------------------------
+        # --- auto-match: score against every active job ---
         jobs_resp = (
             supabase.table("jobs")
             .select("id, title, requirements")
             .eq("is_active", True)
             .execute()
         )
-
-        jobs = jobs_resp.data or []
+        jobs: list[dict] = jobs_resp.data or []
 
         if not jobs:
             return 0.0, None
 
         best_score = 0.0
-        best_job_id = None
+        best_job_id: str | None = None
 
         for job in jobs:
-
             try:
-                raw_score = score_candidate(
+                raw = score_candidate(
                     cv_data=extracted,
                     job_title=job["title"],
-                    job_requirements=job.get(
-                        "requirements",
-                        "",
-                    ),
+                    job_requirements=job.get("requirements", ""),
                 )
-
-                score = float(raw_score or 0)
-
-                print(
-                    f"[JOB SCORE] "
-                    f"{job['title']} => {score}"
-                )
+                score = _extract_scalar_score(raw)
+                print(f"[JOB SCORE] {job['title']} => {score}")
 
                 if score > best_score:
                     best_score = score
                     best_job_id = job["id"]
 
-            except Exception as e:
-                print(
-                    f"[SCORING ERROR] "
-                    f"{job['title']} => {e}"
-                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[SCORING ERROR] {job['title']} => {exc}")
 
         return best_score, best_job_id
 
-    except Exception as e:
-        print(f"[COMPUTE SCORE ERROR] {e}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[COMPUTE SCORE ERROR] {exc}")
         return 0.0, None
 
+
+def _insert_failed_candidate(
+    supabase,
+    cv_url: str,
+    drive_file_id: str,
+    job_id: str | None,
+) -> None:
+    """Insert a stub row for files whose text could not be extracted."""
+    payload: dict = {
+        "full_name": "Document non lisible",
+        "cv_file_url": cv_url,
+        "drive_file_id": drive_file_id,
+        "status": "failed",
+    }
+    if job_id:
+        payload["job_id"] = job_id
+
+    try:
+        supabase.table("candidates").insert(payload).execute()
+    except Exception:  # noqa: BLE001
+        pass  # best-effort — don't mask the original ValueError
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
     """
-    Pipeline for a single Drive file:
-    idempotency check → download → upload to Storage → AI parse → score → insert candidate.
+    Single-file pipeline:
+      idempotency → download → Storage upload → AI parse → score → insert
+
+    Permanent errors (ValueError, PermissionError) propagate immediately.
+    Transient errors are retried with exponential back-off (60s, 120s, 240s).
+    A 401 from the Drive API clears the service cache before retrying.
     """
     supabase = get_supabase_admin()
+
     try:
+        # --- idempotency guard ---
         existing = (
             supabase.table("candidates")
             .select("id")
@@ -138,11 +176,12 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
         if existing.data:
             return {"status": "skipped", "drive_file_id": drive_file_id}
 
+        # --- fetch & download ---
         metadata = get_file_metadata(drive_file_id)
-        raw_file_name = metadata.get("name", f"{drive_file_id}.pdf")
-        file_name = sanitize_filename(raw_file_name)
+        file_name = sanitize_filename(metadata.get("name", f"{drive_file_id}.pdf"))
         pdf_bytes = download_file_bytes(drive_file_id)
 
+        # --- upload to Supabase Storage ---
         storage_path = f"cvs/drive/{drive_file_id}/{file_name}"
         supabase.storage.from_("cvs").upload(
             storage_path,
@@ -151,28 +190,18 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
         )
         cv_url = supabase.storage.from_("cvs").get_public_url(storage_path)
 
+        # --- text extraction ---
         raw_text = extract_text_from_bytes(pdf_bytes)
         if not raw_text.strip():
-            try:
-                fallback_payload = {
-                    "full_name": "Document non lisible",
-                    "cv_file_url": cv_url,
-                    "drive_file_id": drive_file_id,
-                    "status": "failed",
-                }
-                if job_id:
-                    fallback_payload["job_id"] = job_id
-                supabase.table("candidates").insert(fallback_payload).execute()
-            except Exception:
-                pass
+            _insert_failed_candidate(supabase, cv_url, drive_file_id, job_id)
             raise ValueError(f"Empty text extracted from Drive file {drive_file_id}")
 
+        # --- AI extraction + scoring ---
         extracted = extract_cv_info(raw_text)
-
-        # Always attempt scoring — falls back to best active job when job_id is None
         score, resolved_job_id = _compute_score(supabase, extracted, job_id)
 
-        candidate_payload = {
+        # --- build & insert candidate row ---
+        payload: dict = {
             "full_name": extracted.get("full_name") or "Sans nom",
             "email": extracted.get("email"),
             "phone": extracted.get("phone"),
@@ -186,12 +215,12 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
             "status": "applied",
         }
         if resolved_job_id:
-            candidate_payload["job_id"] = resolved_job_id
+            payload["job_id"] = resolved_job_id
         if score is not None:
-            candidate_payload["score"] = float(score or 0)
+            payload["score"] = float(score)
 
         try:
-            response = supabase.table("candidates").insert(candidate_payload).execute()
+            response = supabase.table("candidates").insert(payload).execute()
         except Exception as db_exc:
             if "uq_candidates_drive_file_id" in str(db_exc):
                 return {"status": "skipped_race", "drive_file_id": drive_file_id}
@@ -202,13 +231,22 @@ def process_drive_file(self, drive_file_id: str, job_id: str | None = None):
     except _PERMANENT_ERRORS:
         raise
 
+    except HttpError as exc:
+        if exc.status_code == 401:
+            _get_drive_service.cache_clear()
+        raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
+
     except Exception as exc:
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
 @shared_task
-def sync_drive_folder(job_id: str | None = None):
-    """Full folder scan — safety net for missed webhooks. Runs daily via Beat."""
+def sync_drive_folder(job_id: str | None = None) -> dict:
+    """
+    Full folder scan — safety net for missed webhooks.
+    Dispatches process_drive_file for every unseen PDF.
+    Runs daily via Celery Beat.
+    """
     settings = get_settings()
     folder_id = settings.drive_folder_id
 
@@ -219,7 +257,11 @@ def sync_drive_folder(job_id: str | None = None):
     files = list_pdf_files(folder_id)
 
     existing = supabase.table("candidates").select("drive_file_id").execute()
-    processed_ids = {r["drive_file_id"] for r in existing.data if r.get("drive_file_id")}
+    processed_ids = {
+        row["drive_file_id"]
+        for row in existing.data
+        if row.get("drive_file_id")
+    }
 
     queued = 0
     for f in files:
@@ -231,14 +273,21 @@ def sync_drive_folder(job_id: str | None = None):
 
 
 @shared_task
-def sync_drive_webhook(job_id: str | None = None):
-    """Handle a Drive push notification."""
+def sync_drive_webhook(job_id: str | None = None) -> dict:
+    """
+    Handle a Drive push notification.
+    Reads the persisted page token, walks the changes feed,
+    dispatches tasks for new PDFs, then advances the token.
+    Falls back to a full sync when no token is stored.
+    """
     settings = get_settings()
     folder_id = settings.drive_folder_id
+
     if not folder_id:
         return {"status": "skipped", "reason": "DRIVE_FOLDER_ID not configured"}
 
     supabase = get_supabase_admin()
+
     config_row = (
         supabase.table("app_config")
         .select("value")
@@ -246,34 +295,41 @@ def sync_drive_webhook(job_id: str | None = None):
         .single()
         .execute()
     )
-    page_token = config_row.data["value"] if config_row.data else None
+    page_token: str | None = config_row.data["value"] if config_row.data else None
+
     if not page_token:
         return sync_drive_folder(job_id=job_id)
 
     new_files, next_token = list_new_pdf_files_since(folder_id, page_token)
 
-    queued = 0
     for f in new_files:
         process_drive_file.delay(drive_file_id=f["id"], job_id=job_id)
-        queued += 1
 
     supabase.table("app_config").upsert(
         {"key": "drive_page_token", "value": next_token}
     ).execute()
 
-    return {"status": "done", "new_files": len(new_files), "queued": queued}
+    return {"status": "done", "new_files": len(new_files), "queued": len(new_files)}
 
 
 @shared_task
-def renew_drive_webhook():
-    """Renews the Drive webhook channel before expiration. Runs every 12h via Beat."""
-    from app.services.webhook_manager import ensure_webhook_registered
+def renew_drive_webhook() -> dict:
+    """
+    Renew the Drive push-notification channel before it expires.
+    Runs every 12 h via Celery Beat.
+    """
+    from app.services.webhook_manager import ensure_webhook_registered  # noqa: PLC0415
+
     return ensure_webhook_registered()
 
 
 @shared_task
-def backfill_scores():
-    """One-shot backfill: scores existing candidates that have NULL score."""
+def backfill_scores() -> dict:
+    """
+    One-shot backfill: score all candidates whose `score` column is NULL
+    but whose `ai_extracted_data` is populated.
+    Safe to re-run — already-scored rows are excluded by the query.
+    """
     supabase = get_supabase_admin()
 
     rows = (
@@ -294,7 +350,7 @@ def backfill_scores():
         if score is not None:
             supabase.table("candidates").update(
                 {
-                    "score": score,
+                    "score": float(score),
                     "job_id": row.get("job_id") or resolved_job_id,
                 }
             ).eq("id", row["id"]).execute()

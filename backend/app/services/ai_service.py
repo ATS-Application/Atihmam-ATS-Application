@@ -1,45 +1,57 @@
+# backend/app/services/ai_service.py
+"""
+AI Service — multi-provider with fallback chain.
+Extracts structured CV data and delegates scoring to scoring_service.
+"""
+from __future__ import annotations
+
 import json
 import re
+from typing import Any
+
 import requests
 import google.generativeai as genai
-from typing import Optional
-from app.config import get_settings
 
+from app.config import get_settings
 from app.services.scoring_service import compute_candidate_score
 
-# =========================================================
-# JSON PARSER
-# =========================================================
+
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
 
 def _parse_json_response(text: str) -> dict:
     if not text:
         raise ValueError("Empty AI response")
-    # Extract JSON if wrapped in markdown
-    clean = re.sub(r"```(?:json)?", "", text)
-    clean = clean.replace("```", "").strip()
+
+    clean = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
+
+    if clean.startswith("["):
+        clean = clean[1 : clean.rfind("]")]
+
     try:
         return json.loads(clean)
-    except json.JSONDecodeError as e:
-        print("[JSON PARSE ERROR]", clean)
-        raise ValueError(f"Invalid JSON response: {e}")
+    except json.JSONDecodeError as exc:
+        print(f"[ai_service] JSON parse error — first 200 chars: {clean[:200]}")
+        raise ValueError(f"Invalid JSON from AI provider: {exc}") from exc
 
-# =========================================================
-# PROVIDER CALLS
-# =========================================================
+
+# ---------------------------------------------------------------------------
+# Provider calls
+# ---------------------------------------------------------------------------
 
 def _call_gemini(prompt: str, settings) -> str:
     if not settings.gemini_api_key:
-        raise Exception("Missing Gemini API key")
+        raise RuntimeError("Missing Gemini API key")
     genai.configure(api_key=settings.gemini_api_key)
-    # Using 1.5-flash-latest to avoid 404 errors
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(prompt)
     return response.text
 
+
 def _call_openrouter(prompt: str, settings) -> str:
     if not settings.openrouter_api_key:
-        raise Exception("Missing OpenRouter API key")
-    
+        raise RuntimeError("Missing OpenRouter API key")
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -55,10 +67,10 @@ def _call_openrouter(prompt: str, settings) -> str:
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
+
 def _call_deepseek(prompt: str, settings) -> str:
     if not settings.deepseek_api_key:
-        raise Exception("Missing DeepSeek API key")
-    
+        raise RuntimeError("Missing DeepSeek API key")
     response = requests.post(
         "https://api.deepseek.com/chat/completions",
         headers={
@@ -74,10 +86,10 @@ def _call_deepseek(prompt: str, settings) -> str:
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
+
 def _call_mistral(prompt: str, settings) -> str:
     if not settings.mistral_api_key:
-        raise Exception("Missing Mistral API key")
-        
+        raise RuntimeError("Missing Mistral API key")
     response = requests.post(
         "https://api.mistral.ai/v1/chat/completions",
         headers={
@@ -94,51 +106,156 @@ def _call_mistral(prompt: str, settings) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 
-def score_candidate(cv_data: dict, job_title: str, job_requirements: str) -> dict:
-    """
-    Pass-through function to satisfy the import in drive_sync.py
-    """
-    return compute_candidate_score(cv_data, job_title, job_requirements)
+# ---------------------------------------------------------------------------
+# Fallback engine
+# ---------------------------------------------------------------------------
 
+_PROVIDERS = [
+    ("OpenRouter", _call_openrouter),
+    ("DeepSeek",   _call_deepseek),
+    ("Mistral",    _call_mistral),
+    ("Gemini",     _call_gemini),
+]
 
-# =========================================================
-# FALLBACK ENGINE & EXPORTS
-# =========================================================
 
 def _generate_with_fallback(prompt: str) -> str:
     settings = get_settings()
-    providers = [
-        ("OpenRouter", _call_openrouter),
-        ("DeepSeek", _call_deepseek),
-        ("Mistral", _call_mistral),
-        ("Gemini", _call_gemini),
-    ]
-
-    for name, fn in providers:
+    for name, fn in _PROVIDERS:
         try:
             return fn(prompt, settings)
-        except Exception as e:
-            print(f"[AI] {name} failed: {e}")
-    
-    raise Exception("All AI providers failed.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ai_service] {name} failed: {exc}")
+    raise RuntimeError("All AI providers failed — no response available.")
 
-def extract_cv_info(raw_text: str) -> dict:
-    """
-    Parses CV text into a JSON object.
-    """
-    prompt = f"""
-    You are an ATS resume parser. Extract the following information from the provided CV text into JSON format:
+
+# ---------------------------------------------------------------------------
+# CV extraction prompt
+# ---------------------------------------------------------------------------
+
+_CV_PROMPT_TEMPLATE = """
+You are an expert ATS resume parser. Extract the following structured information
+from the CV text below. Return ONLY valid JSON with no extra text, preamble, or
+markdown fences.
+
+Required JSON schema:
+{{
+  "full_name": "string",
+  "email": "string or null",
+  "phone": "string or null",
+  "current_position": "string or null",
+  "skills": ["list of technical skills as strings"],
+  "experience_years": number or null,
+  "summary": "2-3 sentence professional summary or null",
+  "work_history": [
     {{
-      "full_name": "string",
-      "email": "string",
-      "phone": "string",
-      "current_position": "string",
-      "skills": ["list", "of", "strings"],
-      "experience_years": number
+      "title": "Job title",
+      "company": "Company name",
+      "start_date": "YYYY-MM or null",
+      "end_date": "YYYY-MM or null (null = present)",
+      "duration_months": number or null,
+      "description": "Key responsibilities and achievements"
     }}
-    
-    CV Text:
-    {raw_text[:8000]}
+  ],
+  "projects": [
+    {{
+      "name": "Project name",
+      "tech": "Technologies used",
+      "description": "What was built, scale, impact",
+      "complexity": "low|medium|high"
+    }}
+  ],
+  "certifications": ["list of certification names"],
+  "education": [
+    {{
+      "degree": "Degree name",
+      "institution": "School name",
+      "year": number or null
+    }}
+  ],
+  "languages": ["spoken languages"],
+  "linkedin": "URL or null",
+  "github": "URL or null"
+}}
+
+Rules:
+- experience_years: sum of UNIQUE non-overlapping professional experience.
+  If two roles overlap in time, count only the longer one.
+- skills: include programming languages, frameworks, tools, platforms, methodologies.
+- projects: include significant personal, open-source, or work projects.
+- complexity: "high" if production/large-scale, "medium" if moderate, "low" if tutorial/small.
+- work_history: always include duration_months if you can calculate it from dates.
+
+CV Text (max 8000 chars):
+{cv_text}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Public: CV extraction
+# ---------------------------------------------------------------------------
+
+def extract_cv_info(raw_text: str) -> dict[str, Any]:
     """
-    response_text = _generate_with_fallback(prompt)
-    return _parse_json_response(response_text)
+    Parse raw CV text into a rich structured dict.
+    Falls back to a minimal safe dict if all providers fail.
+    """
+    prompt = _CV_PROMPT_TEMPLATE.format(cv_text=raw_text[:8000])
+    try:
+        response_text = _generate_with_fallback(prompt)
+        data = _parse_json_response(response_text)
+        data.setdefault("skills", [])
+        data.setdefault("work_history", [])
+        data.setdefault("projects", [])
+        data.setdefault("certifications", [])
+        data.setdefault("education", [])
+        data.setdefault("languages", [])
+        return data
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ai_service] CV extraction failed: {exc}")
+        return {
+            "full_name":        None,
+            "email":            None,
+            "phone":            None,
+            "current_position": None,
+            "skills":           [],
+            "experience_years": None,
+            "summary":          None,
+            "work_history":     [],
+            "projects":         [],
+            "certifications":   [],
+            "education":        [],
+            "languages":        [],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Public: scoring shim
+# ---------------------------------------------------------------------------
+
+def score_candidate(
+    cv_data: dict[str, Any],
+    job_title: str,
+    job_requirements: str,
+) -> dict[str, Any]:
+    """
+    Delegate to the intelligent scorer.
+
+    Returns the full scoring dict from compute_candidate_score:
+      {
+        "score":            float,   ← 0-100, this is what callers extract
+        "confidence":       float,
+        "domain":           str,
+        "reasoning":        str,
+        "matched_keywords": list,
+        "missing_keywords": list,
+        "dimension_scores": dict,
+      }
+
+    Callers must extract ["score"] — never cast the whole dict to float.
+    _compute_score in drive_sync.py handles this via _extract_scalar_score().
+    """
+    return compute_candidate_score(
+        cv_data=cv_data,
+        job_title=job_title,
+        job_requirements=job_requirements,
+    )

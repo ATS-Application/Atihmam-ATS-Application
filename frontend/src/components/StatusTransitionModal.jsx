@@ -1,3 +1,4 @@
+// frontend/src/components/StatusTransitionModal.jsx
 import { useState } from "react";
 import { X } from "lucide-react";
 import { useTransitionStatus } from "../hooks/useCandidates";

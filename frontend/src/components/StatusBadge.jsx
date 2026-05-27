@@ -1,3 +1,4 @@
+// frontend/src/components/StatusBadge.jsx
 const STATUS_CONFIG = {
   applied:   { label: "Candidature", color: "bg-blue-100 text-blue-700" },
   screening: { label: "Screening",   color: "bg-yellow-100 text-yellow-700" },
