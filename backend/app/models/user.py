@@ -1,5 +1,5 @@
 # backend/app/models/user.py
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from uuid import UUID
 
 
@@ -24,3 +24,10 @@ class UserProfile(BaseModel):
     email: str
     full_name: str | None = None
     role: str
+    
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+    
+class PasswordResetConfirm(BaseModel):
+    access_token: str
+    new_password: str = Field(..., min_length=8)

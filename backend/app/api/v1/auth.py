@@ -1,8 +1,10 @@
 # backend/app/api/v1/auth.py
+from app.config import get_settings
+# from backend.app.tasks.celery import get_settings
 from fastapi import APIRouter, HTTPException, status
-from app.models.user import UserLogin, UserRegister, TokenResponse
+from app.models.user import UserLogin, UserRegister, TokenResponse, PasswordResetRequest, PasswordResetConfirm
 from app.core.security import create_access_token
-from app.db.supabase_client import get_supabase
+from app.db.supabase_client import get_supabase, get_supabase_admin
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -56,6 +58,38 @@ async def login(payload: UserLogin):
 
     access_token = create_access_token({"sub": user.id, "email": user.email})
     return TokenResponse(access_token=access_token)
+
+
+@router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
+async def forgot_password(payload: PasswordResetRequest):
+    supabase = get_supabase()
+    settings = get_settings()
+    try:
+        supabase.auth.reset_password_for_email(
+            payload.email,
+            options={"redirect_to": f"{settings.frontend_url}/reset-password"},
+        )
+    except Exception as e:
+        # Temporarily expose error for debugging
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"message": "If this email is registered, a reset link has been sent."}
+
+
+@router.post("/reset-password", status_code=status.HTTP_200_OK)
+async def reset_password(payload: PasswordResetConfirm):
+    supabase_admin = get_supabase_admin()
+    try:
+        # Decode user id from the access token
+        user = get_supabase().auth.get_user(payload.access_token)
+        if not user or not user.user:
+            raise ValueError("Invalid token")
+        supabase_admin.auth.admin.update_user_by_id(
+            user.user.id,
+            {"password": payload.new_password}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="Lien invalide ou expiré.")
+    return {"message": "Password updated successfully."}
 
 
 @router.get("/me")

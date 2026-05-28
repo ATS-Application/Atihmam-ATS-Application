@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     # ── API ──────────────────────────────
     react_app_api_url: str = "http://localhost:5173"
+    frontend_url: str = "http://localhost:5173"
 
     # ── Auth ─────────────────────────────
     secret_key: str = "change-me"

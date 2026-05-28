@@ -1,4 +1,5 @@
 # backend/app/config.py
+import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -24,7 +25,7 @@ class Settings(BaseSettings):
     # Gemini
     gemini_api_key: str
 
-    # OPTIONAL (only if you use them)
+    # Optional
     openrouter_api_key: str | None = None
     deepseek_api_key: str | None = None
     mistral_api_key: str | None = None
@@ -40,8 +41,11 @@ class Settings(BaseSettings):
     # App
     app_env: str = "development"
     allowed_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
-    
-    
+
+    # Frontend
+    frontend_url: str = "http://localhost:5173"
+
+
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
@@ -49,8 +53,3 @@ def get_settings() -> Settings:
     print(f"DEBUG: Loaded DeepSeek Key: {'Present' if settings.deepseek_api_key else 'MISSING'}")
     print(f"DEBUG: Loaded Mistral Key: {'Present' if settings.mistral_api_key else 'MISSING'}")
     return settings
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
