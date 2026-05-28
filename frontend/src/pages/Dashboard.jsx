@@ -267,6 +267,7 @@ export default function Dashboard() {
   const [activeJob, setActiveJob]                 = useState(null);
   const [selectedCandidate, setSelectedCandidate] = useState(null);
 
+
   const stats = useMemo(() => ({
     total:      candidates.length,
     inProgress: candidates.filter((c) => ["screening", "interview", "offer"].includes(c.status)).length,
