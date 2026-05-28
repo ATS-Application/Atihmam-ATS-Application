@@ -87,7 +87,7 @@ export default function UploadCVModal({
       <div
         className="
           relative
-          w-full max-w-lg
+          w-full max-w-lg h-150
           overflow-hidden
           rounded-3xl
           border border-white/20
@@ -101,10 +101,10 @@ export default function UploadCVModal({
         {/* Header */}
         <div className="relative flex items-start justify-between p-6 border-b border-gray-100">
           <div className="flex items-start gap-4">
-            <div className="p-3 rounded-2xl bg-indigo-100">
+            <div className="p-3 rounded-2xl bg-amber-100">
               <Sparkles
                 size={20}
-                className="text-indigo-600"
+                className="text-orange-600"
               />
             </div>
 
@@ -164,14 +164,14 @@ export default function UploadCVModal({
               ${
                 isDragging
                   ? `
-                    border-indigo-500
-                    bg-indigo-50
+                    border-orange-500
+                    bg-orange-50
                     scale-[1.01]
                   `
                   : `
                     border-gray-300
-                    hover:border-indigo-400
-                    hover:bg-indigo-50/50
+                    hover:border-orange-400
+                    hover:bg-orange-50/50
                   `
               }
             `}
@@ -186,7 +186,7 @@ export default function UploadCVModal({
             />
 
             {/* Glow */}
-            <div className="absolute inset-0 bg-linear-to-br from-indigo-500/5 to-blue-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
+            <div className="absolute inset-0 bg-linear-to-br from-orange-500/5 to-amber-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
 
             {file ? (
               <div className="relative flex flex-col items-center">
@@ -206,7 +206,7 @@ export default function UploadCVModal({
                   </div>
                 </div>
 
-                <h3 className="mt-4 font-semibold text-gray-900">
+                <h3 className="mt-4 font-semibold text-orange-900">
                   {file.name}
                 </h3>
 
@@ -233,10 +233,10 @@ export default function UploadCVModal({
               </div>
             ) : (
               <div className="relative">
-                <div className="mx-auto w-20 h-20 rounded-3xl bg-indigo-100 flex items-center justify-center mb-5 group-hover:scale-105 transition-transform">
+                <div className="mx-auto w-20 h-20 rounded-3xl bg-orange-100 flex items-center justify-center mb-5 group-hover:scale-105 hover:bg-orange-200 transition-transform">
                   <Upload
                     size={32}
-                    className="text-indigo-600"
+                    className="text-orange-600"
                   />
                 </div>
 
@@ -250,7 +250,7 @@ export default function UploadCVModal({
                   sélectionner un fichier
                 </p>
 
-                <div className="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-100 text-indigo-700 text-sm font-medium">
+                <div className="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-orange-100 text-orange-700 text-sm font-medium">
                   <Upload size={15} />
                   Choisir un fichier
                 </div>
@@ -290,8 +290,8 @@ export default function UploadCVModal({
                   text-sm text-gray-700
                   outline-none
                   transition-all
-                  focus:ring-4 focus:ring-indigo-100
-                  focus:border-indigo-400
+                  focus:ring-4 focus:ring-orange-100
+                  focus:border-orange-400
                 "
               >
                 <option value="">
@@ -341,8 +341,8 @@ export default function UploadCVModal({
                 px-5 py-3
                 rounded-2xl
                 bg-linear-to-r
-                from-indigo-600
-                to-blue-600
+                from-orange-600
+                to-amber-600
                 text-white
                 text-sm font-semibold
                 shadow-md hover:shadow-xl
