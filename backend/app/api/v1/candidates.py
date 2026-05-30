@@ -1,8 +1,21 @@
+# ============================================================================
 # backend/app/api/v1/candidates.py
+# ============================================================================
+# Smart ATS Candidate API
+#
+# Features:
+# - CRUD operations for candidates
+# - Candidate status workflow transitions
+# - Safe data sanitization
+# - CV depth analysis
+# - Supabase integration
+# - Clean architecture
+# ============================================================================
 
 from __future__ import annotations
 
 from uuid import UUID
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -15,7 +28,10 @@ from fastapi import (
 
 from app.core.security import get_current_user
 from app.core.state_machine import validate_transition
-from app.db.supabase_client import get_supabase
+
+from app.db.supabase_client import (
+    get_supabase,
+)
 
 from app.models.candidate import (
     CandidateCreate,
@@ -24,38 +40,43 @@ from app.models.candidate import (
     CandidateUpdate,
 )
 
+from app.services.ai_service import (
+    analyze_cv_depth,
+)
+
 router = APIRouter(
     prefix="/candidates",
     tags=["Candidates"],
 )
 
-
-# =========================================================
+# ============================================================================
 # HELPERS
-# =========================================================
+# ============================================================================
 
-def safe_list(value):
+
+def ensure_list(value: Any) -> list:
     """
-    Ensures value is always a list.
-    Prevents crashes when DB returns null/string.
+    Ensure database fields are always returned as lists.
+    Prevents null/string related crashes.
     """
+
     return value if isinstance(value, list) else []
 
 
 def sanitize_candidate(candidate: dict) -> dict:
     """
-    Sanitizes candidate payload coming from Supabase.
+    Normalize and sanitize candidate payloads coming from Supabase.
     """
 
-    candidate["skills"] = safe_list(
+    candidate["skills"] = ensure_list(
         candidate.get("skills")
     )
 
-    candidate["certifications"] = safe_list(
+    candidate["certifications"] = ensure_list(
         candidate.get("certifications")
     )
 
-    candidate["extracted_skills"] = safe_list(
+    candidate["extracted_skills"] = ensure_list(
         candidate.get("extracted_skills")
     )
 
@@ -67,9 +88,36 @@ def sanitize_candidate(candidate: dict) -> dict:
     return candidate
 
 
-# =========================================================
+def get_candidate_or_404(
+    supabase,
+    candidate_id: UUID,
+):
+    """
+    Fetch a candidate or raise 404.
+    """
+
+    response = (
+        supabase
+        .table("candidates")
+        .select("*")
+        .eq("id", str(candidate_id))
+        .single()
+        .execute()
+    )
+
+    if not response.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Candidate not found",
+        )
+
+    return response.data
+
+
+# ============================================================================
 # LIST CANDIDATES
-# =========================================================
+# ============================================================================
+
 
 @router.get(
     "/",
@@ -78,11 +126,15 @@ def sanitize_candidate(candidate: dict) -> dict:
 async def list_candidates(
     job_id: UUID | None = Query(None),
     status_filter: str | None = Query(
-        None,
+        default=None,
         alias="status",
     ),
     user: dict = Depends(get_current_user),
 ):
+    """
+    Retrieve all candidates with optional filtering.
+    """
+
     supabase = get_supabase()
 
     query = (
@@ -111,17 +163,16 @@ async def list_candidates(
 
     candidates = response.data or []
 
-    sanitized = [
-        sanitize_candidate(c)
-        for c in candidates
+    return [
+        sanitize_candidate(candidate)
+        for candidate in candidates
     ]
 
-    return sanitized
 
-
-# =========================================================
+# ============================================================================
 # GET SINGLE CANDIDATE
-# =========================================================
+# ============================================================================
+
 
 @router.get(
     "/{candidate_id}",
@@ -131,41 +182,24 @@ async def get_candidate(
     candidate_id: UUID,
     user: dict = Depends(get_current_user),
 ):
+    """
+    Retrieve a single candidate by ID.
+    """
+
     supabase = get_supabase()
 
-    response = (
-        supabase
-        .table("candidates")
-        .select("*")
-        .eq("id", str(candidate_id))
-        .single()
-        .execute()
-    )
-    
-    candidate = response.data or []
-
-    if not response.data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Candidate not found",
-        )
-        
-    candidate["skills"] = candidate.get("skills") or []
-    candidate["certifications"] = (
-        candidate.get("certifications") or []
-    )
-    candidate["extracted_skills"] = (
-        candidate.get("extracted_skills") or []
+    candidate = get_candidate_or_404(
+        supabase,
+        candidate_id,
     )
 
-    return sanitize_candidate(
-        response.data
-    )
+    return sanitize_candidate(candidate)
 
 
-# =========================================================
+# ============================================================================
 # CREATE CANDIDATE
-# =========================================================
+# ============================================================================
+
 
 @router.post(
     "/",
@@ -176,25 +210,30 @@ async def create_candidate(
     payload: CandidateCreate,
     user: dict = Depends(get_current_user),
 ):
+    """
+    Create a new candidate.
+    """
+
     supabase = get_supabase()
 
     data = payload.model_dump(
         exclude_none=True
     )
 
-    # Ensure safe arrays
-    data["skills"] = safe_list(
+    # Normalize array fields
+    data["skills"] = ensure_list(
         data.get("skills")
     )
 
-    data["certifications"] = safe_list(
+    data["certifications"] = ensure_list(
         data.get("certifications")
     )
 
-    data["extracted_skills"] = safe_list(
+    data["extracted_skills"] = ensure_list(
         data.get("extracted_skills")
     )
 
+    # UUID serialization
     if data.get("job_id"):
         data["job_id"] = str(
             data["job_id"]
@@ -218,9 +257,10 @@ async def create_candidate(
     )
 
 
-# =========================================================
+# ============================================================================
 # UPDATE CANDIDATE
-# =========================================================
+# ============================================================================
+
 
 @router.patch(
     "/{candidate_id}",
@@ -231,6 +271,10 @@ async def update_candidate(
     payload: CandidateUpdate,
     user: dict = Depends(get_current_user),
 ):
+    """
+    Update an existing candidate.
+    """
+
     supabase = get_supabase()
 
     data = payload.model_dump(
@@ -240,24 +284,23 @@ async def update_candidate(
     if not data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No fields to update",
+            detail="No fields provided for update",
         )
 
-    if "skills" in data:
-        data["skills"] = safe_list(
-            data.get("skills")
-        )
+    # Normalize array fields
+    list_fields = [
+        "skills",
+        "certifications",
+        "extracted_skills",
+    ]
 
-    if "certifications" in data:
-        data["certifications"] = safe_list(
-            data.get("certifications")
-        )
+    for field in list_fields:
+        if field in data:
+            data[field] = ensure_list(
+                data.get(field)
+            )
 
-    if "extracted_skills" in data:
-        data["extracted_skills"] = safe_list(
-            data.get("extracted_skills")
-        )
-
+    # UUID serialization
     if data.get("job_id"):
         data["job_id"] = str(
             data["job_id"]
@@ -282,22 +325,27 @@ async def update_candidate(
     )
 
 
-# =========================================================
-# TRANSITION STATUS
-# =========================================================
+# ============================================================================
+# TRANSITION CANDIDATE STATUS
+# ============================================================================
+
 
 @router.post(
     "/{candidate_id}/transition",
     response_model=CandidateResponse,
 )
-async def transition_status(
+async def transition_candidate_status(
     candidate_id: UUID,
     payload: CandidateStatusTransition,
     user: dict = Depends(get_current_user),
 ):
+    """
+    Transition candidate status using workflow validation.
+    """
+
     supabase = get_supabase()
 
-    current = (
+    candidate = (
         supabase
         .table("candidates")
         .select("id, status")
@@ -306,37 +354,44 @@ async def transition_status(
         .execute()
     )
 
-    if not current.data:
+    if not candidate.data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Candidate not found",
         )
 
+    current_status = candidate.data["status"]
+    new_status = payload.new_status.value
+
+    # Validate workflow transition
     validate_transition(
-        current.data["status"],
-        payload.new_status.value,
+        current_status,
+        new_status,
     )
 
     updated = (
         supabase
         .table("candidates")
         .update({
-            "status": payload.new_status.value
+            "status": new_status,
         })
         .eq("id", str(candidate_id))
         .execute()
     )
 
-    # Save history
-    supabase.table(
-        "candidate_status_history"
-    ).insert({
-        "candidate_id": str(candidate_id),
-        "from_status": current.data["status"],
-        "to_status": payload.new_status.value,
-        "changed_by": user["id"],
-        "note": payload.note,
-    }).execute()
+    # Save transition history
+    (
+        supabase
+        .table("candidate_status_history")
+        .insert({
+            "candidate_id": str(candidate_id),
+            "from_status": current_status,
+            "to_status": new_status,
+            "changed_by": user["id"],
+            "note": payload.note,
+        })
+        .execute()
+    )
 
     if not updated.data:
         raise HTTPException(
@@ -349,9 +404,10 @@ async def transition_status(
     )
 
 
-# =========================================================
+# ============================================================================
 # DELETE CANDIDATE
-# =========================================================
+# ============================================================================
+
 
 @router.delete(
     "/{candidate_id}",
@@ -361,6 +417,10 @@ async def delete_candidate(
     candidate_id: UUID,
     user: dict = Depends(get_current_user),
 ):
+    """
+    Delete a candidate permanently.
+    """
+
     supabase = get_supabase()
 
     response = (
@@ -380,3 +440,63 @@ async def delete_candidate(
     return Response(
         status_code=status.HTTP_204_NO_CONTENT
     )
+    
+# ============================================================================
+# DELETE ALL CANDIDATES
+# ============================================================================
+
+@router.delete(
+    "/",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_all_candidates(
+    user: dict = Depends(get_current_user),
+):
+    """
+    Delete all candidates permanently.
+    """
+
+    supabase = get_supabase()
+
+    response = (
+        supabase
+        .table("candidates")
+        .delete()
+        .neq("id", "00000000-0000-0000-0000-000000000000")
+        .execute()
+    )
+
+    return Response(
+        status_code=status.HTTP_204_NO_CONTENT
+    )
+
+
+# ============================================================================
+# CV DEPTH ANALYSIS
+# ============================================================================
+
+
+@router.get("/{candidate_id}/depth")
+async def get_candidate_cv_depth(
+    candidate_id: UUID,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Analyze CV depth using AI scoring intelligence.
+    """
+
+    supabase = get_supabase()
+
+    candidate = get_candidate_or_404(
+        supabase,
+        candidate_id,
+    )
+
+    report = analyze_cv_depth(
+        candidate
+    )
+
+    return {
+        "candidate_id": str(candidate_id),
+        "analysis": report,
+    }

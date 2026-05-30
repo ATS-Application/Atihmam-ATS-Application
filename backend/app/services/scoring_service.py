@@ -1,4 +1,4 @@
-# app/services/scoring_service.py
+# backend/app/services/scoring_service.py
 # =============================================================================
 # CE FICHIER EST LE CŒUR DU SYSTÈME DE NOTATION DES CANDIDATS.
 #
@@ -21,6 +21,12 @@
 # Le système détecte aussi automatiquement le DOMAINE du poste
 # (Informatique, Finance, Santé, BTP, etc.) pour adapter les critères
 # de notation : un comptable n'a pas besoin de connaître Docker !
+#
+# NOTE: compute_final_score() and get_final_candidate_assessment() were
+# intentionally removed from this file.  Both functions depend on
+# analyze_cv_depth() from ai_service.py, which already imports
+# compute_candidate_score from here — placing them here creates a circular
+# import.  The correct home for those blended-score helpers is ai_service.py.
 # =============================================================================
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -109,6 +116,7 @@ class Domain(str, Enum):
 
     # --- Domaines NON-TECHNIQUES : utilisent un profil de scoring personnalisé ---
     SUPPLY_CHAIN    = "Achats & Supply Chain"
+    PURCHASING_MANAGER = "Responsable Achats"
     ADMIN           = "Administration & Secrétariat"
     AGRI            = "Agriculture & Agroalimentaire"
     ART             = "Art, Culture & Design"
@@ -212,7 +220,8 @@ _DOMAIN_DETECTION: dict[Domain, frozenset[str]] = {
     Domain.QHSE:          frozenset({"hse", "qualité", "iso 9001", "iso 14001", "sécurité au travail",
                                      "audit qualité", "non-conformité", "certification qhse"}),
     Domain.SUPPLY_CHAIN:  frozenset({"achat", "supply chain", "approvisionnement", "logistique",
-                                     "fournisseur", "négociation achat", "erp", "stock"}),
+                                     "fournisseur", "négociation achat", "erp", "stock", "sla", "Service-Level Agreement", "SLA"}),
+    Domain.PURCHASING_MANAGER: frozenset({"responsable achats", "chef des achats", "directeur achats", "sla", "Service-Level Agreement", "SLA"}),
     Domain.ADMIN:         frozenset({"secrétariat", "assistante", "agenda", "courrier",
                                      "accueil", "classement", "bureautique", "archivage"}),
     Domain.AGRI:          frozenset({"agriculture", "élevage", "agronomie", "semences",
@@ -258,23 +267,6 @@ _DOMAIN_DETECTION: dict[Domain, frozenset[str]] = {
 # -----------------------------------------------------------------------------
 # PROFILS DE SCORING PAR DOMAINE NON-TECHNIQUE
 # -----------------------------------------------------------------------------
-# Chaque entrée de ce dictionnaire définit les règles de scoring spécifiques
-# à un domaine métier.
-#
-# Exemple de lecture pour Domain.ACCOUNTING :
-#   - keywords : "comptabilité", "IFRS", "OHADA", "Sage", etc.
-#     → Si ces mots apparaissent à la fois dans le CV ET l'offre, le score
-#       de mots-clés monte.
-#   - indicators : "ifrs" = 20 pts, "ohada" = 20 pts, "audit externe" = 20 pts...
-#     → Présents dans le CV, ces termes indiquent une expertise poussée.
-#   - weight_overrides : keyword=25%, sémantique=30%, expérience=20%,
-#       éducation=15%, complexité=5%, leadership=5%
-#     → Pour la comptabilité, l'éducation (diplôme) compte plus que la moyenne.
-#
-# Note : les domaines de la famille TECH (NETWORKS, ENGINEERING, etc.) ont
-# aussi des profils ici pour étendre les mots-clés et indicateurs tech,
-# mais ils restent dans le pipeline "tech" (TECH_DOMAINS).
-# -----------------------------------------------------------------------------
 _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.SUPPLY_CHAIN: DomainProfile(
         keywords=("achat", "approvisionnement", "supply chain", "erp", "sap",
@@ -282,26 +274,30 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "appel d'offres", "sourcing", "stock", "s&op"),
         indicators={"sap": 20, "erp": 15, "s&op": 20, "négociation": 15,
                     "sourcing international": 20, "réduction coûts": 15},
-        weight_overrides={"keyword": 0.25, "semantic": 0.35, "experience": 0.20,
-                          "leadership": 0.10, "complexity": 0.05, "education": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
         leadership_terms=("chef des achats", "responsable supply chain", "directeur achats"),
+    ),
+    Domain.PURCHASING_MANAGER: DomainProfile(
+        keywords=("responsable achats", "chef des achats", "directeur achats"),
+        indicators={"sla": 20, "service-level agreement": 20, "slas": 20},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
     ),
     Domain.ADMIN: DomainProfile(
         keywords=("secrétariat", "bureautique", "word", "excel", "agenda",
                   "courrier", "classement", "archivage", "accueil", "office"),
         indicators={"bilingue": 20, "office 365": 15, "gestion agenda": 15},
-        # Pour l'admin, la sémantique (sens général du texte) compte beaucoup
-        # car les tâches sont variées et difficiles à résumer en mots-clés précis.
-        weight_overrides={"keyword": 0.20, "semantic": 0.40, "experience": 0.20,
-                          "education": 0.10, "leadership": 0.05, "complexity": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
     ),
     Domain.AGRI: DomainProfile(
         keywords=("agronomie", "agriculture", "élevage", "cultures", "semences",
                   "irrigation", "fertilisation", "agroalimentaire", "phytosanitaire"),
         indicators={"agriculture biologique": 20, "certification bio": 20,
                     "gestion d'exploitation": 15, "irrigation": 10},
-        weight_overrides={"keyword": 0.20, "semantic": 0.35, "experience": 0.25,
-                          "education": 0.10, "complexity": 0.05, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
     ),
     Domain.ART: DomainProfile(
         keywords=("design", "graphisme", "illustrator", "photoshop", "figma",
@@ -309,19 +305,17 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "photographie", "vidéo", "3d", "after effects"),
         indicators={"direction artistique": 20, "identité visuelle": 15,
                     "motion design": 15, "ux research": 20},
-        weight_overrides={"keyword": 0.25, "semantic": 0.35, "experience": 0.15,
-                          "education": 0.10, "complexity": 0.10, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "education": 0.10, "complexity": 0.25, "leadership": 0.05},
     ),
     Domain.BANKING: DomainProfile(
         keywords=("banque", "assurance", "crédit", "risque", "portefeuille",
                   "conformité", "bâle iii", "solvabilité", "actuariat",
                   "kyc", "aml", "produits financiers", "taux"),
-        # Bâle III, KYC/AML et IFRS 9 sont des normes réglementaires très
-        # spécifiques → leur présence dans un CV signale une expertise réelle.
         indicators={"bâle iii": 20, "kyc/aml": 20, "actuariat": 20,
                     "gestion risque": 15, "ifrs 9": 20},
-        weight_overrides={"keyword": 0.25, "semantic": 0.30, "experience": 0.20,
-                          "education": 0.10, "complexity": 0.10, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
     ),
     Domain.SALES: DomainProfile(
         keywords=("vente", "commercial", "prospection", "crm", "b2b", "b2c",
@@ -329,9 +323,8 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "account manager", "fidélisation", "développement commercial"),
         indicators={"développement commercial": 15, "grand compte": 20,
                     "b2b": 10, "crm": 10, "objectifs dépassés": 20},
-        # Pour la vente, l'expérience terrain (0.25) prime sur l'éducation (0.05).
-        weight_overrides={"keyword": 0.20, "semantic": 0.30, "experience": 0.25,
-                          "complexity": 0.10, "leadership": 0.10, "education": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "complexity": 0.25, "leadership": 0.10, "education": 0.05},
         leadership_terms=("directeur commercial", "chef des ventes", "key account manager"),
     ),
     Domain.ACCOUNTING: DomainProfile(
@@ -340,10 +333,8 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "déclarations fiscales", "rapprochement bancaire", "budget"),
         indicators={"ifrs": 20, "ohada": 20, "audit externe": 20,
                     "contrôle de gestion": 15, "sage": 10},
-        # En comptabilité, le diplôme (education=0.15) est plus valorisé
-        # que dans beaucoup d'autres domaines non-tech.
-        weight_overrides={"keyword": 0.25, "semantic": 0.30, "experience": 0.20,
-                          "education": 0.15, "complexity": 0.05, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "education": 0.10, "complexity": 0.25, "leadership": 0.05},
     ),
     Domain.BTP: DomainProfile(
         keywords=("construction", "btp", "génie civil", "conducteur de travaux",
@@ -351,8 +342,8 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "planification", "lot technique", "métré", "vrd"),
         indicators={"conducteur de travaux senior": 20, "autocad": 15,
                     "gestion multi-chantiers": 20, "vrd": 15, "béton armé": 10},
-        weight_overrides={"keyword": 0.25, "semantic": 0.30, "experience": 0.25,
-                          "education": 0.10, "complexity": 0.05, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
         leadership_terms=("directeur de travaux", "chef de chantier", "ingénieur génie civil"),
     ),
     Domain.LEGAL: DomainProfile(
@@ -361,28 +352,24 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "droit des sociétés", "code civil", "tribunal"),
         indicators={"droit ohada": 20, "contentieux complexe": 20,
                     "contrats internationaux": 20, "droit des affaires": 15},
-        # En droit, éducation (0.20) et mots-clés (0.25) dominent.
-        # La complexité (0.03) et le leadership (0.02) ont peu de poids :
-        # le titre de "chef" importe moins que la spécialité juridique.
-        weight_overrides={"keyword": 0.25, "semantic": 0.30, "experience": 0.20,
-                          "education": 0.20, "complexity": 0.03, "leadership": 0.02},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "education": 0.10, "complexity": 0.25, "leadership": 0.05},
     ),
     Domain.EDUCATION: DomainProfile(
         keywords=("enseignement", "formation", "pédagogie", "curriculum",
                   "e-learning", "évaluation", "professeur", "ingénierie pédagogique"),
         indicators={"ingénierie pédagogique": 20, "e-learning": 15,
                     "formation certifiante": 20},
-        weight_overrides={"keyword": 0.20, "semantic": 0.35, "experience": 0.20,
-                          "education": 0.15, "complexity": 0.05, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "education": 0.10, "complexity": 0.25, "leadership": 0.05},
     ),
     Domain.HOSPITALITY: DomainProfile(
         keywords=("hôtellerie", "restauration", "cuisine", "service en salle",
                   "f&b", "sommellerie", "haccp", "réception", "housekeeping"),
         indicators={"étoile michelin": 20, "haccp": 15, "revenue management": 20,
                     "classification hôtelière": 15},
-        # L'hôtellerie-restauration valorise fortement l'expérience terrain (0.30).
-        weight_overrides={"keyword": 0.20, "semantic": 0.30, "experience": 0.30,
-                          "education": 0.08, "complexity": 0.07, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.30, "experience": 0.35,
+                          "education": 0.18, "complexity": 0.20, "leadership": 0.05},
     ),
     Domain.REAL_ESTATE: DomainProfile(
         keywords=("immobilier", "transaction", "bail", "promotion immobilière",
@@ -398,10 +385,8 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "photojournalisme", "digital media"),
         indicators={"grand reportage": 20, "rédacteur en chef": 20,
                     "digital media": 15},
-        # Le journalisme repose beaucoup sur la sémantique (0.40) car
-        # la qualité rédactionnelle est difficile à capturer avec des mots-clés seuls.
-        weight_overrides={"keyword": 0.20, "semantic": 0.40, "experience": 0.20,
-                          "education": 0.08, "complexity": 0.07, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.40, "experience": 0.20,
+                          "education": 0.08, "complexity": 0.27, "leadership": 0.05},
     ),
     Domain.MARKETING: DomainProfile(
         keywords=("marketing", "communication", "seo", "sem", "google ads",
@@ -429,11 +414,8 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "radiologie", "biologie médicale", "clinique", "protocole médical"),
         indicators={"spécialité médicale": 25, "chef de service": 20,
                     "recherche clinique": 20, "urgences": 15},
-        # La santé valorise fortement l'éducation (0.18) car les diplômes médicaux
-        # sont obligatoires et réglementés. Le leadership (0.03) compte peu
-        # car le titre seul ne reflète pas la compétence clinique.
-        weight_overrides={"keyword": 0.20, "semantic": 0.30, "experience": 0.25,
-                          "education": 0.18, "complexity": 0.04, "leadership": 0.03},
+        weight_overrides={"keyword": 0.04, "semantic": 0.30, "experience": 0.30,
+                          "education": 0.23, "complexity": 0.10, "leadership": 0.03},
     ),
     Domain.GENERAL_SERVICES: DomainProfile(
         keywords=("facility management", "maintenance", "nettoyage", "gardiennage",
@@ -446,19 +428,15 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
         keywords=("stage", "alternance", "apprentissage", "projet académique",
                   "mémoire", "rapport de stage"),
         indicators={"projet transversal": 10, "stage longue durée": 15},
-        # Pour un stage, l'éducation (0.25) prime sur l'expérience (0.10)
-        # car les stagiaires n'ont pas encore de carrière longue.
-        # La sémantique (0.40) est haute pour capter les projets académiques
-        # et les centres d'intérêt pertinents.
-        weight_overrides={"keyword": 0.15, "semantic": 0.40, "experience": 0.10,
-                          "education": 0.25, "complexity": 0.05, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
     ),
     Domain.TOURISM: DomainProfile(
         keywords=("tourisme", "voyage", "agence de voyage", "guide touristique",
                   "billetterie", "crm touristique", "gds", "amadeus"),
         indicators={"amadeus": 20, "gds": 15, "tourisme international": 20},
-        weight_overrides={"keyword": 0.20, "semantic": 0.35, "experience": 0.25,
-                          "education": 0.08, "complexity": 0.07, "leadership": 0.05},
+        weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+                          "leadership": 0.10, "complexity": 0.25, "education": 0.05},
     ),
     Domain.TRANSPORT: DomainProfile(
         keywords=("transport", "logistique", "chauffeur", "fret", "douane",
@@ -475,9 +453,6 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "protection sociale", "assistance aux personnes vulnérables"),
         indicators={"gestion de projet ong": 20, "plaidoyer": 15,
                     "financement bailleur": 20, "développement communautaire": 15},
-        # Le travail social mise beaucoup sur la sémantique (0.40) car les valeurs,
-        # la motivation et le contexte d'intervention sont difficiles à capter
-        # avec des mots-clés stricts.
         weight_overrides={"keyword": 0.20, "semantic": 0.40, "experience": 0.18,
                           "education": 0.12, "complexity": 0.05, "leadership": 0.05},
     ),
@@ -499,20 +474,18 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
                   "maintenance préventive"),
         indicators={"catia": 20, "simulation cfd": 20, "certification iso": 15,
                     "projet r&d": 15},
-        weight_overrides={"keyword": 0.25, "semantic": 0.30, "experience": 0.25,
-                          "certification": 0.05, "complexity": 0.10,
-                          "education": 0.03, "leadership": 0.02},
+        weight_overrides={"keyword": 0.10, "semantic": 0.30, "experience": 0.30,
+                          "certification": 0.05, "complexity": 0.15,
+                          "education": 0.07, "leadership": 0.02},
     ),
     Domain.SCIENCE: DomainProfile(
         keywords=("laboratoire", "protocole", "expérimentation", "publication",
                   "thèse", "r&d", "chimie", "biologie", "statistiques",
                   "matlab", "spss", "r", "python"),
-        # Une publication indexée (25 pts) ou une thèse (20 pts) sont
-        # des preuves très fortes d'expertise académique en recherche.
         indicators={"publication indexée": 25, "thèse": 20, "brevet": 20,
                     "financement recherche": 15},
-        weight_overrides={"keyword": 0.20, "semantic": 0.30, "experience": 0.15,
-                          "certification": 0.05, "complexity": 0.10,
+        weight_overrides={"keyword": 0.10, "semantic": 0.30, "experience": 0.20,
+                          "certification": 0.05, "complexity": 0.15,
                           "education": 0.15, "leadership": 0.05},
     ),
     Domain.ENERGY: DomainProfile(
@@ -548,7 +521,6 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 }
 
 # Profil de secours : utilisé quand aucun profil n'est défini pour un domaine.
-# Reprend exactement DEFAULT_WEIGHTS sans modification.
 _FALLBACK_PROFILE = DomainProfile(
     keywords=(),
     indicators={},
@@ -559,30 +531,6 @@ _FALLBACK_PROFILE = DomainProfile(
 # -----------------------------------------------------------------------------
 # CONSTANTES DU PIPELINE TECHNIQUE
 # -----------------------------------------------------------------------------
-# Ces constantes servent UNIQUEMENT pour les domaines TECH_DOMAINS.
-# Pour les autres domaines, les profils (_DOMAIN_PROFILES) les remplacent.
-#
-# TECH_KEYWORDS : liste des technologies recherchées dans les CVs tech.
-# _KW_PATTERNS  : version pré-compilée de ces mots-clés en expressions régulières.
-#   → La compilation est faite une seule fois au chargement du module.
-#   → \b...\b délimite les mots entiers (évite "java" de matcher "javascript").
-#   → Les expressions avec espaces (ex: "spring boot") n'ont pas besoin de \b.
-#
-# CERTIFICATION_SCORES : points bonus pour certifications reconnues.
-#   AWS, Scrum, Oracle → entre 30 et 35 pts chacune.
-#
-# LEADERSHIP_TERMS : mots qui indiquent un rôle d'encadrement.
-#
-# COMPLEXITY_INDICATORS : termes qui signalent des projets techniques complexes,
-#   avec leur valeur en points. Ex: "kubernetes" = 20 pts, "ci/cd" = 10 pts.
-#
-# DEFAULT_REQUIRED_EXPERIENCE : si l'offre ne précise pas d'expérience requise,
-#   on utilise 5 ans par défaut.
-#
-# DEFAULT_WEIGHTS : poids de base de chaque dimension dans le score final.
-#   La somme vaut 1 (100%). Ces poids sont adaptatifs (voir plus bas).
-# -----------------------------------------------------------------------------
-
 TECH_KEYWORDS: tuple[str, ...] = (
     "spring boot", "node.js", "ci/cd",
     "python", "java", "spring", "react", "angular",
@@ -627,25 +575,18 @@ COMPLEXITY_INDICATORS: dict[str, int] = {
 DEFAULT_REQUIRED_EXPERIENCE: int = 5
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "keyword":       0.25,
-    "semantic":      0.25,
-    "experience":    0.25,
+    "keyword":       0.10,
+    "semantic":      0.20,
+    "experience":    0.15,
     "certification": 0.10,
-    "complexity":    0.15,
+    "complexity":    0.30,
     "education":     0.10,
     "leadership":    0.05,
 }
 
-# Boost appliqué à un poids quand un recruteur "like" un candidat
-# dont cette dimension est forte (> 50).
 _LIKE_BOOST    = 0.05
-
-# Pénalité appliquée quand un recruteur "dislike" un candidat.
 _DISLIKE_DECAY = 0.05
 
-# Table de correspondance : nom de la dimension dans le résultat
-# → nom de la clé dans le dictionnaire des poids.
-# Utilisé par update_weights_from_feedback() pour modifier le bon poids.
 _DIM_TO_WEIGHT: dict[str, str] = {
     "keyword_score":            "keyword",
     "semantic_score":           "semantic",
@@ -656,9 +597,6 @@ _DIM_TO_WEIGHT: dict[str, str] = {
     "project_complexity_score": "complexity",
 }
 
-# Poids actifs en mémoire. Initialisés avec DEFAULT_WEIGHTS.
-# Peuvent être mis à jour par update_weights_from_feedback().
-# Variable globale : partagée entre tous les appels dans le même processus.
 _active_weights: dict[str, float] = dict(DEFAULT_WEIGHTS)
 
 
@@ -675,17 +613,14 @@ def classify_domain(cv_text: str, job_title: str, job_requirements: str) -> Doma
     combien de signaux de _DOMAIN_DETECTION apparaissent pour chaque domaine.
     Le domaine avec le plus de correspondances l'emporte.
 
-    En cas d'égalité, c'est le premier domaine rencontré dans _DOMAIN_DETECTION
-    qui gagne. Comme les domaines TECH sont définis en premier dans l'enum et
-    le dictionnaire, ils ont la priorité sur les offres ambiguës.
-
-    Si aucun signal ne correspond (texte vide ou hors domaine connu),
-    on retourne Domain.TECH par défaut (le domaine le plus générique).
+    En cas d'égalité, les domaines TECH ont la priorité car ils sont définis
+    en premier dans l'enum et le dictionnaire. Si aucun signal ne correspond,
+    on retourne Domain.TECH par défaut.
     """
     combined = _norm(f"{cv_text} {job_title} {job_requirements}")
 
-    best_domain  = Domain.TECH
-    best_hits    = 0
+    best_domain = Domain.TECH
+    best_hits   = 0
 
     for domain, signals in _DOMAIN_DETECTION.items():
         hits = sum(1 for sig in signals if sig in combined)
@@ -706,22 +641,12 @@ def _norm(text: str | None) -> str:
 
 
 def _clamp(value: float) -> float:
-    """
-    Contraint une valeur dans l'intervalle [0, 100] et arrondit à 2 décimales.
-    Empêche les scores négatifs ou supérieurs à 100.
-    """
+    """Contraint une valeur dans [0, 100] et arrondit à 2 décimales."""
     return round(max(0.0, min(value, 100.0)), 2)
 
 
 def safe_list(value: Any) -> list[str]:
-    """
-    Convertit en toute sécurité une valeur quelconque en liste de chaînes.
-    Gère les cas fréquents dans les données de CV :
-      - None          → liste vide
-      - str JSON      → parse et retourne la liste (ex: '["Python","Java"]')
-      - str simple    → liste à un élément (ex: "Python")
-      - list          → nettoyage et conversion en str
-    """
+    """Convertit en toute sécurité une valeur quelconque en liste de chaînes."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -737,11 +662,7 @@ def safe_list(value: Any) -> list[str]:
 
 
 def safe_dict_list(value: Any) -> list[dict]:
-    """
-    Même logique que safe_list, mais pour des listes de dictionnaires.
-    Utilisé pour work_history, projects, education (tableaux d'objets).
-    Filtre les éléments qui ne sont pas des dicts (robustesse aux données mal formées).
-    """
+    """Même logique que safe_list, mais pour des listes de dictionnaires."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -764,17 +685,6 @@ def infer_experience_years(work_history: list[Any]) -> float:
     """
     Calcule le nombre total d'années d'expérience à partir de l'historique
     de travail d'un candidat.
-
-    Pour chaque poste, on essaie dans cet ordre :
-      1. Utiliser le champ "duration_months" s'il est déjà calculé.
-      2. Calculer la durée à partir de "start_date" et "end_date".
-         - Les dates peuvent être "YYYY-MM-DD", "YYYY-MM" ou "YYYY".
-         - Si "end_date" est absent, on considère que le poste est actuel
-           (date de fin = maintenant).
-      3. Si les dates sont invalides, on ignore ce poste (continue).
-
-    Retourne le total en années (arrondi à 1 décimale).
-    Ex: 30 mois → 2.5 ans.
     """
     total_months = 0
 
@@ -793,7 +703,6 @@ def infer_experience_years(work_history: list[Any]) -> float:
         try:
             if not start:
                 continue
-            # Normalise les dates au format "YYYY-MM" pour strptime
             start_str = start[:7] if len(start) >= 7 else f"{start[:4]}-01"
             end_str   = end[:7]   if (end and len(end) >= 7) else (
                         f"{end[:4]}-01" if (end and len(end) >= 4) else None)
@@ -806,10 +715,10 @@ def infer_experience_years(work_history: list[Any]) -> float:
                 + end_dt.month
                 - start_dt.month
             )
-            total_months += max(months, 0)  # max(..., 0) empêche les durées négatives
+            total_months += max(months, 0)
 
         except (ValueError, TypeError):
-            continue  # date mal formée → on ignore ce poste
+            continue
 
     return round(total_months / 12, 1)
 
@@ -819,31 +728,11 @@ def infer_experience_years(work_history: list[Any]) -> float:
 # =============================================================================
 
 def _build_cv_text(cv: dict[str, Any]) -> str:
-    """
-    Construit une représentation textuelle complète d'un CV pour l'analyse.
-
-    Stratégie de récupération des données (ordre de priorité) :
-      1. Champs directs du CV (work_history, projects, education, skills, etc.)
-      2. Champ "ai_extracted_data" : données extraites par IA (JSON ou dict)
-         → utilisé en fallback si les champs directs sont vides.
-
-    Le texte final concatène (dans l'ordre) :
-      - Résumé du profil
-      - Poste actuel
-      - Compétences (liste)
-      - Certifications (liste)
-      - Historique pro (titre + entreprise + description de chaque poste)
-      - Projets (nom + tech + description + complexité)
-      - Formation (diplôme + établissement)
-      - Texte brut du CV (tronqué à 1000 caractères pour ne pas surcharger)
-
-    Tout est normalisé (minuscules) via _norm() avant retour.
-    """
+    """Construit une représentation textuelle complète d'un CV pour l'analyse."""
     work_history = safe_dict_list(cv.get("work_history"))
     projects     = safe_dict_list(cv.get("projects"))
     education    = safe_dict_list(cv.get("education"))
 
-    # Tentative de lecture de ai_extracted_data (peut être une str JSON ou un dict)
     ai_data: dict[str, Any] = {}
     raw_ai = cv.get("ai_extracted_data")
     if isinstance(raw_ai, str):
@@ -854,7 +743,6 @@ def _build_cv_text(cv: dict[str, Any]) -> str:
     elif isinstance(raw_ai, dict):
         ai_data = raw_ai
 
-    # Fallback vers ai_extracted_data si les champs directs sont vides
     if not work_history:
         work_history = safe_dict_list(ai_data.get("work_history"))
     if not projects:
@@ -901,7 +789,7 @@ def _build_cv_text(cv: dict[str, Any]) -> str:
         " ".join(work_parts),
         " ".join(project_parts),
         " ".join(education_parts),
-        str(cv_raw_text)[:1000],  # Limité à 1000 chars pour les perfs
+        str(cv_raw_text)[:1000],
     ]
 
     return _norm(" ".join(filter(None, parts)))
@@ -920,19 +808,7 @@ def _extract_keywords_from_set(
     text: str,
     keywords: tuple[str, ...],
 ) -> set[str]:
-    """
-    Recherche des mots-clés dans un texte à partir d'un tuple arbitraire.
-
-    Pour chaque mot-clé, compile un pattern regex à la volée :
-      - Mot simple (sans espace) → \b...\b pour chercher des mots entiers.
-        Ex: "java" ne matche pas dans "javascript".
-      - Expression avec espace (ex: "supply chain") → recherche directe
-        de la phrase (pas besoin de \b car les espaces servent de délimiteurs).
-
-    Note : pour TECH_KEYWORDS, on utilise _extract_tech_keywords() qui est
-    plus rapide car les patterns sont pré-compilés au niveau du module.
-    Cette fonction est réservée aux keywords des profils de domaine.
-    """
+    """Recherche des mots-clés dans un texte à partir d'un tuple arbitraire."""
     result: set[str] = set()
     for kw in keywords:
         pat = re.compile(
@@ -945,11 +821,7 @@ def _extract_keywords_from_set(
 
 
 def _extract_tech_keywords(text: str) -> set[str]:
-    """
-    Version rapide du matching pour les mots-clés tech.
-    Utilise les patterns pré-compilés _KW_PATTERNS (module-level)
-    au lieu de recompiler à chaque appel.
-    """
+    """Version rapide du matching pour les mots-clés tech (patterns pré-compilés)."""
     return {kw for kw, pat in _KW_PATTERNS.items() if pat.search(text)}
 
 
@@ -961,20 +833,8 @@ def _keyword_match(
     """
     Calcule le score de correspondance par mots-clés entre un CV et une offre.
 
-    Logique :
-      1. On extrait les mots-clés présents dans le CV → cv_kws
-      2. On extrait les mots-clés présents dans l'offre → job_kws
-      3. matched = intersection (présents dans les deux)
-      4. missing = dans l'offre mais pas dans le CV (compétences manquantes)
-
-    Score :
-      - Si l'offre n'a aucun mot-clé reconnu → 50 (score neutre, pas pénalisant)
-      - Sinon : (nb mots matchés / nb mots dans l'offre) * 100
-
     Si keywords=None → pipeline tech (TECH_KEYWORDS pré-compilés).
     Si keywords fournis → pipeline domaine (profil spécifique).
-
-    Retourne : {"score": float, "matched": list, "missing": list}
     """
     if keywords is None:
         cv_kws  = _extract_tech_keywords(cv_text)
@@ -1000,27 +860,7 @@ def _keyword_match(
 # =============================================================================
 
 def _semantic_score(cv_text: str, job_text: str) -> float:
-    """
-    Mesure la similarité sémantique entre le CV et l'offre d'emploi.
-
-    Contrairement aux mots-clés (correspondance exacte), la similarité
-    sémantique capture le "sens" : un CV qui parle de "développement backend"
-    sera considéré proche d'une offre qui cherche un "ingénieur serveur",
-    même si les mots sont différents.
-
-    Algorithme :
-      1. Tronque les textes (CV à 4000 chars, offre à 2000) pour limiter
-         le temps de calcul et éviter de noyer le modèle.
-      2. Le SentenceTransformer encode les deux textes en vecteurs numériques
-         (des "embeddings" de 384 dimensions pour all-MiniLM-L6-v2).
-         normalize_embeddings=True : les vecteurs sont normalisés (norme = 1),
-         ce qui rend la cosine similarity équivalente au produit scalaire
-         → calcul plus rapide.
-      3. cosine_similarity calcule l'angle entre les deux vecteurs.
-         Résultat entre -1 et 1 → multiplié par 100 pour avoir 0-100.
-
-    En cas d'erreur (ex: modèle non chargé), retourne 0 sans faire planter.
-    """
+    """Mesure la similarité sémantique entre le CV et l'offre d'emploi."""
     cv_text  = cv_text[:4000]
     job_text = job_text[:2000]
 
@@ -1047,14 +887,7 @@ def _semantic_score(cv_text: str, job_text: str) -> float:
 # =============================================================================
 
 def _experience_score(candidate_years: float, required_years: float) -> float:
-    """
-    Score d'expérience : rapport entre ce que le candidat a et ce qui est requis.
-
-    Ex: 3 ans d'expérience pour 5 ans requis → (3/5)*100 = 60.
-        7 ans pour 5 requis → (7/5)*100 = 140 → clampé à 100.
-
-    Si required_years <= 0 (non spécifié), score = 100 (pas de pénalité).
-    """
+    """Score d'expérience : rapport entre ce que le candidat a et ce qui est requis."""
     try:
         candidate_years = float(candidate_years or 0)
         required_years  = float(required_years  or 0)
@@ -1066,28 +899,13 @@ def _experience_score(candidate_years: float, required_years: float) -> float:
 
 
 def _certification_score(cv_text: str) -> float:
-    """
-    Score de certifications (pipeline TECH uniquement).
-    Cherche "aws", "scrum", "oracle" dans le texte du CV.
-    Additionne les points correspondants (AWS=35, Scrum=30, Oracle=35).
-    Résultat clampé à 100.
-    Note : non appelé pour les domaines non-tech (remplacé par _complexity_score).
-    """
+    """Score de certifications (pipeline TECH uniquement)."""
     total = sum(pts for cert, pts in CERTIFICATION_SCORES.items() if cert in cv_text)
     return _clamp(total)
 
 
 def _education_score(cv_text: str) -> float:
-    """
-    Score de niveau d'études (simple détection par mots-clés).
-    Hiérarchie décroissante :
-      Doctorat/PhD → 100
-      Master/Mastère → 90
-      Licence/Bachelor/BTS/DUT → 75
-      Autre (aucun diplôme détecté) → 50 (score de base, pas 0)
-
-    Note : utilise des mots-clés en français et anglais pour la robustesse.
-    """
+    """Score de niveau d'études (simple détection par mots-clés)."""
     if "phd" in cv_text or "doctorate" in cv_text or "doctorat" in cv_text:
         return 100.0
     if "master" in cv_text or "mastère" in cv_text:
@@ -1098,15 +916,7 @@ def _education_score(cv_text: str) -> float:
 
 
 def _leadership_score(cv_text: str, extra_terms: tuple[str, ...] = ()) -> float:
-    """
-    Score de leadership : compte les termes d'encadrement dans le CV.
-
-    Combine la liste globale LEADERSHIP_TERMS avec les termes spécifiques
-    au domaine (extra_terms) fournis par le DomainProfile.
-
-    +20 points par terme trouvé, clampé à 100.
-    Ex: "lead" + "mentor" + "management" → 3 * 20 = 60 pts.
-    """
+    """Score de leadership : compte les termes d'encadrement dans le CV."""
     all_terms = LEADERSHIP_TERMS + extra_terms
     matches   = sum(1 for term in all_terms if term in cv_text)
     return _clamp(matches * 20)
@@ -1116,18 +926,7 @@ def _complexity_score(
     cv_text: str,
     indicators: dict[str, int] | None = None,
 ) -> float:
-    """
-    Score de complexité / profondeur technique ou métier.
-
-    Additionne les points de chaque indicateur trouvé dans le CV.
-
-    Deux modes :
-      - indicators=None  → utilise COMPLEXITY_INDICATORS (tech, ex: kubernetes=20)
-      - indicators fourni → utilise les indicateurs du DomainProfile
-        (ex: pour QHSE : "iso 9001"=20, "audit tierce partie"=20)
-
-    Résultat clampé à 100.
-    """
+    """Score de complexité / profondeur technique ou métier."""
     source = indicators if indicators is not None else COMPLEXITY_INDICATORS
     score  = sum(pts for term, pts in source.items() if term in cv_text)
     return _clamp(score)
@@ -1144,41 +943,17 @@ def _resolve_weights(
     """
     Fusionne les poids de base avec les surcharges du profil de domaine,
     puis normalise pour que la somme fasse exactement 1.
-
-    Les clés présentes dans overrides remplacent celles de base.
-    Les clés absentes de overrides conservent leurs valeurs de base.
-
-    Exemple :
-      base     = {"keyword": 0.20, "semantic": 0.30, ...}
-      overrides= {"semantic": 0.40, "education": 0.15}
-      merged   = {"keyword": 0.20, "semantic": 0.40, ..., "education": 0.15}
-      → normalisé pour que sum = 1.
     """
     merged = {**base, **overrides}
     return _normalize_weights(merged)
 
 
 # =============================================================================
-# GESTION ADAPTATIVE DES POIDS (APPRENTISSAGE PAR FEEDBACK)
-# =============================================================================
-# Ce système permet aux recruteurs d'améliorer la pertinence des scores
-# au fil du temps via des "like" et "dislike" sur les candidats proposés.
-#
-# Fonctionnement :
-#   1. Les poids sont stockés en base de données (table app_config, clé "ats_weights").
-#   2. Au démarrage, _load_weights() charge ces poids depuis la DB.
-#      En absence de DB (tests, dev local), utilise _active_weights en mémoire.
-#   3. Quand un recruteur like/dislike un candidat, update_weights_from_feedback()
-#      ajuste les poids des dimensions qui ont le plus contribué au score.
-#   4. Les nouveaux poids sont normalisés et sauvegardés en DB.
+# GESTION ADAPTATIVE DES POIDS
 # =============================================================================
 
 def _load_weights(supabase=None) -> dict[str, float]:
-    """
-    Charge les poids depuis Supabase (ou retourne les poids en mémoire si pas de DB).
-    Valide que tous les clés de DEFAULT_WEIGHTS sont présentes avant d'utiliser
-    les poids stockés (protection contre une DB corrompue ou incomplète).
-    """
+    """Charge les poids depuis Supabase (ou retourne les poids en mémoire si pas de DB)."""
     if supabase is None:
         return dict(_active_weights)
 
@@ -1203,11 +978,7 @@ def _load_weights(supabase=None) -> dict[str, float]:
 
 
 def _save_weights(weights: dict[str, float], supabase=None) -> None:
-    """
-    Sauvegarde les poids dans Supabase via un UPSERT (insert ou update).
-    on_conflict="key" : met à jour la ligne existante si "ats_weights" existe déjà.
-    Silencieux si pas de DB (ne fait rien).
-    """
+    """Sauvegarde les poids dans Supabase via un UPSERT."""
     if supabase is None:
         return
     try:
@@ -1220,11 +991,7 @@ def _save_weights(weights: dict[str, float], supabase=None) -> None:
 
 
 def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
-    """
-    Normalise un dictionnaire de poids pour que leur somme vaille exactement 1.
-    Si la somme est nulle ou négative (cas dégénéré), retourne DEFAULT_WEIGHTS.
-    Chaque valeur est arrondie à 4 décimales.
-    """
+    """Normalise un dictionnaire de poids pour que leur somme vaille exactement 1."""
     total = sum(weights.values())
     if total <= 0:
         return dict(DEFAULT_WEIGHTS)
@@ -1234,7 +1001,7 @@ def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
 def update_weights_from_feedback(
     *,
     supabase=None,
-    candidate_id: str | None = None,  # Réservé pour l'audit (non utilisé ici)
+    candidate_id: str | None = None,
     liked: bool = True,
     dimension_scores: dict[str, float] | None = None,
     feedback_data: dict[str, float] | None = None,
@@ -1242,25 +1009,9 @@ def update_weights_from_feedback(
     """
     Adapte les poids de scoring en fonction du feedback d'un recruteur.
 
-    Deux modes de mise à jour :
-
-    Mode 1 — feedback_data (mise à jour directe) :
-      Remplace directement les valeurs des poids spécifiés.
-      Utile pour une interface d'administration qui permet de régler
-      manuellement les poids.
-
-    Mode 2 — dimension_scores + liked (apprentissage automatique) :
-      Pour chaque dimension qui a un score > 50 (contribue positivement) :
-        - liked=True  → augmente le poids de +0.05 (LIKE_BOOST)
-        - liked=False → diminue le poids de -0.05 (DISLIKE_DECAY)
-      Minimum: 0.01 (une dimension ne peut pas disparaître complètement).
-
-    Après modification, les poids sont normalisés et sauvegardés.
-    La variable globale _active_weights est mise à jour pour les appels suivants
-    dans le même processus (évite de recharger la DB à chaque scoring).
-
-    Note : * (keyword-only args) oblige à nommer tous les paramètres à l'appel,
-    ce qui évite les erreurs de position dans une fonction à nombreux args.
+    Mode 1 — feedback_data : remplace directement les valeurs des poids.
+    Mode 2 — dimension_scores + liked : ajuste automatiquement les poids
+              des dimensions qui ont le plus contribué au score.
     """
     global _active_weights
 
@@ -1299,38 +1050,25 @@ def compute_candidate_score(
     job_requirements: str,
     required_experience: int = DEFAULT_REQUIRED_EXPERIENCE,
     supabase=None,
-    domain: Domain | None = None,  # Si fourni, évite la classification auto
+    domain: Domain | None = None,
 ) -> dict[str, Any]:
     """
-    Score un candidat par rapport à une offre d'emploi. C'est la fonction centrale.
+    Score un candidat par rapport à une offre d'emploi.
 
-    ÉTAPE 1 — Préparation
-      - Charge les poids adaptatifs depuis la DB (ou mémoire).
-      - Construit les textes normalisés du CV et de l'offre.
-      - Détermine le domaine (fourni ou auto-détecté).
-      - Récupère le profil du domaine et détermine s'il est tech ou non.
-      - Fusionne les poids de base avec les surcharges du profil.
+    Retourne un dict complet:
+      {
+        "score":            float,   # 0-100
+        "confidence":       float,
+        "domain":           str,
+        "reasoning":        str,
+        "matched_keywords": list,
+        "missing_keywords": list,
+        "dimension_scores": dict,
+      }
 
-    ÉTAPE 2 — Calcul des 7 dimensions
-      a) keyword_score      : % de mots-clés de l'offre présents dans le CV
-      b) semantic_score     : similarité de sens CV ↔ offre (0-100)
-      c) experience_score   : années candidat / années requises * 100
-      d) certification_score: points pour certifications IT (TECH uniquement, sinon 0)
-      e) education_score    : niveau d'études (50-100)
-      f) leadership_score   : termes d'encadrement dans le CV
-      g) project_complexity_score : indicateurs de projets complexes
-
-    ÉTAPE 3 — Score final
-      Somme pondérée des 7 dimensions avec les poids résolus.
-      Résultat entre 0 et 100.
-
-    ÉTAPE 4 — Confiance
-      (semantic_score + keyword_score) / 200
-      Mesure à quel point on "fait confiance" au score : si les deux dimensions
-      les plus importantes sont faibles, le score global est moins fiable.
-
-    Retourne un dict complet avec le score, la confiance, le domaine détecté,
-    les mots-clés matchés/manquants, et le détail de toutes les dimensions.
+    IMPORTANT: this function is keyword-only (note the bare * in the signature).
+    Always call it with named arguments:
+        compute_candidate_score(cv_data=..., job_title=..., job_requirements=...)
     """
     base_weights = _load_weights(supabase)
     cv_text      = _build_cv_text(cv_data)
@@ -1340,24 +1078,20 @@ def compute_candidate_score(
     if domain is None:
         domain = classify_domain(cv_text, job_title, job_requirements)
 
-    profile     = _DOMAIN_PROFILES.get(domain, _FALLBACK_PROFILE)
-    is_tech     = domain in TECH_DOMAINS
-    weights     = _resolve_weights(base_weights, profile.weight_overrides)
+    profile  = _DOMAIN_PROFILES.get(domain, _FALLBACK_PROFILE)
+    is_tech  = domain in TECH_DOMAINS
+    weights  = _resolve_weights(base_weights, profile.weight_overrides)
 
     # ── Mots-clés ────────────────────────────────────────────────────────────
     if is_tech:
-        kw = _keyword_match(cv_text, job_text)              # mots-clés tech
+        kw = _keyword_match(cv_text, job_text)
     else:
-        kw = _keyword_match(cv_text, job_text, profile.keywords)  # mots-clés du domaine
+        kw = _keyword_match(cv_text, job_text, profile.keywords)
 
     # ── Sémantique ───────────────────────────────────────────────────────────
     sem_score = _semantic_score(cv_text, job_text)
 
-    # ── Certifications ───────────────────────────────────────────────────────
-    # Les certifications IT (AWS, Scrum, Oracle) n'ont pas de sens pour
-    # un comptable ou un médecin → score = 0 pour les domaines non-tech.
-    # Les profils non-tech ont déjà un weight_override qui met "certification"
-    # à 0 ou très bas, donc cette valeur 0 n'impacte pas le score final.
+    # ── Certifications (TECH uniquement) ─────────────────────────────────────
     cert_score = _certification_score(cv_text) if is_tech else 0.0
 
     # ── Éducation ────────────────────────────────────────────────────────────
@@ -1368,12 +1102,11 @@ def compute_candidate_score(
 
     # ── Complexité ───────────────────────────────────────────────────────────
     if is_tech:
-        complex_score = _complexity_score(cv_text)              # indicateurs tech globaux
+        complex_score = _complexity_score(cv_text)
     else:
-        complex_score = _complexity_score(cv_text, profile.indicators)  # indicateurs domaine
+        complex_score = _complexity_score(cv_text, profile.indicators)
 
     # ── Expérience ───────────────────────────────────────────────────────────
-    # Même logique de fallback que pour les autres données : champ direct → ai_extracted_data.
     ai_data: dict[str, Any] = {}
     raw_ai = cv_data.get("ai_extracted_data")
     if isinstance(raw_ai, str):
@@ -1435,7 +1168,7 @@ def compute_candidate_score(
 
 
 # =============================================================================
-# VERSION ASYNCHRONE (pour les serveurs web / APIs)
+# VERSION ASYNCHRONE
 # =============================================================================
 
 async def compute_candidate_score_async(
@@ -1449,19 +1182,7 @@ async def compute_candidate_score_async(
 ) -> dict[str, Any]:
     """
     Version asynchrone de compute_candidate_score.
-
-    compute_candidate_score est une fonction synchrone (bloquante) car
-    le modèle SentenceTransformer fait du calcul intensif CPU/GPU.
-    Dans un serveur async (FastAPI, etc.), exécuter du code bloquant
-    directement dans la boucle d'événements gèlerait tous les autres clients.
-
-    Solution : run_in_executor() délègue l'exécution à un ThreadPoolExecutor
-    (thread séparé), libérant la boucle async pendant le calcul.
-    Le "await" reprend quand le thread a fini.
-
-    lambda : nécessaire pour passer les arguments nommés (keyword args)
-    à une fonction exécutée via run_in_executor (qui n'accepte que les callables
-    sans arguments ou avec args positionnels).
+    Délègue le calcul bloquant à un ThreadPoolExecutor via run_in_executor.
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
@@ -1478,7 +1199,7 @@ async def compute_candidate_score_async(
 
 
 # =============================================================================
-# SCORING EN LOT (PLUSIEURS CANDIDATS À LA FOIS)
+# SCORING EN LOT
 # =============================================================================
 
 def batch_score_candidates(
@@ -1491,15 +1212,8 @@ def batch_score_candidates(
     domain: Domain | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Score une liste de candidats pour une même offre et retourne les résultats
-    triés du meilleur au moins bon (reverse=True = ordre décroissant).
-
-    Chaque résultat contient le CV original ("cv") + toutes les clés de
-    compute_candidate_score (score, domain, reasoning, etc.).
-
+    Score une liste de candidats pour une même offre, triés du meilleur au moins bon.
     Version synchrone : les candidats sont traités séquentiellement.
-    Pour de grandes listes (50+ candidats), préférer la version async
-    qui parallélise les calculs.
     """
     results = [
         {
@@ -1529,17 +1243,7 @@ async def batch_score_candidates_async(
 ) -> list[dict[str, Any]]:
     """
     Version asynchrone du scoring en lot.
-
-    asyncio.gather() lance TOUS les scorings en parallèle (concurrence, pas
-    forcément vraie parallélisation CPU, mais les threads de run_in_executor
-    tournent en parallèle grâce au GIL Python qui se relâche pour le code C).
-    Le résultat est une liste dans le même ordre que les tâches créées.
-
-    zip(candidates, scores) relie chaque CV à son score pour construire
-    le résultat final, qui est ensuite trié par score décroissant.
-
-    Avantage par rapport à la version sync : sur 100 candidats, au lieu
-    d'attendre score_1 + score_2 + ... + score_100, on attend max(tous les scores).
+    asyncio.gather() lance tous les scorings en parallèle.
     """
     tasks = [
         compute_candidate_score_async(

@@ -7,6 +7,7 @@ import { Search, Upload, RefreshCw, Trash2, ChevronDown } from "lucide-react";
 import {
   useCandidates,
   useDeleteCandidate,
+  useDeleteAllCandidates,
   useDriveSync,
 } from "../hooks/useCandidates";
 
@@ -34,11 +35,13 @@ export default function CandidateList() {
   const [jobFilter,       setJobFilter]       = useState("");
   const [showUpload,      setShowUpload]      = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
   const [candidateToDelete, setCandidateToDelete] = useState(null);
 
   const { data: candidates = [], isLoading }        = useCandidates(statusFilter ? { status: statusFilter } : {});
   const { data: jobs = [] }                         = useJobs();
   const { mutate: deleteCandidate }                 = useDeleteCandidate();
+  const { mutate: deleteAllCandidates } = useDeleteAllCandidates();
   const { mutate: syncDrive, isPending: isSyncing } = useDriveSync();
 
   const filtered = candidates
@@ -73,6 +76,12 @@ export default function CandidateList() {
     if (candidateToDelete) deleteCandidate(candidateToDelete.id);
     setShowDeleteModal(false);
     setCandidateToDelete(null);
+  };
+
+  const confirmDeleteAll = () => {
+    deleteAllCandidates();
+
+    setShowDeleteAllModal(false);
   };
 
   const closeDeleteModal = () => {
@@ -112,6 +121,13 @@ export default function CandidateList() {
           >
             <Upload size={12} />
             Uploader un CV
+          </button>
+          <button
+              onClick={() => setShowDeleteAllModal(true)}
+              className="flex items-center gap-2 rounded-lg bg-red-600 hover:bg-red-700 px-3 py-1.5 text-xs font-medium text-white transition-colors"
+            >
+              <Trash2 size={12} />
+              Tout supprimer
           </button>
         </div>
       </div>
@@ -332,6 +348,44 @@ export default function CandidateList() {
           </div>
         </div>
       )}
+
+      {/* Delete all modal */}
+        {showDeleteAllModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+            onClick={() => setShowDeleteAllModal(false)}
+          >
+            <div
+              className="w-full max-w-sm bg-white rounded-xl border border-gray-200 p-6 shadow-xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 className="text-sm font-semibold text-gray-900 mb-1">
+                Supprimer tous les candidats
+              </h2>
+
+              <p className="text-xs text-gray-500 mb-6">
+                Tous les candidats seront définitivement supprimés.
+                Cette action est irréversible.
+              </p>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowDeleteAllModal(false)}
+                  className="flex-1 h-9 rounded-lg border border-gray-200 bg-white text-xs font-medium text-gray-600 hover:bg-gray-50 transition-colors"
+                >
+                  Annuler
+                </button>
+
+                <button
+                  onClick={confirmDeleteAll}
+                  className="flex-1 h-9 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-medium transition-colors"
+                >
+                  Tout supprimer
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
       {showUpload && <UploadCVModal onClose={() => setShowUpload(false)} />}
     </div>

@@ -1,3 +1,5 @@
+// frontend/src/api/candidatesApi.js
+
 import axiosClient from "./axiosClient";
 
 export const getCandidates = (params) =>

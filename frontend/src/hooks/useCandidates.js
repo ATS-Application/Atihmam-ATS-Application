@@ -3,6 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
 
+import axiosClient from "../api/axiosClient";
 import {
   getCandidates,
   getCandidate,
@@ -11,6 +12,9 @@ import {
   uploadCV,
   triggerDriveSync,
 } from "../api/candidatesApi";
+
+// Processing statuses that mean "still in flight" — poll until we leave these.
+const PENDING_STATUSES = new Set(["queued", "processing"]);
 
 export function useCandidates(filters = {}) {
   return useQuery({
@@ -37,17 +41,13 @@ export function useCandidate(id) {
     },
 
     enabled: !!id,
-
     staleTime: 1000 * 15,
     refetchOnWindowFocus: false,
     retry: 1,
   });
 }
 
-export function useCandidateWithPolling(
-  id,
-  { pollUntilScored = false } = {}
-) {
+export function useCandidateWithPolling(id, { pollUntilScored = false } = {}) {
   return useQuery({
     queryKey: ["candidate", id],
 
@@ -59,36 +59,40 @@ export function useCandidateWithPolling(
     enabled: !!id,
 
     refetchInterval: (query) => {
-      if (!pollUntilScored) {
-        return false;
-      }
+      if (!pollUntilScored) return false;
 
       const candidate = query.state.data;
 
-      if (!candidate) {
-        return 3000;
-      }
+      // No data yet — poll to get the initial state.
+      if (!candidate) return 3000;
 
-      // stop polling if completed
-      if (
-        candidate.processing_status === "completed" ||
-        candidate.processing_status === "failed"
-      ) {
-        return false;
-      }
+      // processing_status is the authoritative signal.
+      // Stop once we've left a pending state (completed, failed, done, or null).
+      if (PENDING_STATUSES.has(candidate.processing_status)) return 3000;
 
-      // stop if score exists
-      if (candidate.score !== null && candidate.score !== undefined) {
-        return false;
-      }
-
-      // continue polling
-      return 3000;
+      return false;
     },
 
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     retry: 1,
+  });
+}
+
+export function useDeleteAllCandidates() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    // Fix: was referencing undefined `api` — use axiosClient directly.
+    mutationFn: () => axiosClient.delete("/candidates"),
+
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["candidates"] });
+    },
+
+    onError: () => {
+      toast.error("Erreur lors de la suppression");
+    },
   });
 }
 
@@ -100,22 +104,13 @@ export function useTransitionStatus() {
       transitionStatus(id, new_status, note),
 
     onSuccess: (_, { id }) => {
-      qc.invalidateQueries({
-        queryKey: ["candidates"],
-      });
-
-      qc.invalidateQueries({
-        queryKey: ["candidate", id],
-      });
-
+      qc.invalidateQueries({ queryKey: ["candidates"] });
+      qc.invalidateQueries({ queryKey: ["candidate", id] });
       toast.success("Statut mis à jour");
     },
 
     onError: (err) => {
-      toast.error(
-        err.response?.data?.detail ||
-          "Transition non autorisée"
-      );
+      toast.error(err.response?.data?.detail || "Transition non autorisée");
     },
   });
 }
@@ -127,10 +122,7 @@ export function useDeleteCandidate() {
     mutationFn: deleteCandidate,
 
     onSuccess: () => {
-      qc.invalidateQueries({
-        queryKey: ["candidates"],
-      });
-
+      qc.invalidateQueries({ queryKey: ["candidates"] });
       toast.success("Candidat supprimé");
     },
 
@@ -144,21 +136,17 @@ export function useUploadCV() {
   const qc = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ file, job_id }) =>
-      uploadCV(file, job_id),
+    mutationFn: ({ file, job_id }) => uploadCV(file, job_id),
 
     onSuccess: () => {
-      qc.invalidateQueries({
-        queryKey: ["candidates"],
-      });
-
-      toast.success(
-        "CV uploadé — traitement en cours"
-      );
+      qc.invalidateQueries({ queryKey: ["candidates"] });
+      toast.success("CV uploadé — traitement en cours");
     },
 
-    onError: () => {
-      toast.error("Échec de l'upload");
+    onError: (err) => {
+      toast.error(
+        err.response?.data?.detail || "Échec de l'upload"
+      );
     },
   });
 }
@@ -170,21 +158,14 @@ export function useDriveSync() {
     mutationFn: triggerDriveSync,
 
     onSuccess: () => {
-      toast.success(
-        "Synchronisation Drive lancée"
-      );
-
-      setTimeout(() => {
-        qc.invalidateQueries({
-          queryKey: ["candidates"],
-        });
-      }, 3000);
+      toast.success("Synchronisation Drive lancée");
+      // Invalidate immediately — new candidates appear as stubs right away.
+      // Individual polling hooks handle live score updates from there.
+      qc.invalidateQueries({ queryKey: ["candidates"] });
     },
 
     onError: () => {
-      toast.error(
-        "Échec de la synchronisation Drive"
-      );
+      toast.error("Échec de la synchronisation Drive");
     },
   });
 }

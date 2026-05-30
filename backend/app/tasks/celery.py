@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     gemini_api_key: str
 
     # Google Drive
-    google_drive_credentials_json: str = "credentials.json"
+    google_drive_credentials_json: str = "oauth_credentials.json"
     drive_folder_id: str = ""
     webhook_base_url: str = "http://localhost:8000"
 

@@ -2,6 +2,10 @@
 """
 AI Service — multi-provider with fallback chain.
 Extracts structured CV data and delegates scoring to scoring_service.
+
+CV depth analysis also lives here to avoid the circular import that would
+arise if scoring_service imported from ai_service (ai_service already imports
+compute_candidate_score from scoring_service).
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from typing import Any
 
 import requests
 import google.generativeai as genai
+#from google import genai
 
 from app.config import get_settings
 from app.services.scoring_service import compute_candidate_score
@@ -44,28 +49,32 @@ def _call_gemini(prompt: str, settings) -> str:
     if not settings.gemini_api_key:
         raise RuntimeError("Missing Gemini API key")
     genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-3-flash")
     response = model.generate_content(prompt)
     return response.text
 
 
-def _call_openrouter(prompt: str, settings) -> str:
-    if not settings.openrouter_api_key:
-        raise RuntimeError("Missing OpenRouter API key")
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {settings.openrouter_api_key.strip()}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "deepseek/deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=60,
+def _call_nvidia(prompt: str, settings) -> str:
+    if not settings.nvidia_api_key:
+        raise RuntimeError("Missing NVIDIA API key")
+    
+    from openai import OpenAI
+    
+    client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=settings.nvidia_api_key.strip(),
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    
+    completion = client.chat.completions.create(
+        model="z-ai/glm-5.1",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=1,
+        top_p=1,
+        max_tokens=16384,
+        stream=False,  # non-streaming to return a plain string like the original
+    )
+    
+    return completion.choices[0].message.content
 
 
 def _call_deepseek(prompt: str, settings) -> str:
@@ -105,16 +114,35 @@ def _call_mistral(prompt: str, settings) -> str:
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
+def _call_github_models(prompt: str, settings) -> str:
+    if not settings.github_token:
+        raise RuntimeError("Missing GitHub token")
+    response = requests.post(
+        "https://models.inference.ai.azure.com/chat/completions",
+        headers={
+            "Authorization": f"Bearer {settings.github_token.strip()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "deepseek/deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
 
 # ---------------------------------------------------------------------------
 # Fallback engine
 # ---------------------------------------------------------------------------
 
 _PROVIDERS = [
-    ("OpenRouter", _call_openrouter),
+    ("NVIDIA", _call_nvidia),
     ("DeepSeek",   _call_deepseek),
     ("Mistral",    _call_mistral),
     ("Gemini",     _call_gemini),
+    ("GitHub Models", _call_github_models)
 ]
 
 
@@ -159,8 +187,8 @@ Required JSON schema:
   "projects": [
     {{
       "name": "Project name",
-      "tech": "Technologies used",
-      "description": "What was built, scale, impact",
+      "tools": "Tools used",
+      "description": "What was built, budget, scale, impact",
       "complexity": "low|medium|high"
     }}
   ],
@@ -174,20 +202,129 @@ Required JSON schema:
   ],
   "languages": ["spoken languages"],
   "linkedin": "URL or null",
-  "github": "URL or null"
 }}
 
 Rules:
 - experience_years: sum of UNIQUE non-overlapping professional experience.
   If two roles overlap in time, count only the longer one.
 - skills: include programming languages, frameworks, tools, platforms, methodologies.
-- projects: include significant personal, open-source, or work projects.
-- complexity: "high" if production/large-scale, "medium" if moderate, "low" if tutorial/small.
+- projects: include significant personal, open-source, or work projects and the complexity.
+- complexity: "high" if production/large-scale with metrics or numbers, "medium" if moderate, "low" if tutorial/small.
 - work_history: always include duration_months if you can calculate it from dates.
+- Candidates with a Master's degree are ranked above those with a BTS (Brevet de Technicien Supérieur), provided all other qualifications, skills, and experience are equal.
 
 CV Text (max 8000 chars):
 {cv_text}
+
 """
+
+# ---------------------------------------------------------------------------
+# CV depth analysis prompt
+# ---------------------------------------------------------------------------
+
+# NOTE: {today} was removed from the format call because the template body
+# never referenced it — the variable was computed and passed but silently
+# discarded, which caused confusion.  The prompt now makes today's date
+# available to the model through a dedicated header line instead.
+_CV_DEPTH_PROMPT = """
+You are a senior auditor and expert recruiter. Today's date is {today}.
+Analyze the provided structured CV data for DEPTH and EVIDENCE.
+
+CRITICAL RULES:
+1. METRIC MANDATE:
+   - A 'High Quality' entry must contain at least one quantifiable metric
+     (e.g., $, %, time saved, team size, revenue growth).
+   - If the candidate has > 5 years of experience but NO metrics in their
+     recent roles, the 'overall_depth_score' MUST be capped at 40/100,
+     regardless of job titles.
+
+2. SCORING PENALTIES (Start from 100):
+   - Subtract 5 points for every entry in 'missing_metrics'.
+   - Subtract 5 points for every entry in 'weak_descriptions'.
+   - Subtract 4 points for every unexplained 'employment_gap' > 3 months.
+   - Floor the final score at 0.
+
+3. FLAG DEFINITIONS:
+   - missing_metrics: Flag any work_history/project entry where the description
+     lacks numbers, percentages, currency, or team sizes.
+   - weak_descriptions: Flag any entry under 60 words OR that lists generic
+     duties (e.g., "Managed team X") without specific achievements or outcomes.
+
+Return ONLY the following JSON object:
+{{
+  "overall_depth_score": <int 0-100>,
+  "missing_metrics": [
+    {{"section": "work_history|projects", "entry": "string", "issue": "string", "suggestion": "string"}}
+  ],
+  "weak_descriptions": [
+    {{"section": "work_history|projects", "entry": "string", "issue": "string", "suggestion": "string"}}
+  ],
+  "employment_gaps": [
+    {{"from": "YYYY-MM", "to": "YYYY-MM", "duration_months": <int>, "note": "string"}}
+  ],
+  "summary": "Strict, 2-3 sentence assessment of the CV's depth and professional quality."
+}}
+
+Structured CV data:
+{cv_json}
+
+"""
+
+
+def analyze_cv_depth(cv_data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Assess the depth and completeness of a parsed CV.
+
+    Expects cv_data as returned by extract_cv_info() (or a CV row from the DB
+    with ai_extracted_data already parsed).
+
+    Returns a CvDepthReport dict:
+      {
+        "overall_depth_score": int,        # 0-100
+        "missing_metrics":     list[dict],  # entries without numbers
+        "weak_descriptions":   list[dict],  # vague / too-short entries
+        "employment_gaps":     list[dict],  # unexplained time periods
+        "summary":             str,
+      }
+    """
+    from datetime import date
+
+    today = date.today().strftime("%Y-%m")
+
+    # Slim the payload: the AI only needs these fields
+    slim = {
+        "work_history":     cv_data.get("work_history", []),
+        "projects":         cv_data.get("projects", []),
+        "experience_years": cv_data.get("experience_years"),
+        "summary":          cv_data.get("summary"),
+    }
+
+    # FIX: {today} is now actually used inside the prompt template body.
+    prompt = _CV_DEPTH_PROMPT.format(
+        today=today,
+        cv_json=json.dumps(slim, ensure_ascii=False, indent=2),
+    )
+
+    try:
+        raw = _generate_with_fallback(prompt)
+        report = _parse_json_response(raw)
+        # Guarantee all keys exist even if the AI omits one
+        report.setdefault("overall_depth_score", 0)
+        report.setdefault("missing_metrics", [])
+        report.setdefault("weak_descriptions", [])
+        report.setdefault("employment_gaps", [])
+        report.setdefault("summary", "")
+        return report
+    except Exception as exc:
+        print(f"[ai_service] CV depth analysis failed: {exc}")
+        return {
+            "overall_depth_score": None,
+            "missing_metrics":     [],
+            "weak_descriptions":   [],
+            "employment_gaps":     [],
+            "summary":             "Depth analysis unavailable.",
+            "error":               str(exc),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +379,7 @@ def score_candidate(
 
     Returns the full scoring dict from compute_candidate_score:
       {
-        "score":            float,   ← 0-100, this is what callers extract
+        "score":            float,   ← 0-100
         "confidence":       float,
         "domain":           str,
         "reasoning":        str,
@@ -259,3 +396,42 @@ def score_candidate(
         job_title=job_title,
         job_requirements=job_requirements,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public: combined relevance + depth score
+# ---------------------------------------------------------------------------
+
+def compute_final_score(
+    cv_data: dict[str, Any],
+    job_title: str,
+    job_requirements: str,
+) -> float:
+    """
+    Blended score = 60 % relevance (keyword/semantic) + 40 % CV depth/quality.
+
+    This is the correct home for this function because:
+      • It calls analyze_cv_depth()       — defined here in ai_service
+      • It calls compute_candidate_score() — imported from scoring_service
+
+    Keeping it here avoids the circular import that would result from placing
+    it in scoring_service (which already imports from ai_service).
+
+    Returns a float in [0, 100].
+    """
+    # 1. CV depth / quality score (AI-powered)
+    depth_report  = analyze_cv_depth(cv_data)
+    quality_score = depth_report.get("overall_depth_score") or 0
+
+    # 2. Relevance score — compute_candidate_score is keyword-only and returns
+    #    a dict; extract the scalar "score" key before blending.
+    score_result   = compute_candidate_score(
+        cv_data=cv_data,
+        job_title=job_title,
+        job_requirements=job_requirements,
+    )
+    relevance_score = float(score_result.get("score", 0))
+
+    # 3. Weighted blend (60 % relevance, 40 % evidence/quality).
+    #    Prevents keyword-stuffing from carrying a candidate.
+    return round(relevance_score * 0.6 + quality_score * 0.4, 2)

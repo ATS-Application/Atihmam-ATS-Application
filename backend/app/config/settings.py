@@ -1,3 +1,4 @@
+# backend/app/config/settings.py
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
@@ -30,9 +31,10 @@ class Settings(BaseSettings):
 
     # ── AI Keys ──────────────────────────
     gemini_api_key: str | None = None
-    openrouter_api_key: str | None = None
+    nvidia_api_key: str | None = None
     deepseek_api_key: str | None = None
     mistral_api_key: str | None = None
+    github_token: str | None = None
 
     # ── Drive ────────────────────────────
     google_drive_credentials_json: str | None = None
