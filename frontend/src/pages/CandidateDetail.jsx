@@ -45,7 +45,7 @@ const DIMENSIONS = [
     icon: Target,
     accent: "#f97316",
     track: "#fff7ed",
-    description: "Correspondance sémantique avec la fiche de poste",
+    description: "Correspondance sémantique (similarité) avec la fiche de poste",
   },
   {
     key: "semantic_score",
@@ -85,7 +85,7 @@ const DIMENSIONS = [
   icon: CheckCircle2,     // already imported
   accent: "#f59e0b",
   track: "#fffbeb",
-  description: "Certifications professionnelles détectées (AWS, Scrum, Oracle…)",
+  description: "Certifications professionnelles détectées",
   },
   {
     key: "leadership_score",
@@ -98,6 +98,17 @@ const DIMENSIONS = [
 ];
 
 const CLUSTER_ICONS = {
+  word: "📝",
+  powerpoint: "📊",
+  excel: "📈",
+  powerbi: "📉",
+  odoo: "🧩",
+  microsoft_office: "🪟",
+  google_suite: "📧",
+  google_docs: "📄",
+  google_sheets: "📊",
+  google_slides: "📈",
+  oracle: "🗄️",
   python: "🐍",
   javascript: "🟨",
   typescript: "🔷",

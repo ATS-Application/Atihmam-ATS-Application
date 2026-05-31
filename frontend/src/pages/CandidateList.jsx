@@ -229,7 +229,7 @@ export default function CandidateList() {
                     key={c.id}
                     onClick={() => navigate(`/candidates/${c.id}`)}
                     className={`cursor-pointer transition-colors hover:bg-gray-50 ${
-                      isTop5 ? "bg-gray-50/60" : ""
+                      isTop5 ? "bg-green-50/60" : ""
                     }`}
                   >
                     {/* Rank */}
