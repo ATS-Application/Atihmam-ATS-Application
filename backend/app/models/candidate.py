@@ -20,24 +20,8 @@ class CandidateStatus(str, Enum):
 
 
 ALLOWED_TRANSITIONS: dict[CandidateStatus, list[CandidateStatus]] = {
-    CandidateStatus.APPLIED: [
-        CandidateStatus.SCREENING,
-        CandidateStatus.REJECTED,
-    ],
-    CandidateStatus.SCREENING: [
-        CandidateStatus.INTERVIEW,
-        CandidateStatus.REJECTED,
-    ],
-    CandidateStatus.INTERVIEW: [
-        CandidateStatus.OFFER,
-        CandidateStatus.REJECTED,
-    ],
-    CandidateStatus.OFFER: [
-        CandidateStatus.HIRED,
-        CandidateStatus.REJECTED,
-    ],
-    CandidateStatus.HIRED: [],
-    CandidateStatus.REJECTED: [],
+    s: [t for t in CandidateStatus if t != s]
+    for s in CandidateStatus
 }
 
 
