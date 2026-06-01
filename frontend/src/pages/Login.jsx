@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useLogin, useForgotPassword } from "../hooks/useAuth";
+import atihmamLogo from "../assets/atihmam_logo.png";
 
 // ─── Sub-views ────────────────────────────────────────────────
 
@@ -183,6 +184,7 @@ export default function Login() {
             className="h-14 w-auto object-contain"
             draggable={false}
           />
+          <img src={atihmamLogo} alt="Company Logo" />
           <p className="text-xs text-gray-400 mt-3 tracking-widest uppercase">
             Plateforme ATS
           </p>

@@ -3,7 +3,8 @@ import axios from "axios";
 import { useAuthStore } from "../store/authStore";
 
 const axiosClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL,
+  // Use the environment variable, fallback to production URL if missing
+  baseURL: import.meta.env.VITE_API_BASE_URL || "https://atihmam-ats-application.onrender.com/api/v1",
   headers: { "Content-Type": "application/json" },
 });
 
