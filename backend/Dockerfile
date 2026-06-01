@@ -13,4 +13,5 @@ RUN uv pip install --system --no-cache-dir -r requirements.txt
 COPY . .
 
 # Set the command to run your application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Replace your current CMD with this:
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
