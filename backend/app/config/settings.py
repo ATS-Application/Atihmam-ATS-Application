@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     # ── Core ─────────────────────────────
     app_env: str = "development"
     debug: bool = True
+    
+    port: int = 8000
 
     # ── API ──────────────────────────────
     react_app_api_url: str = "http://localhost:5173"

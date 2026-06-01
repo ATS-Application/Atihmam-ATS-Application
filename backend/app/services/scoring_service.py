@@ -279,7 +279,10 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
         leadership_terms=("chef des achats", "responsable supply chain", "directeur achats"),
     ),
     Domain.PURCHASING_MANAGER: DomainProfile(
-        keywords=("responsable achats", "chef des achats", "directeur achats"),
+        keywords=("responsable achats", "chef des achats", "directeur achats", "strategie achat", "SLA", "gestion fournisseurs", "négociation achat", "supply chain"
+                  "Politique d'achat", "service level agreement", "gestion des fournisseurs", "négociation avec les fournisseurs"
+                  "Production des coûts", "P and L", "Profit and Loss", "Portefeuille fournisseurs", "gestion des contrats d'achat",
+                  "wallet", "gestion des stocks", "gestion des approvisionnements", "stock", "appel d'offres", "procédure d'achat"),
         indicators={"sla": 20, "service-level agreement": 20, "slas": 20},
         weight_overrides={"keyword": 0.10, "semantic": 0.35, "experience": 0.15,
                           "leadership": 0.10, "complexity": 0.25, "education": 0.05},
