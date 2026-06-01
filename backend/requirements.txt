@@ -1,21 +1,31 @@
+# --- ADD THIS LINE AT THE TOP ---
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Core deps
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
-email-validator
 pydantic-settings==2.6.1
+python-multipart==0.0.19
+httpx==0.27.2
+
+# ML/AI Deps (Forced CPU-only)
+torch
+torchvision
+sentence-transformers==2.7.0
+scikit-learn==1.8.0
+google-generativeai==0.8.3
+openai==2.38.0
+
+# Other utils
+email-validator
 supabase==2.10.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-python-multipart==0.0.19
-httpx==0.27.2
 celery==5.6.3
 valkey==6.1.1
 pdfplumber==0.11.4
 google-api-python-client==2.155.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1
-google-generativeai==0.8.3
 python-dotenv==1.0.1
-sentence-transformers==2.7.0
-scikit-learn==1.8.0
-openai==2.38.0

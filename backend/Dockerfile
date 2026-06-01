@@ -1,16 +1,20 @@
-FROM python:3.11-slim
-
-# Install uv by copying it from the official image
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
+# Stage 1: Build
+FROM python:3.11-slim AS builder
 WORKDIR /app
-
-# Copy requirements and install them globally
+RUN pip install uv
 COPY requirements.txt .
-RUN uv pip install --system --no-cache-dir -r requirements.txt
+# Install into a virtual environment
+RUN uv venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN uv pip install -r requirements.txt
 
-# Copy the rest of your application code
+# Stage 2: Final
+FROM python:3.11-slim
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 COPY . .
 
-# Set the command to run your application
+# Correctly binding to the port assigned by the cloud provider
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
