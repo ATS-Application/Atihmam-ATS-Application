@@ -1,14 +1,54 @@
 // frontend/src/api/authApi.js
 import axiosClient from "./axiosClient";
 
-export const login = (email, password) =>
-  axiosClient.post("/auth/login", { email, password });
+/**
+ * Normalize API responses
+ */
+const unwrap = (promise) =>
+  promise
+    .then((res) => res.data)
+    .catch((error) => {
+      const message =
+        error?.response?.data?.detail ||
+        error?.response?.data?.message ||
+        error.message ||
+        "Unexpected error occurred";
 
-export const register = (email, password, full_name) =>
-  axiosClient.post("/auth/register", { email, password, full_name });
+      throw new Error(message);
+    });
 
-export const forgotPassword = (email) =>
-  axiosClient.post("/auth/forgot-password", { email });
+/**
+ * Auth API
+ */
+export const authApi = {
+  login: ({ email, password }) => {
+    return unwrap(
+      axiosClient.post("/auth/login", { email, password })
+    );
+  },
 
-export const resetPassword = (access_token, new_password) =>
-  axiosClient.post("/auth/reset-password", { access_token, new_password });
+  register: ({ email, password, full_name }) => {
+    return unwrap(
+      axiosClient.post("/auth/register", {
+        email,
+        password,
+        full_name,
+      })
+    );
+  },
+
+  forgotPassword: ({ email }) => {
+    return unwrap(
+      axiosClient.post("/auth/forgot-password", { email })
+    );
+  },
+
+  resetPassword: ({ access_token, new_password }) => {
+    return unwrap(
+      axiosClient.post("/auth/reset-password", {
+        access_token,
+        new_password,
+      })
+    );
+  },
+};

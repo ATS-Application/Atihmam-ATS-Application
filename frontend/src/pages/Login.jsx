@@ -184,7 +184,7 @@ export default function Login() {
             className="h-14 w-auto object-contain"
             draggable={false}
           />
-          <img src={atihmamLogo} alt="Company Logo" />
+          <img src={atihmamLogo} alt="Company Logo" className="h-14 w-auto object-contain" />
           <p className="text-xs text-gray-400 mt-3 tracking-widest uppercase">
             Plateforme ATS
           </p>

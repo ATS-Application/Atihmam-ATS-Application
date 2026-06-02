@@ -1,7 +1,6 @@
 // frontend/src/components/UploadCVModal.jsx
 
 import { useState, useRef } from "react";
-
 import {
   X,
   Upload,
@@ -11,50 +10,36 @@ import {
   CheckCircle2,
 } from "lucide-react";
 
+import toast from "react-hot-toast";
+
 import { useUploadCV } from "../hooks/useCandidates";
 import { useJobs } from "../hooks/useJobs";
 
-export default function UploadCVModal({
-  onClose,
-}) {
+export default function UploadCVModal({ onClose }) {
   const [file, setFile] = useState(null);
-
   const [jobId, setJobId] = useState("");
-
-  const [isDragging, setIsDragging] =
-    useState(false);
+  const [isDragging, setIsDragging] = useState(false);
 
   const fileRef = useRef();
 
-  const { mutate, isPending } =
-    useUploadCV();
-
+  const { mutate, isPending } = useUploadCV();
   const { data: jobs = [] } = useJobs();
 
   function handleDrop(e) {
     e.preventDefault();
-
     setIsDragging(false);
 
-    const dropped =
-      e.dataTransfer.files?.[0];
+    const dropped = e.dataTransfer.files?.[0];
 
-    if (
-      dropped?.type ===
-      "application/pdf"
-    ) {
+    if (dropped?.type === "application/pdf") {
       setFile(dropped);
     }
   }
 
   function handleFileSelect(e) {
-    const selected =
-      e.target.files?.[0];
+    const selected = e.target.files?.[0];
 
-    if (
-      selected?.type ===
-      "application/pdf"
-    ) {
+    if (selected?.type === "application/pdf") {
       setFile(selected);
     }
   }
@@ -68,10 +53,26 @@ export default function UploadCVModal({
         job_id: jobId || undefined,
       },
       {
-        onSuccess: onClose,
+        onSuccess: () => {
+          toast.success("CV uploaded successfully");
+          onClose();
+        },
+
+        onError: (error) => {
+          if (error?.response?.status === 409) {
+            toast.error(
+              error.response?.data?.detail ||
+                "This CV has already been processed."
+            );
+            return;
+          }
+
+          toast.error("Failed to upload CV.");
+        },
       }
     );
   }
+
 
   return (
     <div
