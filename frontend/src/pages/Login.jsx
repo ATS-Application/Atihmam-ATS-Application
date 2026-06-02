@@ -178,7 +178,7 @@ export default function Login() {
       <div className="w-full max-w-sm">
 
         <div className="flex flex-col items-center mb-8">
-          <img src={atihmamLogo} alt="Company Logo" />
+          <img src={atihmamLogo} alt="Company Logo" className="h-14 w-auto object-contain" />
           
           <p className="text-xs text-gray-400 mt-3 tracking-widest uppercase">
             Plateforme ATS
