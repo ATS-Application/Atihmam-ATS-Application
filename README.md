@@ -1,3 +1,5 @@
+<img width="1536" height="864" alt="atihmam_logo" src="https://github.com/user-attachments/assets/cc530f7d-bce1-4472-a58e-7e3bf65a276b" />
+
 # 📋 Atihmam ATS — Documentation Complète
 
 > Système de Suivi des Candidatures intelligent, alimenté par l'IA
@@ -72,6 +74,7 @@ L'application se décompose en deux parties :
   │   Storage  │  │   Celery)    │  │                │
   └────────────┘  └──────────────┘  └────────────────┘
 ```
+<img width="1382" height="1627" alt="ATS Architecture Atihmam" src="https://github.com/user-attachments/assets/25f494a5-08f6-43e4-9b42-20e2f84d578d" />
 
 ---
 
@@ -218,6 +221,7 @@ Atihmam-ATS-Application/
     │       └── domainClassifier.jsx # Classification côté frontend
     └── vite.config.js
 ```
+<img width="426" height="676" alt="Screenshot 2026-06-02 114315" src="https://github.com/user-attachments/assets/14f04546-fa68-4c55-a51b-f47501b5f1b6" />
 
 ---
 
@@ -583,4 +587,4 @@ Un bucket Supabase Storage nommé `cvs` est également nécessaire pour stocker 
 
 ---
 
-*Documentation générée le 2 juin 2026 — Version 2.0.0*
+*By Issika Kouamé — 2 juin 2026 *
