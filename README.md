@@ -1,4 +1,4 @@
-<img width="1536" height="864" alt="atihmam_logo" src="https://github.com/user-attachments/assets/cc530f7d-bce1-4472-a58e-7e3bf65a276b" />
+<img width="646" height="266" alt="company_logo" src="https://github.com/user-attachments/assets/3112a72b-d917-4df2-a5a1-2fb5845ea896" />
 
 # 📋 Atihmam ATS — Documentation Complète
 
