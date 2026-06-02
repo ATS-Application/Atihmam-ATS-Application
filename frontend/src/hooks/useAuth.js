@@ -2,7 +2,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { login, register, forgotPassword, resetPassword } from "../api/authApi";
+import { authApi, register, forgotPassword, resetPassword } from "../api/authApi";
 import { useAuthStore } from "../store/authStore";
 
 export function useLogin() {
@@ -10,7 +10,7 @@ export function useLogin() {
   const navigate = useNavigate();
 
   return useMutation({
-    mutationFn: ({ email, password }) => login(email, password),
+    mutationFn: ({ email, password }) => authApi.login({ email, password }),
     onSuccess: (res) => {
       setAuth(res.data.access_token, null);
       navigate("/dashboard");
