@@ -589,6 +589,10 @@ Un bucket Supabase Storage nommé `cvs` est également nécessaire pour stocker 
 
 https://github.com/user-attachments/assets/44c89f85-6e88-445e-93e1-214b03cc6a6c
 
+
+https://github.com/user-attachments/assets/d42a69ef-b482-473f-ae0e-8fba2cb05a55
+
+
 ---
 
 * By Issika Kouamé — 2 juin 2026 *
