@@ -1,12 +1,35 @@
 # backend/app/tasks/drive_sync.py
 
+"""
+Drive Sync Pipeline (MVP VERSION - NO CELERY)
+
+Replaces:
+- Celery tasks
+- Redis queue
+- Worker services
+
+With:
+- direct execution
+- FastAPI BackgroundTasks support
+- safe synchronous processing
+
+Pipeline:
+1. Scan Google Drive folder
+2. Detect new PDFs
+3. Download file
+4. Upload to Supabase storage
+5. Extract text
+6. AI parsing
+7. Score candidate
+8. Insert into DB
+"""
+
 from __future__ import annotations
 
 import os
 import re
 from typing import Any
 
-from celery import shared_task
 from googleapiclient.errors import HttpError
 
 from app.config import get_settings
@@ -22,7 +45,6 @@ from app.services.drive_service import (
 )
 from app.services.scoring_service import compute_candidate_score
 
-from app.services.screening_engine import passes_screening
 from app.tasks.cv_processing import (
     build_candidate_payload,
     compute_best_job_match,
@@ -34,13 +56,11 @@ from app.tasks.cv_processing import (
 PERMANENT_ERRORS = (ValueError, PermissionError)
 RETRY_BASE_DELAY = 60
 
-
 # --------------------------------------------------------------------------- #
-# Helpers
+# HELPERS
 # --------------------------------------------------------------------------- #
 
 def sanitize_filename(filename: str) -> str:
-    """Sanitize uploaded filenames for storage safety."""
     name, ext = os.path.splitext(filename)
 
     cleaned = re.sub(
@@ -52,13 +72,7 @@ def sanitize_filename(filename: str) -> str:
     return f"{cleaned}{ext}"
 
 
-def retry_delay(retries: int) -> int:
-    """Exponential retry backoff."""
-    return RETRY_BASE_DELAY * (2**retries)
-
-
 def candidate_exists(supabase, drive_file_id: str) -> bool:
-    """Check whether a Drive file was already processed."""
     response = (
         supabase.table("candidates")
         .select("id")
@@ -66,7 +80,6 @@ def candidate_exists(supabase, drive_file_id: str) -> bool:
         .limit(1)
         .execute()
     )
-
     return bool(response.data)
 
 
@@ -76,7 +89,6 @@ def upload_cv_to_storage(
     file_name: str,
     pdf_bytes: bytes,
 ) -> str:
-    """Upload CV to Supabase storage and return public URL."""
     storage_path = f"cvs/drive/{drive_file_id}/{file_name}"
 
     supabase.storage.from_("cvs").upload(
@@ -91,65 +103,11 @@ def upload_cv_to_storage(
     return supabase.storage.from_("cvs").get_public_url(storage_path)
 
 
-def insert_failed_candidate(
-    supabase,
-    cv_url: str,
-    drive_file_id: str,
-    job_id: str | None = None,
-) -> None:
-    """Insert placeholder row for unreadable CVs."""
-    payload: dict[str, Any] = {
-        "full_name": "Document non lisible",
-        "cv_file_url": cv_url,
-        "drive_file_id": drive_file_id,
-        "processing_status": "failed",
-        "status": "failed",
-    }
-
-    if job_id:
-        payload["job_id"] = job_id
-
-    try:
-        supabase.table("candidates").insert(payload).execute()
-    except Exception:
-        # Best effort only
-        pass
+def extract_candidate_text(pdf_bytes: bytes) -> str:
+    return extract_text_from_bytes(pdf_bytes)
 
 
-def extract_candidate_text(
-    pdf_bytes: bytes,
-    supabase,
-    cv_url: str,
-    drive_file_id: str,
-    job_id: str | None,
-) -> str:
-    """Extract raw text from PDF bytes."""
-    raw_text = extract_text_from_bytes(pdf_bytes)
-
-    if raw_text.strip():
-        return raw_text
-
-    insert_failed_candidate(
-        supabase=supabase,
-        cv_url=cv_url,
-        drive_file_id=drive_file_id,
-        job_id=job_id,
-    )
-
-    raise ValueError(
-        f"Empty text extracted from Drive file '{drive_file_id}'"
-    )
-
-
-def resolve_candidate_score(
-    supabase,
-    extracted: dict,
-    job_id: str | None,
-) -> tuple[dict, str | None]:
-    """
-    Resolve best score result and matching job.
-    Mirrors process_cv scoring logic.
-    """
+def resolve_candidate_score(supabase, extracted: dict, job_id: str | None):
     score_result = None
     resolved_job_id = job_id
 
@@ -176,25 +134,17 @@ def resolve_candidate_score(
     if score_result:
         return score_result, resolved_job_id
 
-    # Fallback scoring
-    fallback_score = compute_candidate_score(
-        cv_data=extracted,
-        job_title=extracted.get("current_position", "Candidate"),
-        job_requirements=" ".join(
-            ensure_list(extracted.get("skills"))
-        ),
-        supabase=supabase,
-    )
-
-    return fallback_score, resolved_job_id
+    return {
+        "score": 0,
+        "dimension_scores": {},
+        "confidence": 0.0,
+        "reasoning": "",
+        "matched_keywords": [],
+        "missing_keywords": [],
+    }, resolved_job_id
 
 
-def insert_candidate(
-    supabase,
-    payload: dict,
-    drive_file_id: str,
-) -> dict:
-    """Insert candidate safely with race-condition protection."""
+def insert_candidate(supabase, payload: dict, drive_file_id: str):
     try:
         response = (
             supabase.table("candidates")
@@ -210,56 +160,26 @@ def insert_candidate(
     except Exception as exc:
         if "uq_candidates_drive_file_id" in str(exc):
             return {
-                "status": "skipped_race",
+                "status": "skipped",
+                "reason": "duplicate",
                 "drive_file_id": drive_file_id,
             }
 
         raise
 
-
 # --------------------------------------------------------------------------- #
-# Tasks
+# MAIN PROCESSOR (NO CELERY)
 # --------------------------------------------------------------------------- #
 
-@shared_task(
-    bind=True,
-    max_retries=3,
-    default_retry_delay=RETRY_BASE_DELAY,
-)
-def process_drive_file(
-    self,
-    drive_file_id: str,
-    job_id: str | None = None,
-) -> dict:
-    """
-    Process a single Drive CV file.
-
-    Pipeline:
-        - Idempotency check
-        - Download PDF
-        - Upload to storage
-        - Extract text
-        - AI parsing
-        - Scoring
-        - Candidate insertion
-    """
+def process_drive_file(drive_file_id: str, job_id: str | None = None) -> dict:
     supabase = get_supabase_admin()
 
     try:
-        # ------------------------------------------------------------------ #
-        # Idempotency
-        # ------------------------------------------------------------------ #
-
+        # 1. idempotency
         if candidate_exists(supabase, drive_file_id):
-            return {
-                "status": "skipped",
-                "drive_file_id": drive_file_id,
-            }
+            return {"status": "skipped"}
 
-        # ------------------------------------------------------------------ #
-        # Download file
-        # ------------------------------------------------------------------ #
-
+        # 2. metadata + download
         metadata = get_file_metadata(drive_file_id)
 
         file_name = sanitize_filename(
@@ -268,49 +188,35 @@ def process_drive_file(
 
         pdf_bytes = download_file_bytes(drive_file_id)
 
-        # ------------------------------------------------------------------ #
-        # Upload CV
-        # ------------------------------------------------------------------ #
-
+        # 3. upload to storage
         cv_url = upload_cv_to_storage(
-            supabase=supabase,
-            drive_file_id=drive_file_id,
-            file_name=file_name,
-            pdf_bytes=pdf_bytes,
+            supabase,
+            drive_file_id,
+            file_name,
+            pdf_bytes,
         )
 
-        # ------------------------------------------------------------------ #
-        # Text extraction
-        # ------------------------------------------------------------------ #
+        # 4. extract text
+        raw_text = extract_candidate_text(pdf_bytes)
 
-        raw_text = extract_candidate_text(
-            pdf_bytes=pdf_bytes,
-            supabase=supabase,
-            cv_url=cv_url,
-            drive_file_id=drive_file_id,
-            job_id=job_id,
-        )
+        if not raw_text.strip():
+            return {
+                "status": "failed",
+                "reason": "empty_text",
+                "drive_file_id": drive_file_id,
+            }
 
-        # ------------------------------------------------------------------ #
-        # AI extraction
-        # ------------------------------------------------------------------ #
-
+        # 5. AI extraction
         extracted = extract_cv_info(raw_text)
 
-        # ------------------------------------------------------------------ #
-        # Scoring
-        # ------------------------------------------------------------------ #
-
+        # 6. scoring
         score_result, resolved_job_id = resolve_candidate_score(
-            supabase=supabase,
-            extracted=extracted,
-            job_id=job_id,
+            supabase,
+            extracted,
+            job_id,
         )
 
-        # ------------------------------------------------------------------ #
-        # Build payload
-        # ------------------------------------------------------------------ #
-
+        # 7. build payload
         payload = build_candidate_payload(
             raw_text=raw_text,
             cv_info=extracted,
@@ -326,48 +232,31 @@ def process_drive_file(
             }
         )
 
-        # ------------------------------------------------------------------ #
-        # Insert candidate
-        # ------------------------------------------------------------------ #
-
+        # 8. insert
         return insert_candidate(
-            supabase=supabase,
-            payload=payload,
-            drive_file_id=drive_file_id,
-        )
-
-    except PERMANENT_ERRORS:
-        raise
-
-    except HttpError as exc:
-        if exc.status_code == 401:
-            _get_drive_service.cache_clear()
-
-        raise self.retry(
-            exc=exc,
-            countdown=retry_delay(self.request.retries),
+            supabase,
+            payload,
+            drive_file_id,
         )
 
     except Exception as exc:
-        raise self.retry(
-            exc=exc,
-            countdown=retry_delay(self.request.retries),
-        )
+        return {
+            "status": "error",
+            "error": str(exc),
+            "drive_file_id": drive_file_id,
+        }
 
+# --------------------------------------------------------------------------- #
+# DRIVE SYNC (NO CELERY)
+# --------------------------------------------------------------------------- #
 
-@shared_task
 def sync_drive_folder(job_id: str | None = None) -> dict:
-    """
-    Full Drive folder synchronization.
-
-    Safety net for missed webhook events.
-    """
     settings = get_settings()
 
     if not settings.drive_folder_id:
         return {
             "status": "skipped",
-            "reason": "DRIVE_FOLDER_ID not configured",
+            "reason": "missing_drive_folder_id",
         }
 
     supabase = get_supabase_admin()
@@ -382,7 +271,7 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
 
     processed_ids = {
         row["drive_file_id"]
-        for row in existing.data
+        for row in (existing.data or [])
         if row.get("drive_file_id")
     }
 
@@ -394,11 +283,8 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
         if file_id in processed_ids:
             continue
 
-        process_drive_file.delay(
-            drive_file_id=file_id,
-            job_id=job_id,
-        )
-
+        # direct call (NO CELERY)
+        process_drive_file(file_id, job_id)
         queued += 1
 
     return {
@@ -407,18 +293,17 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
         "queued": queued,
     }
 
+# --------------------------------------------------------------------------- #
+# WEBHOOK SYNC (NO CELERY)
+# --------------------------------------------------------------------------- #
 
-@shared_task
 def sync_drive_webhook(job_id: str | None = None) -> dict:
-    """
-    Process Drive webhook notifications using page tokens.
-    """
     settings = get_settings()
 
     if not settings.drive_folder_id:
         return {
             "status": "skipped",
-            "reason": "DRIVE_FOLDER_ID not configured",
+            "reason": "missing_drive_folder_id",
         }
 
     supabase = get_supabase_admin()
@@ -438,7 +323,7 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
     )
 
     if not page_token:
-        return sync_drive_folder(job_id=job_id)
+        return sync_drive_folder(job_id)
 
     new_files, next_token = list_new_pdf_files_since(
         settings.drive_folder_id,
@@ -446,68 +331,24 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
     )
 
     for file_data in new_files:
-        process_drive_file.delay(
-            drive_file_id=file_data["id"],
-            job_id=job_id,
-        )
+        process_drive_file(file_data["id"], job_id)
 
-    (
-        supabase.table("app_config")
-        .upsert(
-            {
-                "key": "drive_page_token",
-                "value": next_token,
-            }
-        )
-        .execute()
-    )
+    supabase.table("app_config").upsert(
+        {
+            "key": "drive_page_token",
+            "value": next_token,
+        }
+    ).execute()
 
     return {
         "status": "done",
         "new_files": len(new_files),
-        "queued": len(new_files),
     }
 
+# --------------------------------------------------------------------------- #
+# WEBHOOK RENEWAL
+# --------------------------------------------------------------------------- #
 
-@shared_task
 def renew_drive_webhook() -> dict:
-    """
-    Renew Google Drive webhook subscription.
-    Runs periodically via Celery Beat.
-    """
-    from app.services.webhook_manager import (
-        ensure_webhook_registered,
-    )
-
+    from app.services.webhook_manager import ensure_webhook_registered
     return ensure_webhook_registered()
-
-
-# --------------------------------------------------------------------------- #
-# Candidate Screening
-# --------------------------------------------------------------------------- #
-
-def process_candidate(candidate, job) -> dict:
-    """
-    Apply hard screening gates before scoring a candidate.
-    """
-
-    if not passes_screening(candidate, job):
-        return {
-            "status": "rejected",
-            "score": 0,
-        }
-
-    cv_data = extract_cv_info(candidate.raw_text)
-
-    score_result = compute_candidate_score(
-        cv_data=cv_data,
-        job_title=job.title,
-        job_requirements=job.requirements,
-        supabase=get_supabase_admin(),
-    )
-
-    return {
-        "status": "accepted",
-        "score": score_result.get("final_score", 0),
-        "details": score_result,
-    }

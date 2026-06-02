@@ -69,10 +69,15 @@ async def forgot_password(payload: PasswordResetRequest):
             payload.email,
             options={"redirect_to": f"{settings.frontend_url}/reset-password"},
         )
+        return {"message": "If this email is registered, a reset link has been sent."}
     except Exception as e:
-        # Temporarily expose error for debugging
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"message": "If this email is registered, a reset link has been sent."}
+        # This will print the actual Supabase error (e.g., "invalid email", "rate limit exceeded")
+        # to your backend logs.
+        print(f"DEBUG ERROR: {e}") 
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=str(e) # This will now show the real error in your browser console
+        )
 
 
 @router.post("/reset-password", status_code=status.HTTP_200_OK)

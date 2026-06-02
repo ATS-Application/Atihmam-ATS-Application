@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.api.v1 import  auth, candidates, jobs, ingestion, feedback
+from app.api.v1 import  auth, candidates, jobs, ingestion, feedback, health
 from app.api.v1.analytics import router as analytics_router
 
 settings = get_settings()
@@ -40,6 +40,7 @@ def create_app() -> FastAPI:
 
     origins = getattr(settings, "allowed_origins", []) or []
     required_origins = [
+        "https://atihmam-ats-application.vercel.app",
         "http://localhost:5173",
         "http://localhost:5174",
         "http://localhost:3000",
@@ -63,11 +64,8 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router,       prefix=prefix)
     app.include_router(ingestion.router,  prefix=prefix)
     app.include_router(feedback.router,   prefix=prefix)
+    app.include_router(health.router,     prefix=prefix)
     app.include_router(analytics_router, prefix="/api/v1")
-
-    @app.get("/health", tags=["Health"])
-    def health():
-        return {"status": "ok", "env": settings.app_env, "version": "2.0.0"}
 
     return app
 
