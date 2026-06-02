@@ -1,20 +1,24 @@
 # backend/app/api/v1/ingestion.py
-from fastapi import (
-    APIRouter,
-    Depends,
-    UploadFile,
-    File,
-    Form,
-    HTTPException,
-    Request,
-    status,
-)
 
-from datetime import datetime
+from __future__ import annotations
+
 import hashlib
 import re
 import unicodedata
 import uuid
+from datetime import datetime
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 
 from app.core.security import (
     get_current_user,
@@ -22,7 +26,6 @@ from app.core.security import (
 )
 
 from app.db.supabase_client import (
-    get_supabase,
     get_supabase_admin,
 )
 
@@ -30,36 +33,32 @@ from app.services.webhook_manager import (
     ensure_webhook_registered,
 )
 
-from app.tasks.cv_processing import (
-    process_cv,
-)
-
-from app.tasks.drive_sync import (
-    sync_drive_folder,
-)
+from app.tasks.cv_processing import process_cv
+from app.tasks.drive_sync import sync_drive_folder
 
 router = APIRouter(
     prefix="/ingestion",
     tags=["CV Ingestion"],
 )
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 ALLOWED_CONTENT_TYPES = {
-    "application/pdf"
+    "application/pdf",
 }
 
 MAX_FILE_SIZE_MB = 10
 
-
-# ─────────────────────────────────────────────
+# =========================================================
 # HELPERS
-# ─────────────────────────────────────────────
+# =========================================================
+
 
 def sanitize_filename(filename: str) -> str:
     filename = (
-        unicodedata.normalize(
-            "NFKD",
-            filename,
-        )
+        unicodedata.normalize("NFKD", filename)
         .encode("ascii", "ignore")
         .decode("ascii")
     )
@@ -79,12 +78,8 @@ def sanitize_filename(filename: str) -> str:
     return filename.lower()
 
 
-def create_file_hash(
-    content: bytes,
-) -> str:
-    return hashlib.sha256(
-        content
-    ).hexdigest()
+def create_file_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
 
 def log_candidate_status(
@@ -98,52 +93,102 @@ def log_candidate_status(
 
     supabase.table(
         "candidate_status_history"
-    ).insert({
-        "candidate_id": candidate_id,
-        "from_status": from_status,
-        "to_status": to_status,
-        "changed_by": changed_by,
-        "note": note,
-        "created_at": datetime.utcnow().isoformat(),
-    }).execute()
+    ).insert(
+        {
+            "candidate_id": candidate_id,
+            "from_status": from_status,
+            "to_status": to_status,
+            "changed_by": changed_by,
+            "note": note,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+    ).execute()
 
 
-# ─────────────────────────────────────────────
+# =========================================================
+# TASK DISPATCHER
+# =========================================================
+
+def queue_cv_processing(
+    background_tasks: BackgroundTasks,
+    candidate_id: str,
+    storage_path: str,
+    job_id: str | None,
+):
+    """
+    Try Celery first.
+    Fallback to FastAPI BackgroundTasks.
+    """
+
+    try:
+        process_cv.delay(
+            candidate_id=candidate_id,
+            storage_path=storage_path,
+            job_id=job_id,
+        )
+
+        return "celery"
+
+    except Exception:
+        background_tasks.add_task(
+            process_cv,
+            candidate_id=candidate_id,
+            storage_path=storage_path,
+            job_id=job_id,
+        )
+
+        return "background"
+
+
+def queue_drive_sync(
+    background_tasks: BackgroundTasks,
+    job_id: str | None = None,
+):
+    """
+    Try Celery first.
+    Fallback to FastAPI BackgroundTasks.
+    """
+
+    try:
+        sync_drive_folder.delay(
+            job_id=job_id,
+        )
+
+        return "celery"
+
+    except Exception:
+        background_tasks.add_task(
+            sync_drive_folder,
+            job_id=job_id,
+        )
+
+        return "background"
+
+
+# =========================================================
 # MANUAL CV UPLOAD
-# ─────────────────────────────────────────────
+# =========================================================
 
 @router.post(
     "/upload",
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def upload_cv(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     job_id: str | None = Form(None),
-    user: dict = Depends(
-        get_current_user
-    ),
+    user: dict = Depends(get_current_user),
 ):
     """
-    Upload CV manually and trigger
-    asynchronous AI processing.
+    Upload a CV and queue asynchronous processing.
+    Supports Celery and FastAPI BackgroundTasks.
     """
 
-    # ─────────────────────────────────────────
-    # VALIDATE CONTENT TYPE
-    # ─────────────────────────────────────────
-
-    if (
-        file.content_type
-        not in ALLOWED_CONTENT_TYPES
-    ):
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
             detail="Only PDF files are accepted.",
         )
-
-    # ─────────────────────────────────────────
-    # READ FILE
-    # ─────────────────────────────────────────
 
     content = await file.read()
 
@@ -153,32 +198,17 @@ async def upload_cv(
             detail="Uploaded file is empty.",
         )
 
-    size_mb = len(content) / (
-        1024 * 1024
-    )
+    size_mb = len(content) / (1024 * 1024)
 
     if size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"File exceeds "
-                f"{MAX_FILE_SIZE_MB} MB limit."
-            ),
+            detail=f"File exceeds {MAX_FILE_SIZE_MB} MB limit.",
         )
 
-    # ─────────────────────────────────────────
-    # CREATE HASH
-    # ─────────────────────────────────────────
-
-    file_hash = create_file_hash(
-        content
-    )
+    file_hash = create_file_hash(content)
 
     supabase = get_supabase_admin()
-
-    # ─────────────────────────────────────────
-    # OPTIONAL DUPLICATE CHECK
-    # ─────────────────────────────────────────
 
     existing = (
         supabase.table("candidates")
@@ -191,46 +221,30 @@ async def upload_cv(
     if existing.data:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "This CV was already uploaded."
-            ),
-        )
-
-    # ─────────────────────────────────────────
-    # CREATE CANDIDATE
-    # ─────────────────────────────────────────
-
-    candidate_insert = {
-        "job_id": job_id,
-        "status": "applied",
-        "processing_status": "queued",
-        "cv_file_hash": file_hash,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-
-    candidate_response = (
-        supabase.table("candidates")
-        .insert(candidate_insert)
-        .execute()
-    )
-
-    if not candidate_response.data:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Could not create candidate."
-            ),
+            detail="This CV has already been uploaded.",
         )
 
     candidate = (
-        candidate_response.data[0]
+        supabase.table("candidates")
+        .insert(
+            {
+                "job_id": job_id,
+                "status": "applied",
+                "processing_status": "queued",
+                "cv_file_hash": file_hash,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+        )
+        .execute()
     )
 
-    candidate_id = candidate["id"]
+    if not candidate.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create candidate.",
+        )
 
-    # ─────────────────────────────────────────
-    # LOG INITIAL STATUS
-    # ─────────────────────────────────────────
+    candidate_id = candidate.data[0]["id"]
 
     log_candidate_status(
         candidate_id=candidate_id,
@@ -240,12 +254,8 @@ async def upload_cv(
         note="CV uploaded manually.",
     )
 
-    # ─────────────────────────────────────────
-    # CREATE SAFE FILE NAME
-    # ─────────────────────────────────────────
-
     safe_filename = sanitize_filename(
-        file.filename
+        file.filename or "cv.pdf"
     )
 
     unique_filename = (
@@ -253,13 +263,8 @@ async def upload_cv(
     )
 
     storage_path = (
-        f"manual/{candidate_id}/"
-        f"{unique_filename}"
+        f"manual/{candidate_id}/{unique_filename}"
     )
-
-    # ─────────────────────────────────────────
-    # UPLOAD TO STORAGE
-    # ─────────────────────────────────────────
 
     try:
         (
@@ -269,15 +274,13 @@ async def upload_cv(
                 storage_path,
                 content,
                 file_options={
-                    "content-type":
-                    "application/pdf",
+                    "content-type": "application/pdf",
                     "upsert": "false",
                 },
             )
         )
 
-    except Exception as e:
-        # rollback candidate
+    except Exception as exc:
         (
             supabase.table("candidates")
             .delete()
@@ -287,31 +290,23 @@ async def upload_cv(
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Storage upload failed: "
-                f"{str(e)}"
-            ),
+            detail=f"Storage upload failed: {exc}",
         )
-
-    # ─────────────────────────────────────────
-    # SAVE STORAGE PATH
-    # ─────────────────────────────────────────
 
     (
         supabase.table("candidates")
-        .update({
-            "cv_file_url": storage_path,
-            "updated_at": datetime.utcnow().isoformat(),
-        })
+        .update(
+            {
+                "cv_file_url": storage_path,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        )
         .eq("id", candidate_id)
         .execute()
     )
 
-    # ─────────────────────────────────────────
-    # QUEUE BACKGROUND TASK
-    # ─────────────────────────────────────────
-
-    process_cv.delay(
+    worker = queue_cv_processing(
+        background_tasks=background_tasks,
         candidate_id=candidate_id,
         storage_path=storage_path,
         job_id=job_id,
@@ -319,17 +314,15 @@ async def upload_cv(
 
     return {
         "success": True,
-        "message": (
-            "CV uploaded successfully."
-        ),
         "candidate_id": candidate_id,
         "processing_status": "queued",
+        "worker": worker,
     }
 
 
-# ─────────────────────────────────────────────
+# =========================================================
 # GOOGLE DRIVE WEBHOOK
-# ─────────────────────────────────────────────
+# =========================================================
 
 @router.post(
     "/drive/webhook",
@@ -337,19 +330,19 @@ async def upload_cv(
 )
 async def drive_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
 ):
     headers = request.headers
 
     resource_state = headers.get(
         "x-goog-resource-state",
-        "",
+        ""
     )
 
     resource_id = headers.get(
         "x-goog-resource-id"
     )
 
-    # Google handshake
     if resource_state == "sync":
         return {
             "status": "acknowledged"
@@ -370,24 +363,24 @@ async def drive_webhook(
     if not resource_id:
         return {
             "status": "ignored",
-            "reason": "missing resource_id",
+            "reason": "missing_resource_id",
         }
 
-    # Queue async sync
-    sync_drive_folder.delay()
+    worker = queue_drive_sync(
+        background_tasks=background_tasks
+    )
 
     return {
-        "status": "queued"
+        "status": "queued",
+        "worker": worker,
     }
 
 
-# ─────────────────────────────────────────────
-# REGISTER WEBHOOK
-# ─────────────────────────────────────────────
+# =========================================================
+# REGISTER DRIVE WEBHOOK
+# =========================================================
 
-@router.post(
-    "/drive/register-webhook"
-)
+@router.post("/drive/register-webhook")
 async def register_drive_webhook(
     user: dict = Depends(
         require_role("admin")
@@ -396,15 +389,16 @@ async def register_drive_webhook(
     return ensure_webhook_registered()
 
 
-# ─────────────────────────────────────────────
+# =========================================================
 # MANUAL DRIVE SYNC
-# ─────────────────────────────────────────────
+# =========================================================
 
 @router.post(
     "/drive/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def trigger_drive_sync(
+    background_tasks: BackgroundTasks,
     job_id: str | None = None,
     user: dict = Depends(
         require_role(
@@ -413,11 +407,13 @@ async def trigger_drive_sync(
         )
     ),
 ):
-    sync_drive_folder.delay(
-        job_id=job_id
+    worker = queue_drive_sync(
+        background_tasks=background_tasks,
+        job_id=job_id,
     )
 
     return {
         "success": True,
         "message": "Drive sync queued.",
+        "worker": worker,
     }
