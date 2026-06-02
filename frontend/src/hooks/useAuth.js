@@ -1,57 +1,166 @@
 // frontend/src/hooks/useAuth.js
+
 import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { authApi, register, forgotPassword, resetPassword } from "../api/authApi";
+
+import { authApi } from "../api/authApi";
 import { useAuthStore } from "../store/authStore";
 
+// ======================================================
+// LOGIN
+// ======================================================
+
 export function useLogin() {
-  const setAuth = useAuthStore((s) => s.setAuth);
   const navigate = useNavigate();
+  const setAuth = useAuthStore((state) => state.setAuth);
 
   return useMutation({
-    mutationFn: ({ email, password }) => authApi.login({ email, password }),
-    onSuccess: (res) => {
-      setAuth(res.data.access_token, null);
-      navigate("/dashboard");
+    mutationFn: ({ email, password }) =>
+      authApi.login({
+        email,
+        password,
+      }),
+
+    onSuccess: (data) => {
+      const token =
+        data?.access_token ||
+        data?.token ||
+        data?.accessToken;
+
+      if (!token) {
+        toast.error("Token d'authentification introuvable");
+        return;
+      }
+
+      setAuth(token, null);
+
       toast.success("Connexion réussie");
+
+      navigate("/dashboard");
     },
-    onError: (err) => {
-      toast.error(err.response?.data?.detail || "Identifiants incorrects");
+
+    onError: (error) => {
+      toast.error(
+        error?.message ||
+          "Identifiants incorrects"
+      );
     },
   });
 }
+
+// ======================================================
+// REGISTER
+// ======================================================
+
+export function useRegister() {
+  const navigate = useNavigate();
+
+  return useMutation({
+    mutationFn: ({
+      email,
+      password,
+      full_name,
+    }) =>
+      authApi.register({
+        email,
+        password,
+        full_name,
+      }),
+
+    onSuccess: () => {
+      toast.success(
+        "Compte créé avec succès"
+      );
+
+      navigate("/login");
+    },
+
+    onError: (error) => {
+      toast.error(
+        error?.message ||
+          "Impossible de créer le compte"
+      );
+    },
+  });
+}
+
+// ======================================================
+// FORGOT PASSWORD
+// ======================================================
 
 export function useForgotPassword() {
   return useMutation({
-    mutationFn: (email) => forgotPassword(email),
-    onError: (err) => {
-      toast.error(err.response?.data?.detail || "Une erreur est survenue");
+    mutationFn: ({ email }) =>
+      authApi.forgotPassword({
+        email,
+      }),
+
+    onSuccess: () => {
+      toast.success(
+        "Email de réinitialisation envoyé"
+      );
+    },
+
+    onError: (error) => {
+      toast.error(
+        error?.message ||
+          "Une erreur est survenue"
+      );
     },
   });
 }
+
+// ======================================================
+// RESET PASSWORD
+// ======================================================
 
 export function useResetPassword() {
   const navigate = useNavigate();
+
   return useMutation({
-    mutationFn: ({ access_token, new_password }) =>
-      resetPassword(access_token, new_password),
+    mutationFn: ({
+      access_token,
+      new_password,
+    }) =>
+      authApi.resetPassword({
+        access_token,
+        new_password,
+      }),
+
     onSuccess: () => {
-      toast.success("Mot de passe mis à jour. Veuillez vous reconnecter.");
+      toast.success(
+        "Mot de passe mis à jour"
+      );
+
       navigate("/login");
     },
-    onError: (err) => {
-      toast.error(err.response?.data?.detail || "Lien invalide ou expiré.");
+
+    onError: (error) => {
+      toast.error(
+        error?.message ||
+          "Lien invalide ou expiré"
+      );
     },
   });
 }
 
+// ======================================================
+// LOGOUT
+// ======================================================
+
 export function useLogout() {
-  const logout = useAuthStore((s) => s.logout);
+  const logout = useAuthStore(
+    (state) => state.logout
+  );
+
   const navigate = useNavigate();
+
   return () => {
     logout();
-    navigate("/login");
+
     toast.success("Déconnecté");
+
+    navigate("/login");
   };
 }
