@@ -1765,3 +1765,85 @@ async def batch_score_candidates_async(
     scores  = await asyncio.gather(*tasks)
     results = [{"cv": cv, **score} for cv, score in zip(candidates, scores)]
     return sorted(results, key=lambda r: r["score"], reverse=True)
+
+# Fonction de scoring de qualité autonome (sans poste)
+# Utilisée pour évaluer la qualité intrinsèque d'un CV quand il est uploadé mannuellement.
+
+def compute_cv_quality_score(
+    cv_data: dict[str, Any],
+    supabase=None,
+) -> dict[str, Any]:
+    """
+    Score la qualité intrinsèque d'un CV sans comparaison avec un poste.
+    
+    Utilisé quand aucun poste actif n'est disponible.
+    On évalue ce qu'on PEUT mesurer sans offre d'emploi :
+      - Le niveau d'études détecté
+      - Les années d'expérience
+      - La présence de certifications
+      - Les termes de leadership
+      - La complexité des projets
+    
+    Les dimensions qui nécessitent un poste (keyword, semantic)
+    sont mises à 0 et exclues du calcul final.
+    """
+    cv_text = _build_cv_text(cv_data)
+
+    # Récupère les années d'expérience depuis les données IA ou l'historique
+    ai_data = cv_data.get("ai_extracted_data") or {}
+    if isinstance(ai_data, str):
+        try:
+            ai_data = json.loads(ai_data)
+        except Exception:
+            ai_data = {}
+
+    work_history = (
+        safe_dict_list(cv_data.get("work_history"))
+        or safe_dict_list(ai_data.get("work_history"))
+    )
+    candidate_years = (
+        cv_data.get("experience_years")
+        or ai_data.get("experience_years")
+        or infer_experience_years(work_history)
+        or 0
+    )
+
+    # Calcul de chaque dimension disponible
+    edu_score     = _education_score(cv_text)
+    exp_score     = _clamp(float(candidate_years) * 10)  # 10 ans = 100%
+    cert_score    = _certification_score(cv_text)
+    lead_score    = _leadership_score(cv_text)
+    complex_score = _complexity_score(cv_text)
+
+    # Moyenne pondérée uniquement sur les dimensions mesurables
+    # (on ignore keyword et semantic car ils nécessitent un poste)
+    final_score = _clamp(
+        edu_score     * 0.25 +
+        exp_score     * 0.30 +
+        cert_score    * 0.15 +
+        lead_score    * 0.15 +
+        complex_score * 0.15
+    )
+
+    return {
+        "score": final_score,
+        "confidence": 0.5,
+        "domain": "Évaluation qualité CV (sans poste)",
+        "reasoning": (
+            f"Score qualité CV autonome — "
+            f"Éducation={edu_score:.1f}, Expérience={exp_score:.1f}, "
+            f"Certifications={cert_score:.1f}, Leadership={lead_score:.1f}, "
+            f"Complexité={complex_score:.1f}"
+        ),
+        "matched_keywords": [],
+        "missing_keywords": [],
+        "dimension_scores": {
+            "keyword_score":            0,
+            "semantic_score":           0,
+            "experience_score":         exp_score,
+            "certification_score":      cert_score,
+            "education_score":          edu_score,
+            "leadership_score":         lead_score,
+            "project_complexity_score": complex_score,
+        },
+    }
