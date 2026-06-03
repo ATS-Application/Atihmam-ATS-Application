@@ -23,8 +23,12 @@ def run_webhook_setup():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-load the sentence transformer at startup
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _get_model)
+    
     if settings.drive_folder_id:
-        asyncio.get_running_loop().run_in_executor(None, run_webhook_setup)
+        loop.run_in_executor(None, run_webhook_setup)
     yield
 
 
