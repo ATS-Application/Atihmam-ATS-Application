@@ -1776,27 +1776,24 @@ def compute_cv_quality_score(
     """
     Score la qualité intrinsèque d'un CV sans comparaison avec un poste.
     
-    Utilisé quand aucun poste actif n'est disponible.
-    On évalue ce qu'on PEUT mesurer sans offre d'emploi :
-      - Le niveau d'études détecté
-      - Les années d'expérience
-      - La présence de certifications
-      - Les termes de leadership
-      - La complexité des projets
-    
-    Les dimensions qui nécessitent un poste (keyword, semantic)
-    sont mises à 0 et exclues du calcul final.
+    Contrairement à l'ancienne version (tech-only), cette version détecte
+    automatiquement le domaine du CV et utilise le profil correspondant
+    pour évaluer la complexité et les indicateurs métier.
     """
     cv_text = _build_cv_text(cv_data)
 
-    # Récupère les années d'expérience depuis les données IA ou l'historique
-    ai_data = cv_data.get("ai_extracted_data") or {}
-    if isinstance(ai_data, str):
+    # ── Resolve AI data once ─────────────────────────────────────────────────
+    ai_data: dict[str, Any] = {}
+    raw_ai = cv_data.get("ai_extracted_data")
+    if isinstance(raw_ai, str):
         try:
-            ai_data = json.loads(ai_data)
+            ai_data = json.loads(raw_ai)
         except Exception:
-            ai_data = {}
+            pass
+    elif isinstance(raw_ai, dict):
+        ai_data = raw_ai
 
+    # ── Experience ───────────────────────────────────────────────────────────
     work_history = (
         safe_dict_list(cv_data.get("work_history"))
         or safe_dict_list(ai_data.get("work_history"))
@@ -1808,29 +1805,49 @@ def compute_cv_quality_score(
         or 0
     )
 
-    # Calcul de chaque dimension disponible
-    edu_score     = _education_score(cv_text)
-    exp_score     = _clamp(float(candidate_years) * 10)  # 10 ans = 100%
-    cert_score    = _certification_score(cv_text)
-    lead_score    = _leadership_score(cv_text)
-    complex_score = _complexity_score(cv_text)
+    # ── Domain detection (CV-only: no job title/requirements available) ──────
+    # Pass empty strings for job_title and job_requirements — classify_domain
+    # will base its decision purely on CV text signals.
+    domain  = classify_domain(cv_text, "", "")
+    profile = _DOMAIN_PROFILES.get(domain, _FALLBACK_PROFILE)
+    is_tech = domain in TECH_DOMAINS
 
-    # Moyenne pondérée uniquement sur les dimensions mesurables
-    # (on ignore keyword et semantic car ils nécessitent un poste)
+    # ── Dimension scores ─────────────────────────────────────────────────────
+    edu_score  = _education_score(cv_text)
+    exp_score  = _clamp(float(candidate_years) * 10)   # 10 yrs → 100
+
+    # Certifications: use tech scores for tech domains; keyword presence for others.
+    if is_tech:
+        cert_score = _certification_score(cv_text)
+    else:
+        # Count how many domain-specific indicator terms appear in the CV.
+        # Each hit is worth the same flat weight as a tech cert (~30 pts avg).
+        cert_hits  = sum(1 for term in profile.indicators if term in cv_text)
+        cert_score = _clamp(cert_hits * 25)
+
+    lead_score    = _leadership_score(cv_text, profile.leadership_terms)
+
+    # Complexity: tech pipeline vs domain-specific indicators.
+    if is_tech:
+        complex_score = _complexity_score(cv_text)
+    else:
+        complex_score = _complexity_score(cv_text, profile.indicators)
+
+    # ── Weighted blend (keyword/semantic excluded — no job to compare) ───────
     final_score = _clamp(
-        edu_score     * 0.25 +
-        exp_score     * 0.30 +
-        cert_score    * 0.15 +
-        lead_score    * 0.15 +
-        complex_score * 0.15
+        edu_score     * 0.25
+        + exp_score   * 0.30
+        + cert_score  * 0.15
+        + lead_score  * 0.15
+        + complex_score * 0.15
     )
 
     return {
-        "score": final_score,
+        "score":      final_score,
         "confidence": 0.5,
-        "domain": "Évaluation qualité CV (sans poste)",
+        "domain":     domain.value,
         "reasoning": (
-            f"Score qualité CV autonome — "
+            f"Qualité CV autonome | Domaine={domain.value} — "
             f"Éducation={edu_score:.1f}, Expérience={exp_score:.1f}, "
             f"Certifications={cert_score:.1f}, Leadership={lead_score:.1f}, "
             f"Complexité={complex_score:.1f}"
