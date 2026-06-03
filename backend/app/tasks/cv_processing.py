@@ -290,3 +290,19 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             "success": False,
             "error": str(e),
         }
+def build_candidate_payload(cv_info: dict, score_result: dict, resolved_job_id: str | None = None) -> dict:
+    return {
+        "full_name": ensure_string(cv_info.get("full_name")),
+        "email": ensure_string(cv_info.get("email")),
+        "phone": ensure_string(cv_info.get("phone")),
+        "skills": ensure_list(cv_info.get("skills")),
+        "education": ensure_list(cv_info.get("education")),
+        "work_history": ensure_list(cv_info.get("work_history")),
+        "experience_years": cv_info.get("experience_years", 0),
+        "score": score_result.get("score", 0),
+        "dimension_scores": score_result.get("dimension_scores", {}),
+        "score_confidence": score_result.get("confidence", 0),
+        "processing_status": "completed",
+        "updated_at": utc_now(),
+        **({"job_id": resolved_job_id} if resolved_job_id else {}),
+    }
