@@ -323,32 +323,8 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         # On utilise analyze_cv_depth() qui évalue la profondeur et la qualité du CV
         # sans avoir besoin de le comparer à une offre d'emploi
         if not score_result:
-            from app.services.ai_service import analyze_cv_depth
-
-            # Analyse de la profondeur du CV (métriques, descriptions, lacunes...)
-            depth_report = analyze_cv_depth(cv_info)
-            depth_score = depth_report.get("overall_depth_score") or 0
-
-            # On construit un score_result avec la même structure qu'un vrai scoring
-            # pour que le frontend puisse l'afficher normalement
-            score_result = {
-                "score": depth_score,
-                "dimension_scores": {
-                    "keyword_score": 0,           # Pas de mots-clés à comparer (pas de poste)
-                    "semantic_score": 0,           # Pas de similarité sémantique (pas de poste)
-                    "experience_score": min(       # Score basé sur les années d'expérience
-                        float(cv_info.get("experience_years") or 0) * 10, 100
-                    ),
-                    "certification_score": 0,      # Pas de certifications à comparer
-                    "education_score": 75.0,       # Score de formation par défaut
-                    "leadership_score": 0,         # Pas de leadership à comparer
-                    "project_complexity_score": depth_score,  # Basé sur la qualité du CV
-                },
-                "confidence": 0.5,
-                "reasoning": "Scoré sur la qualité du CV (aucun poste actif disponible)",
-                "matched_keywords": [],
-                "missing_keywords": [],
-            }
+            from app.services.scoring_service import compute_cv_quality_score
+            score_result = compute_cv_quality_score(cv_info, supabase=supabase)
 
         # ── Étape 5 : Sauvegarde en base de données ───────────────────────────
 
