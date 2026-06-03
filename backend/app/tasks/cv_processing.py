@@ -232,12 +232,15 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             score_result = best_result
             resolved_job_id = best_job_id
 
+               # In process_cv(), replace the "if not score_result" block:
         if not score_result:
+            from app.services.ai_service import analyze_cv_depth
+            depth_report = analyze_cv_depth(cv_info)
             score_result = {
-                "score": 0,
-                "dimension_scores": {},
-                "confidence": 0.0,
-                "reasoning": "",
+                "score": depth_report.get("overall_depth_score", 0),
+                "dimension_scores": depth_report,
+                "confidence": 0.5,
+                "reasoning": "Scored on CV quality (no active job posts available)",
                 "matched_keywords": [],
                 "missing_keywords": [],
             }
