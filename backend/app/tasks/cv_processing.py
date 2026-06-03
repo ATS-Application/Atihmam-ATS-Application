@@ -290,19 +290,64 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             "success": False,
             "error": str(e),
         }
-def build_candidate_payload(cv_info: dict, score_result: dict, resolved_job_id: str | None = None) -> dict:
-    return {
+def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
+    """Find the best matching job for a CV across all active jobs."""
+    best_score = -1
+    best_result = None
+    best_job_id = None
+
+    for job in jobs:
+        try:
+            result = compute_candidate_score(
+                cv_data=cv_info,
+                job_title=job.get("title", ""),
+                job_requirements=job.get("requirements", ""),
+                supabase=supabase,
+            )
+            score = result.get("score", 0)
+            if score > best_score:
+                best_score = score
+                best_result = result
+                best_job_id = job.get("id")
+        except Exception as e:
+            logger.error(f"Job scoring failed for job {job.get('id')}: {e}")
+
+    return best_result, best_job_id
+
+
+def build_candidate_payload(
+    raw_text: str,
+    cv_info: dict,
+    score_result: dict,
+    job_id: str | None = None,
+) -> dict:
+    """Build the full candidate DB payload from extracted CV and score data."""
+    payload = {
+        "cv_raw_text": raw_text[:MAX_TEXT_LENGTH],
+        "ai_extracted_data": sanitize_ai_data(cv_info),
+
         "full_name": ensure_string(cv_info.get("full_name")),
         "email": ensure_string(cv_info.get("email")),
         "phone": ensure_string(cv_info.get("phone")),
+
         "skills": ensure_list(cv_info.get("skills")),
         "education": ensure_list(cv_info.get("education")),
         "work_history": ensure_list(cv_info.get("work_history")),
+        "certifications": ensure_list(cv_info.get("certifications")),
+        "languages": ensure_list(cv_info.get("languages")),
+        "projects": ensure_list(cv_info.get("projects")),
+
         "experience_years": cv_info.get("experience_years", 0),
+
         "score": score_result.get("score", 0),
         "dimension_scores": score_result.get("dimension_scores", {}),
         "score_confidence": score_result.get("confidence", 0),
+
         "processing_status": "completed",
         "updated_at": utc_now(),
-        **({"job_id": resolved_job_id} if resolved_job_id else {}),
     }
+
+    if job_id:
+        payload["job_id"] = job_id
+
+    return payload
