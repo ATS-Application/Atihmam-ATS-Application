@@ -49,7 +49,7 @@ def _call_gemini(prompt: str, settings) -> str:
     if not settings.gemini_api_key:
         raise RuntimeError("Missing Gemini API key")
     genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel("gemini-3-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(prompt)
     return response.text
 
