@@ -23,6 +23,7 @@ def run_webhook_setup():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.services.scoring_service import _get_model
     # Pre-load the sentence transformer at startup
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_model)
