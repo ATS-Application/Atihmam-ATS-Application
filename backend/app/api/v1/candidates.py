@@ -26,6 +26,9 @@ from fastapi import (
     status,
 )
 
+from app.services.scoring_service import compute_candidate_score
+from app.tasks.cv_processing import fetch_job
+
 from app.core.security import get_current_user
 from app.core.state_machine import validate_transition
 
@@ -499,4 +502,88 @@ async def get_candidate_cv_depth(
     return {
         "candidate_id": str(candidate_id),
         "analysis": report,
+    }
+
+# ============================================================================
+# ON-DEMAND DOMAIN SCORE AGAINST A JOB
+# ============================================================================
+
+@router.post(
+    "/{candidate_id}/score",
+    summary="Score a candidate against a specific job offer",
+)
+async def score_candidate_against_job(
+    candidate_id: UUID,
+    job_id: UUID,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Run the full domain-aware scoring pipeline for a candidate
+    against a specific job offer and persist the result.
+
+    Use this after upload when you want to (re)score against a chosen job,
+    or when the candidate was uploaded without an active job available.
+    """
+    supabase = get_supabase()
+
+    candidate = get_candidate_or_404(supabase, candidate_id)
+
+    job_resp = (
+        supabase.table("jobs")
+        .select("id, title, requirements, required_experience")
+        .eq("id", str(job_id))
+        .single()
+        .execute()
+    )
+    if not job_resp.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+    job = job_resp.data
+
+    # Build cv_data from the stored candidate row.
+    # ai_extracted_data is the richest source; fall back to top-level fields.
+    ai_data = candidate.get("ai_extracted_data") or {}
+    if isinstance(ai_data, str):
+        try:
+            import json as _json
+            ai_data = _json.loads(ai_data)
+        except Exception:
+            ai_data = {}
+
+    cv_data = {
+        **ai_data,
+        # Top-level columns always win over ai_extracted_data
+        "cv_raw_text":      candidate.get("cv_raw_text", ""),
+        "skills":           candidate.get("skills") or ai_data.get("skills", []),
+        "work_history":     candidate.get("work_history") or ai_data.get("work_history", []),
+        "education":        candidate.get("education") or ai_data.get("education", []),
+        "experience_years": candidate.get("experience_years") or ai_data.get("experience_years"),
+        "certifications":   candidate.get("certifications") or ai_data.get("certifications", []),
+        "projects":         candidate.get("projects") or ai_data.get("projects", []),
+        "summary":          candidate.get("summary") or ai_data.get("summary", ""),
+        "current_position": candidate.get("current_position") or ai_data.get("current_position", ""),
+    }
+
+    score_result = compute_candidate_score(
+        cv_data=cv_data,
+        job_title=job.get("title", ""),
+        job_requirements=job.get("requirements", ""),
+        required_experience=job.get("required_experience", 5),
+        supabase=supabase,
+    )
+
+    # Persist the new score and associate with the job
+    supabase.table("candidates").update({
+        "score":            score_result["score"],
+        "dimension_scores": score_result["dimension_scores"],
+        "score_confidence": score_result["confidence"],
+        "job_id":           str(job_id),
+    }).eq("id", str(candidate_id)).execute()
+
+    return {
+        "candidate_id": str(candidate_id),
+        "job_id":       str(job_id),
+        **score_result,
     }
