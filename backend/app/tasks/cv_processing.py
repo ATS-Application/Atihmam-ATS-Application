@@ -211,13 +211,10 @@ def _build_score_payload(score_result: dict) -> dict:
 # ============================================================================
 
 def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
-    """
-    Pipeline complet de traitement d'un CV.
-    """
     supabase = get_supabase_admin()
 
     try:
-        logger.info(f"🚀 Début traitement CV : {candidate_id}")
+        logger.info(f"🚀 Traitement CV : {candidate_id}")
 
         candidate = fetch_candidate(supabase, candidate_id)
         if not candidate:
@@ -228,23 +225,14 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             "updated_at": utc_now(),
         })
 
-        # 1. Téléchargement PDF
+        # Téléchargement PDF
         pdf_bytes = supabase.storage.from_("cvs").download(storage_path)
-        if not pdf_bytes:
-            raise ValueError("Impossible de télécharger le PDF")
-
-        # 2. Extraction texte
         raw_text = extract_text_safe(pdf_bytes)
 
-        # 3. Extraction IA
+        # Extraction IA
         cv_info = extract_cv_info(raw_text)
-        validate_cv_info(cv_info)
 
-        # 4. Scoring
-        score_result = None
-
-                # ── Étape 4 : Scoring (amélioré) ─────────────────────────────────────
-
+        # === SCORING ===
         score_result = None
 
         if job_id:
@@ -257,21 +245,18 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                     supabase=supabase,
                 )
         else:
-            # Tentative de matching avec les meilleurs jobs actifs
             jobs = fetch_active_jobs(supabase)
             if jobs:
                 best_result, best_job_id = compute_best_job_match(supabase, cv_info, jobs)
                 if best_result:
                     score_result = best_result
-                    job_id = best_job_id   # on associe le meilleur job
+                    job_id = best_job_id
 
-        # Fallback : Score de qualité du CV seul
+        # Fallback : Score qualité autonome
         if not score_result:
-            logger.info("Aucun job actif → calcul du score de qualité autonome")
             score_result = compute_cv_quality_score(cv_info, supabase=supabase)
 
-        # ── Étape 5 : Sauvegarde ─────────────────────────────────────────────
-
+        # Sauvegarde
         payload = build_candidate_payload(
             raw_text=raw_text,
             cv_info=cv_info,
@@ -281,15 +266,15 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 
         update_candidate(supabase, candidate_id, payload)
 
-        logger.info(f"✅ CV traité avec succès {candidate_id} → Score: {score_result.get('score', 0)}")
+        logger.info(f"✅ CV {candidate_id} traité → Score : {score_result.get('score', 0)}")
 
         return {"success": True, "score": score_result.get("score", 0)}
 
     except Exception as e:
-        logger.exception(f"❌ Erreur traitement CV {candidate_id}")
+        logger.exception(f"Échec CV {candidate_id}")
         update_candidate(supabase, candidate_id, {
             "processing_status": "failed",
-            "processing_error": str(e),
+            "processing_error": str(e)[:500],
             "updated_at": utc_now(),
         })
         return {"success": False, "error": str(e)}
