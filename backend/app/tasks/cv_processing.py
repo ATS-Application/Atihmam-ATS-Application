@@ -212,61 +212,38 @@ def _build_score_payload(score_result: dict) -> dict:
 
 def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
     """
-    Traite un CV de A à Z : téléchargement, extraction IA, scoring, sauvegarde.
-
-    Corrections apportées :
-      1. _education_score() reçoit maintenant domain + level (évite TypeError)
-      2. score_reasoning / matched_keywords / missing_keywords sont persistés
-      3. dimension_scores est toujours un dict non-null dans le payload
+    Pipeline complet de traitement d'un CV.
     """
     supabase = get_supabase_admin()
 
     try:
-        logger.info("Début du traitement du CV : %s", candidate_id)
-
-        # ── Étape 0 : Vérifications préliminaires ────────────────────────────
+        logger.info(f"🚀 Début traitement CV : {candidate_id}")
 
         candidate = fetch_candidate(supabase, candidate_id)
         if not candidate:
-            raise ValueError("Candidat introuvable en base de données")
-
-        if candidate.get("processing_status") == "completed":
-            return {"message": "CV déjà traité avec succès"}
+            raise ValueError("Candidat non trouvé")
 
         update_candidate(supabase, candidate_id, {
             "processing_status": "processing",
-            "processing_error":  None,
-            "updated_at":        utc_now(),
+            "updated_at": utc_now(),
         })
 
-        # ── Étape 1 : Téléchargement du PDF ──────────────────────────────────
-
+        # 1. Téléchargement PDF
         pdf_bytes = supabase.storage.from_("cvs").download(storage_path)
-
         if not pdf_bytes:
-            raise ValueError("Impossible de télécharger le PDF depuis le stockage")
+            raise ValueError("Impossible de télécharger le PDF")
 
-        # ── Étape 2 : Extraction du texte brut ───────────────────────────────
-
+        # 2. Extraction texte
         raw_text = extract_text_safe(pdf_bytes)
 
-        if not raw_text.strip():
-            raise ValueError(
-                "Le PDF ne contient aucun texte lisible (PDF image non OCRisé ?)"
-            )
-
-        # ── Étape 3 : Analyse IA du CV ───────────────────────────────────────
-
+        # 3. Extraction IA
         cv_info = extract_cv_info(raw_text)
         validate_cv_info(cv_info)
 
-        # ── Étape 4 : Calcul du score ─────────────────────────────────────────
-
-        score_result   = None
-        resolved_job_id = job_id
+        # 4. Scoring
+        score_result = None
 
         if job_id:
-            # CAS 1 : poste spécifique fourni à l'upload
             job = fetch_job(supabase, job_id)
             if job:
                 score_result = compute_candidate_score(
@@ -277,96 +254,40 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                 )
 
         else:
-            # CAS 2 : meilleur poste parmi les postes actifs
+            # Essayer de matcher avec le meilleur poste actif
             jobs = fetch_active_jobs(supabase)
-            best_score  = -1
-            best_result = None
-            best_job_id = None
+            if jobs:
+                best_result, best_job_id = compute_best_job_match(supabase, cv_info, jobs)
+                if best_result:
+                    score_result = best_result
+                    job_id = best_job_id
 
-            for job in jobs:
-                try:
-                    result = compute_candidate_score(
-                        cv_data=cv_info,
-                        job_title=job.get("title", ""),
-                        job_requirements=job.get("requirements", ""),
-                        supabase=supabase,
-                    )
-                    s = result.get("score", 0)
-                    if s > best_score:
-                        best_score  = s
-                        best_result = result
-                        best_job_id = job.get("id")
-                except Exception as exc:
-                    logger.error(
-                        "Erreur lors du scoring pour le poste %s : %s",
-                        job.get("id"), exc,
-                    )
-
-            score_result    = best_result
-            resolved_job_id = best_job_id
-
-        # CAS 3 : aucun poste actif → qualité du CV
+        # Fallback : score de qualité autonome
         if not score_result:
-            depth_report = analyze_cv_depth(cv_info)
-            score_result = _build_fallback_score_result(cv_info, depth_report)
+            score_result = compute_cv_quality_score(cv_info, supabase=supabase)
 
-        # ── Étape 5 : Sauvegarde en base de données ───────────────────────────
-
-        payload: dict = {
-            # Texte brut et données IA
-            "cv_raw_text":       raw_text[:MAX_TEXT_LENGTH],
-            "ai_extracted_data": sanitize_ai_data(cv_info),
-
-            # Informations personnelles
-            "full_name": ensure_string(cv_info.get("full_name")),
-            "email":     ensure_string(cv_info.get("email")),
-            "phone":     ensure_string(cv_info.get("phone")),
-
-            # Compétences et parcours
-            "skills":         ensure_list(cv_info.get("skills")),
-            "education":      ensure_list(cv_info.get("education")),
-            "work_history":   ensure_list(cv_info.get("work_history")),
-            "certifications": ensure_list(cv_info.get("certifications")),
-            "languages":      ensure_list(cv_info.get("languages")),
-            "projects":       ensure_list(cv_info.get("projects")),
-
-            # Expérience
-            "experience_years": cv_info.get("experience_years", 0),
-
-            # Scoring complet (FIX : toutes les colonnes)
-            **_build_score_payload(score_result),
-
-            # Statut
-            "processing_status": "completed",
-            "updated_at":        utc_now(),
-        }
-
-        if resolved_job_id:
-            payload["job_id"] = resolved_job_id
+        # 5. Sauvegarde complète
+        payload = build_candidate_payload(
+            raw_text=raw_text,
+            cv_info=cv_info,
+            score_result=score_result,
+            job_id=job_id
+        )
 
         update_candidate(supabase, candidate_id, payload)
 
-        logger.info(
-            "CV traité avec succès : %s — Score : %s",
-            candidate_id, payload["score"],
-        )
+        logger.info(f"✅ CV traité avec succès {candidate_id} → Score: {score_result.get('score', 0)}")
 
-        return {
-            "success":      True,
-            "candidate_id": candidate_id,
-            "score":        payload["score"],
-        }
+        return {"success": True, "score": score_result.get("score", 0)}
 
-    except Exception as exc:
-        logger.exception("Échec du traitement du CV %s : %s", candidate_id, exc)
-
+    except Exception as e:
+        logger.exception(f"❌ Erreur traitement CV {candidate_id}")
         update_candidate(supabase, candidate_id, {
             "processing_status": "failed",
-            "processing_error":  str(exc),
-            "updated_at":        utc_now(),
+            "processing_error": str(e),
+            "updated_at": utc_now(),
         })
-
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": str(e)}
 
 
 # ============================================================================
