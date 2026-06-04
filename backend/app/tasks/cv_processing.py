@@ -334,6 +334,7 @@ def build_candidate_payload(
             cv_info.get("current_position")
             or cv_info.get("title")        # some extractors emit "title"
             or cv_info.get("job_title")    # defensive alias
+            or cv_info.get("headline")
         ),
 
         "skills":         ensure_list(cv_info.get("skills")),
