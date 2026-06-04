@@ -29,7 +29,12 @@ from typing import Any
 from app.db.supabase_client import get_supabase_admin
 from app.services.ai_service import extract_cv_info
 from app.services.cv_parser import extract_text_from_bytes
-from app.services.scoring_service import compute_candidate_score
+from app.services.scoring_service import (
+                _build_cv_text, _education_score, _certification_score,
+                _leadership_score, _complexity_score, compute_candidate_score, infer_experience_years,
+                safe_dict_list, _clamp )
+from app.services.ai_service import analyze_cv_depth
+
 
 # Logger pour tracer les erreurs et les étapes importantes
 logger = logging.getLogger(__name__)
@@ -323,9 +328,31 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         # On utilise analyze_cv_depth() qui évalue la profondeur et la qualité du CV
         # sans avoir besoin de le comparer à une offre d'emploi
         if not score_result:
-            from app.services.scoring_service import compute_cv_quality_score
-            score_result = compute_cv_quality_score(cv_info, supabase=supabase)
+            # Analyse IA de la qualité du CV (métriques, descriptions, lacunes...)
+            depth_report = analyze_cv_depth(cv_info)
+            depth_score  = depth_report.get("overall_depth_score") or 0
 
+            # Dimensions locales (sans IA, instantanées)
+            cv_text  = _build_cv_text(cv_info)
+            exp_years = float(cv_info.get("experience_years") or 0)
+
+            score_result = {
+                "score": depth_score,
+                "confidence": 0.6,
+                "domain": "Évaluation qualité CV (sans poste)",
+                "reasoning": depth_report.get("summary", "Analyse qualité CV autonome"),
+                "matched_keywords": [],
+                "missing_keywords": [],
+                "dimension_scores": {
+                    "keyword_score":            0,
+                    "semantic_score":           0,
+                    "experience_score":         _clamp(exp_years * 10),
+                    "certification_score":      _certification_score(cv_text),
+                    "education_score":          _education_score(cv_text),
+                    "leadership_score":         _leadership_score(cv_text),
+                    "project_complexity_score": depth_score,
+                },
+            }
         # ── Étape 5 : Sauvegarde en base de données ───────────────────────────
 
         # On prépare toutes les données à sauvegarder pour ce candidat
