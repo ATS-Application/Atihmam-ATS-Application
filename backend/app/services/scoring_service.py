@@ -51,7 +51,7 @@ _CACHE_DIR.mkdir(exist_ok=True)
 os.environ.setdefault("HF_HOME",          str(_CACHE_DIR.resolve()))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(_CACHE_DIR.resolve()))
 
-_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 # Optimisations mémoire fortes pour Render (512MB)
