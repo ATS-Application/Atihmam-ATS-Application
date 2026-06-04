@@ -243,6 +243,10 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         # 4. Scoring
         score_result = None
 
+                # ── Étape 4 : Scoring (amélioré) ─────────────────────────────────────
+
+        score_result = None
+
         if job_id:
             job = fetch_job(supabase, job_id)
             if job:
@@ -252,21 +256,22 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                     job_requirements=job.get("requirements", ""),
                     supabase=supabase,
                 )
-
         else:
-            # Essayer de matcher avec le meilleur poste actif
+            # Tentative de matching avec les meilleurs jobs actifs
             jobs = fetch_active_jobs(supabase)
             if jobs:
                 best_result, best_job_id = compute_best_job_match(supabase, cv_info, jobs)
                 if best_result:
                     score_result = best_result
-                    job_id = best_job_id
+                    job_id = best_job_id   # on associe le meilleur job
 
-        # Fallback : score de qualité autonome
+        # Fallback : Score de qualité du CV seul
         if not score_result:
+            logger.info("Aucun job actif → calcul du score de qualité autonome")
             score_result = compute_cv_quality_score(cv_info, supabase=supabase)
 
-        # 5. Sauvegarde complète
+        # ── Étape 5 : Sauvegarde ─────────────────────────────────────────────
+
         payload = build_candidate_payload(
             raw_text=raw_text,
             cv_info=cv_info,
