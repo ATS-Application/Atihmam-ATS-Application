@@ -29,6 +29,7 @@ import asyncio
 import json
 import os
 import re
+import torch
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,6 +40,11 @@ from typing import Any
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+
+
+# Forcer le mode CPU et limiter la mémoire
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.set_num_threads(2)  # Limite les threads
 
 
 # =============================================================================
@@ -55,7 +61,11 @@ _MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 @lru_cache(maxsize=1)
 def _get_model() -> SentenceTransformer:
     print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME})…")
-    return SentenceTransformer(_MODEL_NAME)
+    model = SentenceTransformer(_MODEL_NAME)
+    model = model.to('cpu')
+    # Réduire la précision pour gagner de la RAM
+    # model.half()  # ← Décommente si besoin (peut réduire qualité)
+    return model
 
 
 # =============================================================================
