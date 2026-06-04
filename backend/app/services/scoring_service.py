@@ -54,21 +54,36 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(_CACHE_DIR.resolve()))
 _MODEL_NAME = "all-MiniLM-L6-v2"
 
 
-# Optimisations mémoire fortes pour Render (512MB)
+# -----------------------------------------------------------------------------
+# MODÈLE IA - VERSION OPTIMISÉE POUR FAIBLE MÉMOIRE (Render 512MB)
+# -----------------------------------------------------------------------------
+
+# Optimisations globales mémoire
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-torch.set_num_threads(1)                    # Réduit fortement l'usage mémoire
+torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+
+_MODEL_NAME = "all-MiniLM-L6-v2"   # Modèle léger recommandé actuellement
 
 
 @lru_cache(maxsize=1)
 def _get_model() -> SentenceTransformer:
     print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME}) in low memory mode…")
     
+    # Chargement normal
     model = SentenceTransformer(_MODEL_NAME, device='cpu')
     
-    # Réduction supplémentaire de mémoire
-    model.model.half()          # Passe en float16 (réduit ~50% de RAM)
+    # Réduction de mémoire (correct way for SentenceTransformer)
+    try:
+        # Accès à l'auto_model interne
+        if hasattr(model, '0') and hasattr(model[0], 'auto_model'):
+            model[0].auto_model = model[0].auto_model.half()
+            print("[scoring] Model converted to float16 (half precision)")
+        else:
+            print("[scoring] Could not apply half precision")
+    except Exception as e:
+        print(f"[scoring] Warning: Could not apply memory optimization: {e}")
     
     return model
 
