@@ -316,19 +316,34 @@ export default function ScorePanel({ candidate }) {
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
   const dims = useMemo(() => {
-    const raw = candidate?.dimension_scores ?? aiData?.dimension_scores ?? null;
-    return safeParse(raw);
+    // Priority: top-level field → nested in ai_extracted_data → nowhere
+    const raw =
+      candidate?.dimension_scores ??
+      aiData?.dimension_scores ??
+      null;
+
+    if (!raw) return {};
+
+    // Supabase JSONB → already an object
+    if (typeof raw === "object" && !Array.isArray(raw)) return raw;
+
+    // Supabase text column → JSON string
+    if (typeof raw === "string") {
+      try { return JSON.parse(raw); } catch { return {}; }
+    }
+
+  return {};
+}, [candidate, aiData]);
+
+  const matched = useMemo(() => {
+    const raw = candidate?.matched_keywords ?? aiData?.matched_keywords;
+    return safeParseArray(raw);
   }, [candidate, aiData]);
 
-  const matched = useMemo(
-    () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
-    [candidate, aiData]
-  );
-
-  const missing = useMemo(
-    () => safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords),
-    [candidate, aiData]
-  );
+  const missing = useMemo(() => {
+    const raw = candidate?.missing_keywords ?? aiData?.missing_keywords;
+    return safeParseArray(raw);
+  }, [candidate, aiData]);
 
   const coveredClusters = useMemo(() => {
     const explicit = safeParseArray(candidate?.covered_clusters ?? aiData?.covered_clusters);
