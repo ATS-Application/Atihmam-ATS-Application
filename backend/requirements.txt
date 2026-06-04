@@ -9,11 +9,13 @@ pydantic-settings==2.6.1
 python-multipart==0.0.19
 httpx==0.27.2
 
-# ML/AI Deps (Forced CPU-only)
-torch
-torchvision
-sentence-transformers==2.7.0
-scikit-learn==1.8.0
+# ================== ML/AI Deps (CPU Only) ==================
+torch==2.4.1+cpu
+torchvision==0.19.1+cpu
+torchaudio==2.4.1+cpu
+
+sentence-transformers==3.1.1          # Mise à jour recommandée
+scikit-learn==1.5.2                   # Version plus récente et stable
 google-generativeai==0.8.3
 openai==2.38.0
 
