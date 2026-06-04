@@ -330,6 +330,12 @@ def build_candidate_payload(
         "email":     ensure_string(cv_info.get("email")),
         "phone":     ensure_string(cv_info.get("phone")),
 
+        "current_position": ensure_string(
+            cv_info.get("current_position")
+            or cv_info.get("title")        # some extractors emit "title"
+            or cv_info.get("job_title")    # defensive alias
+        ),
+
         "skills":         ensure_list(cv_info.get("skills")),
         "education":      ensure_list(cv_info.get("education")),
         "work_history":   ensure_list(cv_info.get("work_history")),
