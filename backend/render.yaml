@@ -1,0 +1,3 @@
+buildCommand: |
+  rm -rf backend/.hf-cache
+  pip install -r requirements.txt
