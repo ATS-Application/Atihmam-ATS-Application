@@ -27,16 +27,25 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.db.supabase_client import get_supabase_admin
-from app.services.ai_service import extract_cv_info
+from app.services.ai_service import extract_cv_info, analyze_cv_depth
 from app.services.cv_parser import extract_text_from_bytes
 from app.services.scoring_service import (
-                _build_cv_text, _education_score, _certification_score,
-                _leadership_score, _complexity_score, compute_candidate_score, infer_experience_years,
-                safe_dict_list, _clamp )
-from app.services.ai_service import analyze_cv_depth
+    _build_cv_text,
+    _education_score,
+    _certification_score,
+    _leadership_score,
+    _complexity_score,
+    _language_score,
+    compute_candidate_score,
+    compute_cv_quality_score,
+    infer_experience_years,
+    safe_dict_list,
+    _clamp,
+    classify_domain,
+    detect_professional_level,
+)
 
 
-# Logger pour tracer les erreurs et les étapes importantes
 logger = logging.getLogger(__name__)
 
 
@@ -44,23 +53,18 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================================
 
-# Taille maximale du texte brut du CV qu'on stocke en base (50 000 caractères)
-MAX_TEXT_LENGTH = 50_000
-
-# Taille maximale des données extraites par l'IA (100 000 caractères en JSON)
+MAX_TEXT_LENGTH  = 50_000
 MAX_AI_DATA_SIZE = 100_000
 
-# Ces erreurs sont "permanentes" : inutile de réessayer si elles surviennent
 PERMANENT_ERRORS = (
     ValueError,
     PermissionError,
 )
 
-# Champs obligatoires que l'IA doit retourner après analyse du CV
 REQUIRED_CV_FIELDS = [
-    "skills",       # liste des compétences
-    "work_history", # historique professionnel
-    "education",    # formations / diplômes
+    "skills",
+    "work_history",
+    "education",
 ]
 
 
@@ -69,73 +73,36 @@ REQUIRED_CV_FIELDS = [
 # ============================================================================
 
 def utc_now() -> str:
-    """Retourne la date et heure actuelle en UTC au format ISO (pour la base de données)."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def ensure_list(value: Any) -> list:
-    """
-    Garantit qu'une valeur est bien une liste.
-    Si la valeur est None ou autre chose, on retourne une liste vide.
-    Exemple : ensure_list(None) → []
-              ensure_list(["Python"]) → ["Python"]
-    """
     return value if isinstance(value, list) else []
 
 
 def ensure_string(value: Any) -> str:
-    """
-    Garantit qu'une valeur est bien une chaîne de caractères.
-    Si la valeur est None ou autre chose, on retourne une chaîne vide.
-    Exemple : ensure_string(None) → ""
-              ensure_string("Alice") → "Alice"
-    """
     return value if isinstance(value, str) else ""
 
 
 def sanitize_ai_data(data: dict) -> dict:
-    """
-    Nettoie et limite la taille des données extraites par l'IA.
-
-    L'IA peut parfois retourner des données très volumineuses.
-    On les sérialise en JSON, on les coupe si trop grandes, puis on les reparse.
-    Si quelque chose tourne mal, on retourne un dictionnaire vide.
-    """
     try:
         serialized = json.dumps(data)
-
-        # Si les données sont trop grandes, on les tronque
         if len(serialized) > MAX_AI_DATA_SIZE:
             serialized = serialized[:MAX_AI_DATA_SIZE]
-
         return json.loads(serialized)
     except Exception:
         return {}
 
 
 def validate_cv_info(cv_info: dict) -> None:
-    """
-    Vérifie que l'IA a bien retourné un dictionnaire avec les champs attendus.
-
-    Si un champ obligatoire est absent, on log un avertissement (mais on ne bloque pas).
-    Si ce n'est pas un dictionnaire du tout, on lève une erreur.
-    """
     if not isinstance(cv_info, dict):
         raise ValueError("L'extraction IA doit retourner un dictionnaire")
-
     for field in REQUIRED_CV_FIELDS:
         if field not in cv_info:
             logger.warning("Champ manquant dans les données IA : %s", field)
 
 
 def extract_text_safe(pdf_bytes: bytes, timeout: int = 30) -> str:
-    """
-    Extrait le texte d'un PDF avec une limite de temps (timeout).
-
-    On utilise un thread séparé pour pouvoir interrompre l'extraction
-    si elle prend trop longtemps (plus de 30 secondes par défaut).
-    Cela évite que le serveur reste bloqué sur un PDF corrompu ou trop lourd.
-    """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(extract_text_from_bytes, pdf_bytes)
         return future.result(timeout=timeout)
@@ -146,22 +113,10 @@ def extract_text_safe(pdf_bytes: bytes, timeout: int = 30) -> str:
 # ============================================================================
 
 def update_candidate(supabase, candidate_id: str, data: dict):
-    """
-    Met à jour les données d'un candidat dans Supabase.
-
-    Paramètres :
-        supabase     → le client Supabase admin
-        candidate_id → l'identifiant unique du candidat (UUID)
-        data         → les champs à mettre à jour (dictionnaire)
-    """
     supabase.table("candidates").update(data).eq("id", candidate_id).execute()
 
 
 def fetch_candidate(supabase, candidate_id: str):
-    """
-    Récupère toutes les données d'un candidat depuis Supabase.
-    Retourne None si le candidat n'existe pas.
-    """
     return (
         supabase.table("candidates")
         .select("*")
@@ -173,10 +128,6 @@ def fetch_candidate(supabase, candidate_id: str):
 
 
 def fetch_job(supabase, job_id: str):
-    """
-    Récupère les données d'un poste depuis Supabase.
-    Retourne None si le poste n'existe pas.
-    """
     return (
         supabase.table("jobs")
         .select("*")
@@ -188,11 +139,6 @@ def fetch_job(supabase, job_id: str):
 
 
 def fetch_active_jobs(supabase):
-    """
-    Récupère la liste de tous les postes actifs (is_active = true).
-    Retourne une liste vide si aucun poste n'est actif.
-    On ne récupère que l'id, le titre et les exigences (pas tout le reste).
-    """
     return (
         supabase.table("jobs")
         .select("id, title, requirements")
@@ -204,6 +150,63 @@ def fetch_active_jobs(supabase):
 
 
 # ============================================================================
+# HELPERS INTERNES
+# ============================================================================
+
+def _build_fallback_score_result(cv_info: dict, depth_report: dict) -> dict:
+    """
+    Construit un score_result complet pour le CAS 3 (aucun poste actif).
+
+    FIX : _education_score() requiert domain + level ; l'ancienne version
+    passait uniquement cv_text ce qui levait un TypeError silencieusement
+    catchée par le bloc except global, résultant en processing_status='failed'.
+    """
+    cv_text   = _build_cv_text(cv_info)
+    exp_years = float(cv_info.get("experience_years") or 0)
+    domain    = classify_domain(cv_text, "", "")
+    level     = detect_professional_level(cv_text)
+    depth_score = float(depth_report.get("overall_depth_score") or 0)
+
+    return {
+        "score":            depth_score,
+        "confidence":       0.6,
+        "domain":           domain.value,
+        "professional_level": level.value,
+        "reasoning":        depth_report.get("summary", "Analyse qualité CV autonome"),
+        "matched_keywords": [],
+        "missing_keywords": [],
+        "dimension_scores": {
+            "keyword_score":            0.0,
+            "semantic_score":           0.0,
+            "experience_score":         _clamp(exp_years * 10),
+            "certification_score":      _certification_score(cv_text),
+            "education_score":          _education_score(cv_text, domain, "", level),
+            "leadership_score":         _leadership_score(cv_text),
+            "project_complexity_score": depth_score,
+            "language_score":           _language_score(cv_text),
+        },
+    }
+
+
+def _build_score_payload(score_result: dict) -> dict:
+    """
+    Extrait les champs de scoring à persister.
+
+    FIX : l'ancienne version de process_cv omettait score_reasoning,
+    matched_keywords et missing_keywords — ces colonnes restaient NULL
+    ce qui empêchait l'affichage des mots-clés et du raisonnement IA.
+    """
+    return {
+        "score":            score_result.get("score", 0),
+        "dimension_scores": score_result.get("dimension_scores", {}),
+        "score_confidence": score_result.get("confidence", 0),
+        "score_reasoning":  score_result.get("reasoning", ""),
+        "matched_keywords": score_result.get("matched_keywords", []),
+        "missing_keywords": score_result.get("missing_keywords", []),
+    }
+
+
+# ============================================================================
 # PIPELINE PRINCIPAL DE TRAITEMENT
 # ============================================================================
 
@@ -211,78 +214,59 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
     """
     Traite un CV de A à Z : téléchargement, extraction IA, scoring, sauvegarde.
 
-    Cette fonction est appelée :
-    - En tâche de fond par FastAPI (BackgroundTasks) après un upload
-    - Ou directement de façon synchrone si besoin
-
-    Paramètres :
-        candidate_id   → l'UUID du candidat déjà créé en base
-        storage_path   → le chemin du PDF dans Supabase Storage
-        job_id         → (optionnel) l'UUID du poste auquel le candidat postule
+    Corrections apportées :
+      1. _education_score() reçoit maintenant domain + level (évite TypeError)
+      2. score_reasoning / matched_keywords / missing_keywords sont persistés
+      3. dimension_scores est toujours un dict non-null dans le payload
     """
-
-    # On récupère le client Supabase avec les droits admin
     supabase = get_supabase_admin()
 
     try:
-        logger.info(f"Début du traitement du CV : {candidate_id}")
+        logger.info("Début du traitement du CV : %s", candidate_id)
 
         # ── Étape 0 : Vérifications préliminaires ────────────────────────────
 
-        # On vérifie que le candidat existe bien en base
         candidate = fetch_candidate(supabase, candidate_id)
         if not candidate:
             raise ValueError("Candidat introuvable en base de données")
 
-        # Si le CV a déjà été traité avec succès, on ne le retraite pas
         if candidate.get("processing_status") == "completed":
             return {"message": "CV déjà traité avec succès"}
 
-        # On marque le candidat comme "en cours de traitement"
-        # Cela permet au frontend d'afficher un spinner de chargement
         update_candidate(supabase, candidate_id, {
             "processing_status": "processing",
-            "processing_error": None,
-            "updated_at": utc_now(),
+            "processing_error":  None,
+            "updated_at":        utc_now(),
         })
 
         # ── Étape 1 : Téléchargement du PDF ──────────────────────────────────
 
-        pdf_bytes = (
-            supabase.storage
-            .from_("cvs")
-            .download(storage_path)
-        )
+        pdf_bytes = supabase.storage.from_("cvs").download(storage_path)
 
         if not pdf_bytes:
             raise ValueError("Impossible de télécharger le PDF depuis le stockage")
 
         # ── Étape 2 : Extraction du texte brut ───────────────────────────────
 
-        # On extrait le texte lisible depuis le PDF binaire
-        # Un timeout de 30s évite de bloquer sur un PDF corrompu
         raw_text = extract_text_safe(pdf_bytes)
 
         if not raw_text.strip():
-            raise ValueError("Le PDF ne contient aucun texte lisible (PDF image non OCRisé ?)")
+            raise ValueError(
+                "Le PDF ne contient aucun texte lisible (PDF image non OCRisé ?)"
+            )
 
         # ── Étape 3 : Analyse IA du CV ───────────────────────────────────────
 
-        # L'IA lit le texte brut et extrait les infos structurées :
-        # nom, email, compétences, expériences, formations, etc.
         cv_info = extract_cv_info(raw_text)
-
-        # On vérifie que l'IA a bien retourné les champs obligatoires
         validate_cv_info(cv_info)
 
         # ── Étape 4 : Calcul du score ─────────────────────────────────────────
 
-        score_result = None
-        resolved_job_id = job_id  # Le poste final auquel on va associer le candidat
+        score_result   = None
+        resolved_job_id = job_id
 
         if job_id:
-            # CAS 1 : Un poste spécifique a été fourni lors de l'upload
-            # On score le CV uniquement par rapport à ce poste
+            # CAS 1 : poste spécifique fourni à l'upload
             job = fetch_job(supabase, job_id)
             if job:
                 score_result = compute_candidate_score(
@@ -293,11 +277,9 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                 )
 
         else:
-            # CAS 2 : Pas de poste spécifié → on compare avec tous les postes actifs
-            # et on garde le meilleur score (le poste qui correspond le mieux au CV)
+            # CAS 2 : meilleur poste parmi les postes actifs
             jobs = fetch_active_jobs(supabase)
-
-            best_score = -1
+            best_score  = -1
             best_result = None
             best_job_id = None
 
@@ -309,58 +291,30 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                         job_requirements=job.get("requirements", ""),
                         supabase=supabase,
                     )
-
-                    score = result.get("score", 0)
-
-                    # On garde uniquement le meilleur score
-                    if score > best_score:
-                        best_score = score
+                    s = result.get("score", 0)
+                    if s > best_score:
+                        best_score  = s
                         best_result = result
                         best_job_id = job.get("id")
+                except Exception as exc:
+                    logger.error(
+                        "Erreur lors du scoring pour le poste %s : %s",
+                        job.get("id"), exc,
+                    )
 
-                except Exception as e:
-                    logger.error(f"Erreur lors du scoring pour le poste {job.get('id')} : {e}")
-
-            score_result = best_result
+            score_result    = best_result
             resolved_job_id = best_job_id
 
-        # CAS 3 : Aucun poste actif disponible → on score la qualité du CV directement
-        # On utilise analyze_cv_depth() qui évalue la profondeur et la qualité du CV
-        # sans avoir besoin de le comparer à une offre d'emploi
+        # CAS 3 : aucun poste actif → qualité du CV
         if not score_result:
-            # Analyse IA de la qualité du CV (métriques, descriptions, lacunes...)
             depth_report = analyze_cv_depth(cv_info)
-            depth_score  = depth_report.get("overall_depth_score") or 0
+            score_result = _build_fallback_score_result(cv_info, depth_report)
 
-            # Dimensions locales (sans IA, instantanées)
-            cv_text  = _build_cv_text(cv_info)
-            exp_years = float(cv_info.get("experience_years") or 0)
-
-            score_result = {
-                "score": depth_score,
-                "confidence": 0.6,
-                "domain": "Évaluation qualité CV (sans poste)",
-                "reasoning": depth_report.get("summary", "Analyse qualité CV autonome"),
-                "matched_keywords": [],
-                "missing_keywords": [],
-                "dimension_scores": {
-                    "keyword_score":            0,
-                    "semantic_score":           0,
-                    "experience_score":         _clamp(exp_years * 10),
-                    "certification_score":      _certification_score(cv_text),
-                    "education_score":          _education_score(cv_text),
-                    "leadership_score":         _leadership_score(cv_text),
-                    "project_complexity_score": depth_score,
-                },
-            }
         # ── Étape 5 : Sauvegarde en base de données ───────────────────────────
 
-        # On prépare toutes les données à sauvegarder pour ce candidat
-        payload = {
-            # Texte brut du CV (limité à MAX_TEXT_LENGTH caractères)
-            "cv_raw_text": raw_text[:MAX_TEXT_LENGTH],
-
-            # Données structurées extraites par l'IA
+        payload: dict = {
+            # Texte brut et données IA
+            "cv_raw_text":       raw_text[:MAX_TEXT_LENGTH],
             "ai_extracted_data": sanitize_ai_data(cv_info),
 
             # Informations personnelles
@@ -369,56 +323,50 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             "phone":     ensure_string(cv_info.get("phone")),
 
             # Compétences et parcours
-            "skills":       ensure_list(cv_info.get("skills")),
-            "education":    ensure_list(cv_info.get("education")),
-            "work_history": ensure_list(cv_info.get("work_history")),
+            "skills":         ensure_list(cv_info.get("skills")),
+            "education":      ensure_list(cv_info.get("education")),
+            "work_history":   ensure_list(cv_info.get("work_history")),
+            "certifications": ensure_list(cv_info.get("certifications")),
+            "languages":      ensure_list(cv_info.get("languages")),
+            "projects":       ensure_list(cv_info.get("projects")),
 
-            # Années d'expérience (0 si non détecté)
+            # Expérience
             "experience_years": cv_info.get("experience_years", 0),
 
-            # Résultats du scoring
-            "score":            score_result.get("score", 0),
-            "dimension_scores": score_result.get("dimension_scores", {}),
-            "score_confidence": score_result.get("confidence", 0),
+            # Scoring complet (FIX : toutes les colonnes)
+            **_build_score_payload(score_result),
 
-            # Statut final : traitement terminé avec succès
+            # Statut
             "processing_status": "completed",
-            "updated_at": utc_now(),
+            "updated_at":        utc_now(),
         }
 
-        # On associe le candidat au poste trouvé (si applicable)
         if resolved_job_id:
             payload["job_id"] = resolved_job_id
 
-        # On sauvegarde tout en base
         update_candidate(supabase, candidate_id, payload)
 
-        logger.info(f"CV traité avec succès : {candidate_id} — Score : {payload['score']}")
+        logger.info(
+            "CV traité avec succès : %s — Score : %s",
+            candidate_id, payload["score"],
+        )
 
         return {
-            "success": True,
+            "success":      True,
             "candidate_id": candidate_id,
-            "score": payload["score"],
+            "score":        payload["score"],
         }
 
-    except Exception as e:
-        # ── Gestion des erreurs ───────────────────────────────────────────────
-        # Si quelque chose tourne mal à n'importe quelle étape,
-        # on marque le candidat comme "échoué" avec le message d'erreur.
-        # Cela permet au frontend d'afficher un message d'erreur clair
-        # au lieu de rester bloqué sur "Analyse en cours..."
-        logger.exception(f"Échec du traitement du CV {candidate_id} : {e}")
+    except Exception as exc:
+        logger.exception("Échec du traitement du CV %s : %s", candidate_id, exc)
 
         update_candidate(supabase, candidate_id, {
             "processing_status": "failed",
-            "processing_error": str(e),
-            "updated_at": utc_now(),
+            "processing_error":  str(exc),
+            "updated_at":        utc_now(),
         })
 
-        return {
-            "success": False,
-            "error": str(e),
-        }
+        return {"success": False, "error": str(exc)}
 
 
 # ============================================================================
@@ -428,14 +376,9 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
     """
     Trouve le poste qui correspond le mieux à un CV parmi une liste de postes.
-
-    Pour chaque poste, on calcule un score de correspondance.
-    On retourne le meilleur résultat et l'UUID du poste correspondant.
-
-    Retourne un tuple : (meilleur_score_result, meilleur_job_id)
-    Si aucun poste ne peut être scoré, retourne (None, None).
+    Retourne (meilleur_score_result, meilleur_job_id).
     """
-    best_score = -1
+    best_score  = -1
     best_result = None
     best_job_id = None
 
@@ -447,49 +390,35 @@ def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
                 job_requirements=job.get("requirements", ""),
                 supabase=supabase,
             )
-            score = result.get("score", 0)
-
-            if score > best_score:
-                best_score = score
+            s = result.get("score", 0)
+            if s > best_score:
+                best_score  = s
                 best_result = result
                 best_job_id = job.get("id")
-
-        except Exception as e:
-            logger.error(f"Erreur de scoring pour le poste {job.get('id')} : {e}")
+        except Exception as exc:
+            logger.error("Erreur de scoring pour le poste %s : %s", job.get("id"), exc)
 
     return best_result, best_job_id
 
 
 def build_candidate_payload(
-    raw_text: str,
-    cv_info: dict,
+    raw_text    : str,
+    cv_info     : dict,
     score_result: dict,
-    job_id: str | None = None,
+    job_id      : str | None = None,
 ) -> dict:
     """
     Construit le dictionnaire complet à insérer en base pour un nouveau candidat.
-
     Utilisé par drive_sync.py lors de la synchronisation Google Drive.
-    Contrairement à process_cv() qui met à jour un candidat existant,
-    cette fonction crée le payload pour une insertion initiale.
-
-    Paramètres :
-        raw_text     → texte brut extrait du PDF
-        cv_info      → données structurées extraites par l'IA
-        score_result → résultat du scoring (score, dimensions, etc.)
-        job_id       → UUID du poste associé (optionnel)
     """
     payload = {
-        # Texte brut et données IA
         "cv_raw_text":       raw_text[:MAX_TEXT_LENGTH],
         "ai_extracted_data": sanitize_ai_data(cv_info),
 
-        # Informations personnelles
         "full_name": ensure_string(cv_info.get("full_name")),
         "email":     ensure_string(cv_info.get("email")),
         "phone":     ensure_string(cv_info.get("phone")),
 
-        # Compétences et parcours (toujours des listes, jamais null)
         "skills":         ensure_list(cv_info.get("skills")),
         "education":      ensure_list(cv_info.get("education")),
         "work_history":   ensure_list(cv_info.get("work_history")),
@@ -497,20 +426,15 @@ def build_candidate_payload(
         "languages":      ensure_list(cv_info.get("languages")),
         "projects":       ensure_list(cv_info.get("projects")),
 
-        # Expérience
         "experience_years": cv_info.get("experience_years", 0),
 
-        # Scoring
-        "score":            score_result.get("score", 0),
-        "dimension_scores": score_result.get("dimension_scores", {}),
-        "score_confidence": score_result.get("confidence", 0),
+        # Scoring complet (aligned with process_cv)
+        **_build_score_payload(score_result),
 
-        # Statut : traitement terminé
         "processing_status": "completed",
-        "updated_at": utc_now(),
+        "updated_at":        utc_now(),
     }
 
-    # On associe le poste seulement si un job_id a été fourni
     if job_id:
         payload["job_id"] = job_id
 
