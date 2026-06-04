@@ -42,10 +42,6 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-# Forcer le mode CPU et limiter la mémoire
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-torch.set_num_threads(2)  # Limite les threads
-
 
 # =============================================================================
 # CACHE HuggingFace – DOIT être défini avant tout import transformers
@@ -58,13 +54,22 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(_CACHE_DIR.resolve()))
 _MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
 
+# Optimisations mémoire fortes pour Render (512MB)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+torch.set_num_threads(1)                    # Réduit fortement l'usage mémoire
+torch.set_num_interop_threads(1)
+
+
 @lru_cache(maxsize=1)
 def _get_model() -> SentenceTransformer:
-    print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME})…")
-    model = SentenceTransformer(_MODEL_NAME)
-    model = model.to('cpu')
-    # Réduire la précision pour gagner de la RAM
-    # model.half()  # ← Décommente si besoin (peut réduire qualité)
+    print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME}) in low memory mode…")
+    
+    model = SentenceTransformer(_MODEL_NAME, device='cpu')
+    
+    # Réduction supplémentaire de mémoire
+    model.model.half()          # Passe en float16 (réduit ~50% de RAM)
+    
     return model
 
 
