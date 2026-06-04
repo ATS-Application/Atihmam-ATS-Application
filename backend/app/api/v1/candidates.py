@@ -25,15 +25,18 @@ import logging
 from uuid import UUID
 from typing import Any
 
+import time
+from collections import defaultdict, deque
+
 from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
     Query,
+    Request,
     Response,
     status,
 )
-from fastapi_limiter.depends import RateLimiter
 
 from app.core.security import get_current_user
 from app.core.state_machine import validate_transition
@@ -51,6 +54,35 @@ from app.tasks.cv_processing import fetch_job
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/candidates", tags=["Candidates"])
+
+
+# ============================================================================
+# IN-MEMORY RATE LIMITER  (no Redis required)
+# ============================================================================
+
+_rate_limit_buckets: dict[str, deque] = defaultdict(deque)
+
+
+def check_rate_limit(key: str, max_calls: int = 10, window_seconds: int = 60) -> None:
+    """
+    Sliding-window rate limiter stored in process memory.
+    Raises HTTP 429 when the caller exceeds `max_calls` within `window_seconds`.
+    `key` should uniquely identify the caller (e.g. user_id + endpoint).
+    """
+    now = time.monotonic()
+    bucket = _rate_limit_buckets[key]
+
+    # Evict timestamps older than the window
+    while bucket and bucket[0] <= now - window_seconds:
+        bucket.popleft()
+
+    if len(bucket) >= max_calls:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded: max {max_calls} requests per {window_seconds}s.",
+        )
+
+    bucket.append(now)
 
 
 # ============================================================================
@@ -216,10 +248,10 @@ async def update_candidate(
 
 
 @router.post("/{candidate_id}/score", summary="Score a candidate against a job offer")
-@RateLimiter(times=10, seconds=60)
 async def score_candidate_against_job(
     candidate_id: UUID,
     job_id: UUID,
+    request: Request,
     user: dict = Depends(get_current_user),
 ):
     """
@@ -228,6 +260,7 @@ async def score_candidate_against_job(
 
     Rate-limited to 10 requests per minute per user.
     """
+    check_rate_limit(key=f"score:{user['id']}", max_calls=10, window_seconds=60)
     supabase = get_supabase()
 
     try:
