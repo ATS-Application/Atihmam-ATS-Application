@@ -1484,3 +1484,62 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("Tous les tests sont passés avec succès !")
     print("=" * 70)
+
+
+# =============================================================================
+# COMPATIBILITY LAYER FOR ai_service.py
+# =============================================================================
+
+def compute_candidate_score(
+    cv_data: dict[str, Any],
+    job_title: str,
+    job_requirements: str,
+) -> dict[str, Any]:
+    """
+    Compatibility function expected by ai_service.py.
+    Bridges the new rich hierarchical scorer with the old interface.
+    """
+    # Extract raw text from structured CV data
+    if isinstance(cv_data, dict):
+        # Try to get full raw text, otherwise reconstruct
+        cv_text = cv_data.get("raw_text") or cv_data.get("full_text") or ""
+        if not cv_text:
+            # Reconstruct from structured fields
+            parts = []
+            if cv_data.get("summary"):
+                parts.append(cv_data["summary"])
+            for exp in cv_data.get("work_history", []):
+                parts.append(exp.get("title", ""))
+                parts.append(exp.get("description", ""))
+            for proj in cv_data.get("projects", []):
+                parts.append(proj.get("name", ""))
+                parts.append(proj.get("description", ""))
+            cv_text = " ".join(parts)
+    else:
+        cv_text = str(cv_data)
+
+    # Use the rich scorer
+    score_obj = score_candidate(
+        candidate_id="COMPAT-" + str(hash(cv_text[:100])),
+        cv_text=cv_text,
+        job_title=job_title,
+        job_description=job_requirements,
+        required_years_experience=cv_data.get("experience_years") or 0,
+        required_keywords=cv_data.get("skills", []),
+        past_titles=[exp.get("title") for exp in cv_data.get("work_history", []) if exp.get("title")]
+    )
+
+    score_dict = score_to_dict(score_obj)
+
+    # Convert to the format expected by ai_service.py and the rest of the app
+    return {
+        "score": round(score_dict["final_score"] * 100, 2),   # 0-100 scale
+        "confidence": round(score_dict["final_score"] * 100, 2),
+        "domain": score_dict["domain"],
+        "hierarchy_level": score_dict["hierarchy_level"],
+        "reasoning": f"Score calculé via scoring hiérarchique v2.0 - Niveau: {score_dict['hierarchy_level']}",
+        "matched_keywords": score_dict["details"]["keywords"].get("matched_keywords", []),
+        "missing_keywords": [],
+        "dimension_scores": score_dict["dimensions"],
+        "full_details": score_dict,   # for debugging / future use
+    }
