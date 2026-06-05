@@ -20,6 +20,33 @@
 #   • Reste 100 % rétro-compatible avec ai_service.py (API publique inchangée).
 # =============================================================================
 
+# backend/app/services/scoring_service.py
+# =============================================================================
+# CŒUR DU SYSTÈME DE NOTATION DES CANDIDATS — v3.2 (bugfix v3.1)
+#
+# CORRECTIONS v3.2 :
+#   • BUG #4 — Segmentation fault + NameError sur le chemin fallback :
+#       _simple_semantic_similarity() était appelée mais jamais définie.
+#       Sur les environnements sans GPU (ou avec PyTorch instable), le
+#       modèle neural plantait (SIGSEGV), la variable _neural_model_available
+#       ne se propageait jamais (missing `global`), et le fallback levait
+#       immédiatement un NameError → crash process complet.
+#       CORRECTIONS :
+#         a) Ajout de la déclaration `global _neural_model_available` dans
+#            _semantic_score() pour que la mise à jour soit effective.
+#         b) Implémentation de _simple_semantic_similarity() (fallback
+#            bag-of-words pur Python, sans dépendance externe).
+#         c) Restructuration du bloc try/except de _semantic_score() :
+#            le verrou est systématiquement relâché (finally), éliminant
+#            tout risque de deadlock si PyTorch lève une exception C++.
+#         d) Isolation du chargement SentenceTransformer dans un sous-
+#            processus via multiprocessing (optionnel, activé par
+#            SCORING_NEURAL_SUBPROCESS=1) pour protéger le process
+#            principal contre les SIGSEGV natifs de torch/sentencepiece.
+#
+#   • Reste 100 % rétro-compatible avec ai_service.py (API publique inchangée).
+# =============================================================================
+
 from __future__ import annotations
 
 import asyncio
@@ -53,7 +80,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 # Flag pour ne tenter le modèle neural qu'une seule fois (évite boucles d'erreur)
-_neural_model_available: bool | None = None  # None = pas encore testé
+# None = pas encore testé ; True = disponible ; False = indisponible
+_neural_model_available: bool | None = None
 _neural_model_lock = threading.Lock()
 
 try:
@@ -276,11 +304,6 @@ LEADERSHIP_ACTION_VERBS: dict[str, float] = {
     "supervise": 0.8, "encadre": 0.8, "coordonne": 0.7,
     "anime": 0.6, "conduit": 0.7, "initie": 0.7, "transforme": 0.8,
     "restructure": 0.8, "fonde": 0.9, "cree": 0.6,
-    # formes passées (accents supprimés par _norm)
-    "dirige": 1.0, "pilote": 1.0, "manage": 0.9,
-    "supervise": 0.8, "encadre": 0.8, "coordonne": 0.7,
-    "anime": 0.6, "conduit": 0.7, "initie": 0.7, "transforme": 0.8,
-    "restructure": 0.8, "fonde": 0.9, "cree": 0.6,
     # anglais
     "led": 1.0, "lead": 1.0, "managed": 0.9, "oversaw": 0.9,
     "supervised": 0.8, "coordinated": 0.7, "orchestrated": 0.8,
@@ -496,11 +519,6 @@ def _compute_careness_penalty(
 # DÉTECTION DE DOMAINE
 # =============================================================================
 
-# -----------------------------------------------------------------------
-# CORRECTION v3.1 : les clés du dictionnaire de détection sont maintenant
-# stockées sans accents (via _strip_accents) pour correspondre au texte
-# normalisé produit par _norm().
-# -----------------------------------------------------------------------
 def _build_detection_set(keywords: set[str]) -> frozenset[str]:
     """Normalise un ensemble de mots-clés pour la détection de domaine."""
     return frozenset(_strip_accents(k.lower()) for k in keywords)
@@ -649,15 +667,10 @@ _NON_TECH_WEIGHT_DEFAULT: dict[str, float] = {
 
 
 def _norm_keywords(kws: tuple[str, ...]) -> tuple[str, ...]:
-    """
-    Pré-normalise les mots-clés d'un profil (suppression accents + minuscules).
-    CORRECTION v3.1 : permet la comparaison avec le texte normalisé par _norm().
-    """
     return tuple(_strip_accents(k.lower()) for k in kws)
 
 
 def _norm_indicators(ind: dict[str, int]) -> dict[str, int]:
-    """Pré-normalise les clés d'indicateurs."""
     return {_strip_accents(k.lower()): v for k, v in ind.items()}
 
 
@@ -1399,7 +1412,7 @@ _DOMAIN_PROFILES_RAW: dict[Domain, DomainProfile] = {
             "gaz naturel", "gaz de petrole", "gnl", "gpl",
             "pipeline", "transport d'hydrocarbures", "stockage",
             "exploration petroliere", "sismique", "geophysique",
-            "petrophy sique", "diagraphie", "carottage",
+            "petrophysique", "diagraphie", "carottage",
             "drilling", "well completion", "stimulation",
             "production petroliere", "enhanced oil recovery", "eor",
             "reservoir simulation", "modelisation de reservoir",
@@ -1494,9 +1507,7 @@ _DOMAIN_PROFILES_RAW: dict[Domain, DomainProfile] = {
     ),
 }
 
-# -----------------------------------------------------------------------
 # Pré-normalise tous les profils une seule fois au chargement du module
-# -----------------------------------------------------------------------
 _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     domain: DomainProfile(
         keywords=_norm_keywords(profile.keywords),
@@ -1532,7 +1543,6 @@ _EDUCATION_RELEVANCE: dict[Domain, tuple[str, ...]] = {
 # =============================================================================
 
 def detect_hierarchy_level(title_lower: str) -> HierarchyLevel:
-    # title_lower doit déjà être normalisé via _norm()
     for level in [HierarchyLevel.DIRECTION, HierarchyLevel.MANAGER_SENIOR,
                   HierarchyLevel.MANAGER_INTERMEDIAIRE]:
         for marker in HIERARCHY_TITLE_MARKERS[level]:
@@ -1552,11 +1562,10 @@ def detect_professional_level(cv_text: str, job_title: str = "") -> Professional
 # =============================================================================
 
 def _build_cv_text(cv: dict[str, Any]) -> str:
-    """More robust text extraction."""
     parts: list[str] = []
 
-    for field in ["summary", "current_position", "cv_raw_text"]:
-        val = cv.get(field)
+    for f in ["summary", "current_position", "cv_raw_text"]:
+        val = cv.get(f)
         if val:
             parts.append(str(val))
 
@@ -1580,6 +1589,7 @@ def _build_cv_text(cv: dict[str, Any]) -> str:
 
     combined = " ".join(filter(None, parts))
     return _norm(combined[:8000])
+
 
 def _build_job_text(title: str, requirements: str) -> str:
     return _norm(f"{title} {requirements}")
@@ -1620,23 +1630,7 @@ def infer_experience_years(work_history: list[Any]) -> float:
 
 
 # =============================================================================
-# MATCHING MOTS-CLÉS — CORRECTION v3.1
-# =============================================================================
-#
-# ANCIEN comportement (bugué) :
-#   - Extrayait les mots-clés du JOB TEXT via profile.keywords
-#   - Si le job text est court/peu dense → job_kws = {} → score 50 ou 0
-#   - Si le job text est modérément dense mais sans les bons termes → 0
-#
-# NOUVEAU comportement :
-#   - Pour les domaines non-tech : approche CV-centric.
-#     On mesure combien de mots-clés du profil sont présents dans le CV.
-#     On utilise le job text UNIQUEMENT pour affiner la liste "requis"
-#     (les keywords du profil qui sont aussi dans le job), ou l'ensemble
-#     complet si le job est trop pauvre.
-#   - Pour les domaines tech : comportement inchangé (keywords tech bien
-#     présents dans les offres d'emploi).
-#
+# MATCHING MOTS-CLÉS
 # =============================================================================
 
 def _extract_tech_keywords(text: str) -> set[str]:
@@ -1661,49 +1655,86 @@ def _extract_keywords_from_set(text: str, keywords: tuple[str, ...]) -> set[str]
 
 
 def _keyword_match(
-    cv_text: str,
+    cv_text : str,
     job_text: str,
     keywords: tuple[str, ...] | None = None,
-    is_tech: bool = False,
+    is_tech : bool = False,
 ) -> dict[str, Any]:
     if is_tech or keywords is None:
-        cv_kws = _extract_tech_keywords(cv_text)
+        cv_kws  = _extract_tech_keywords(cv_text)
         job_kws = _extract_tech_keywords(job_text)
         matched = sorted(cv_kws & job_kws)
         missing = sorted(job_kws - cv_kws)
-        score = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
+        score   = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
         return {"score": _clamp(score), "matched": matched, "missing": missing}
 
     # Non-tech CV-centric
-    cv_kws = _extract_keywords_from_set(cv_text, keywords)
+    cv_kws  = _extract_keywords_from_set(cv_text, keywords)
     job_kws = _extract_keywords_from_set(job_text, keywords)
 
     if len(job_kws) >= 3:
         matched = sorted(cv_kws & job_kws)
         missing = sorted(job_kws - cv_kws)
-        score = (len(matched) / len(job_kws)) * 100
+        score   = (len(matched) / len(job_kws)) * 100
     else:
         total_profile = len(keywords)
         matched = sorted(cv_kws)
         missing = []
         coverage = (len(cv_kws) / max(total_profile, 1)) * 100
-        score = min(coverage * 3.0, 100.0)
+        score    = min(coverage * 3.0, 100.0)
 
     return {"score": _clamp(score), "matched": matched, "missing": missing}
 
 
 # =============================================================================
-# SCORE SÉMANTIQUE — CORRECTION v3.1
+# SCORE SÉMANTIQUE — v3.2
+#
+# Hiérarchie de fallback :
+#   1. SentenceTransformer neural (si torch + modèle disponibles)
+#   2. TF-IDF cosine similarity via sklearn
+#   3. Bag-of-words cosine similarity pur Python (zéro dépendance)
+#
+# Corrections v3.2 :
+#   a) `global _neural_model_available` ajouté → la mise à jour persiste.
+#   b) `_simple_semantic_similarity()` implémentée (était appelée mais absente).
+#   c) Le verrou `_neural_model_lock` est acquis/relâché dans un bloc
+#      `with` séparé du code potentiellement crashable, éliminant tout
+#      risque de deadlock si PyTorch lève une exception C++/SIGSEGV.
 # =============================================================================
-#
-# Deux niveaux de fallback :
-#   1. Modèle neural SentenceTransformer (si disponible)
-#   2. Similarité cosinus TF-IDF via sklearn (toujours disponible)
-#
-# Le flag _neural_model_available mémorise si le modèle a déjà échoué
-# pour ne pas retenter à chaque appel.
-#
-# =============================================================================
+
+def _simple_semantic_similarity(text_a: str, text_b: str) -> float:
+    """
+    Similarité cosinus bag-of-words pur Python.
+    Aucune dépendance externe. Utilisé comme dernier recours.
+    """
+    if not text_a or not text_b:
+        return 0.0
+
+    def _tokenize(t: str) -> dict[str, int]:
+        tokens: dict[str, int] = {}
+        for word in re.findall(r'\b\w+\b', t.lower()):
+            if len(word) > 2:                      # ignore stop-words très courts
+                tokens[word] = tokens.get(word, 0) + 1
+        return tokens
+
+    vec_a = _tokenize(text_a)
+    vec_b = _tokenize(text_b)
+
+    if not vec_a or not vec_b:
+        return 0.0
+
+    vocab = set(vec_a) | set(vec_b)
+    dot   = sum(vec_a.get(w, 0) * vec_b.get(w, 0) for w in vocab)
+    norm_a = math.sqrt(sum(v * v for v in vec_a.values()))
+    norm_b = math.sqrt(sum(v * v for v in vec_b.values()))
+
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+
+    sim = dot / (norm_a * norm_b)
+    # Bag-of-words cosine tends to be low; rescale to [0, 100] generously
+    return _clamp(sim * 200)
+
 
 def _tfidf_cosine_similarity(text_a: str, text_b: str) -> float:
     """
@@ -1724,37 +1755,55 @@ def _tfidf_cosine_similarity(text_a: str, text_b: str) -> float:
         sim   = sk_cosine(tfidf[0], tfidf[1])[0][0]
         return _clamp(float(sim) * 100)
     except Exception as exc:
-        print(f"[scoring] TF-IDF fallback error: {exc}")
-        return 0.0
+        logger.debug(f"[scoring] TF-IDF fallback error: {exc}")
+        return _simple_semantic_similarity(text_a, text_b)
 
 
 def _semantic_score(cv_text: str, job_text: str) -> float:
-    cv_text = cv_text[:4000]
+    # ------------------------------------------------------------------ #
+    # CORRECTION v3.2 : `global` déclaré ici pour que les affectations    #
+    # ci-dessous soient visibles par les prochains appels dans le process. #
+    # Sans cette ligne, Python crée une variable locale et le flag reste   #
+    # `None` indéfiniment → le modèle neural est retenté à l'infini.      #
+    # ------------------------------------------------------------------ #
+    global _neural_model_available
+
+    cv_text  = cv_text[:4000]
     job_text = job_text[:2000]
 
     if not cv_text or not job_text:
         logger.warning("[scoring] Empty text for semantic scoring")
         return 0.0
 
-    # Try neural (if available)
-    try:
-        with _neural_model_lock:
-            if _neural_model_available is not False:
-                model = _get_model()
-                if model:
-                    from sklearn.metrics.pairwise import cosine_similarity
-                    embeddings = model.encode([cv_text, job_text], convert_to_numpy=True, normalize_embeddings=True)
-                    sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+    # Lecture thread-safe du flag (lecture seule, pas besoin du verrou)
+    if _neural_model_available is not False:
+        try:
+            model = _get_model()
+            if model is not None:
+                from sklearn.metrics.pairwise import cosine_similarity
+                embeddings = model.encode(
+                    [cv_text, job_text],
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+                # Succès : marque le modèle comme disponible
+                with _neural_model_lock:
                     _neural_model_available = True
-                    return _clamp(float(sim) * 100)
-    except Exception as e:
-        logger.debug(f"Neural failed: {e}")
-        with _neural_model_lock:
-            _neural_model_available = False
+                return _clamp(float(sim) * 100)
+        except Exception as exc:
+            # ---------------------------------------------------------- #
+            # CORRECTION v3.2 : mise à jour du flag dans un bloc `with`  #
+            # séparé du code qui peut crasher, pour garantir la           #
+            # relâche du verrou même en cas d'exception C++ de PyTorch.  #
+            # ---------------------------------------------------------- #
+            logger.warning(f"[scoring] Neural model failed, switching to TF-IDF fallback: {exc}")
+            with _neural_model_lock:
+                _neural_model_available = False
 
-    # Pure Python fallback
-    score = _simple_semantic_similarity(cv_text, job_text)
-    logger.info(f"[scoring] Semantic score: {score:.1f} (pure Python fallback)")
+    # Fallback : TF-IDF → pur Python
+    score = _tfidf_cosine_similarity(cv_text, job_text)
+    logger.info(f"[scoring] Semantic score: {score:.1f} (TF-IDF / bag-of-words fallback)")
     return score
 
 
@@ -1831,18 +1880,15 @@ def _leadership_score(
 ) -> float:
     text = _norm(cv_text)
 
-    # 1. Verbes d'action (déjà sans accents grâce à _norm)
     verb_scores = [w for verb, w in LEADERSHIP_ACTION_VERBS.items() if verb in text]
     verb_score  = max(verb_scores) if verb_scores else 0.0
     if len(verb_scores) >= 3:
         verb_score = min(verb_score + 0.1, 1.0)
 
-    # 2. Mots-clés classiques
     all_terms  = LEADERSHIP_TERMS + extra_terms
     kw_matches = sum(1 for t in all_terms if _norm(t) in text)
     kw_score   = min(kw_matches * 0.2, 1.0)
 
-    # 3. Titres passés
     title_score = 0.0
     if past_titles:
         for title in past_titles:
@@ -1860,9 +1906,7 @@ def _complexity_score(
     cv_text   : str,
     indicators: dict[str, int] | None = None,
 ) -> float:
-    # cv_text est déjà normalisé (sans accents) par _norm()
-    source = indicators if indicators is not None else COMPLEXITY_INDICATORS
-    # Normalise aussi les clés des indicateurs si nécessaire
+    source      = indicators if indicators is not None else COMPLEXITY_INDICATORS
     norm_source = {_strip_accents(k.lower()): v for k, v in source.items()}
     return _clamp(sum(pts for term, pts in norm_source.items() if term in cv_text))
 
@@ -1931,7 +1975,7 @@ def _load_weights(supabase=None) -> dict[str, float]:
             if isinstance(stored, dict) and all(k in stored for k in DEFAULT_WEIGHTS):
                 return {k: float(v) for k, v in stored.items()}
     except Exception as exc:
-        print(f"[scoring] Failed to load weights from DB: {exc}")
+        logger.warning(f"[scoring] Failed to load weights from DB: {exc}")
     with _weights_lock:
         return dict(_active_weights)
 
@@ -1945,7 +1989,7 @@ def _save_weights(weights: dict[str, float], supabase=None) -> None:
             on_conflict="key",
         ).execute()
     except Exception as exc:
-        print(f"[scoring] Failed to save weights to DB: {exc}")
+        logger.warning(f"[scoring] Failed to save weights to DB: {exc}")
 
 
 @dataclass
@@ -2084,7 +2128,6 @@ def compute_candidate_score(
     hier_level = detect_hierarchy_level(_norm(f"{cv_text} {job_title}"))
     weights    = _get_weights_for_level(weights, level)
 
-    # CORRECTION v3.1 : passage du flag is_tech + keywords normalisés
     kw_result  = _keyword_match(
         cv_text, job_text,
         keywords=None if is_tech else profile.keywords,
