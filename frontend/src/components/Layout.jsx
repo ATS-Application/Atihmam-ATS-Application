@@ -43,7 +43,16 @@ export default function Layout() {
       {/* Sidebar */}
       <aside className="w-64 bg-white border-r border-gray-200 flex flex-col sticky top-0 h-screen shrink-0">
         <div className="px-6 py-5 border-b border-gray-200">
-          <img src={atihmamLogo} alt="ATS Platform Logo" className="h-30 w-75" onClick={ window.location.reload } />
+          <div
+              onClick={() => window.location.reload()}
+              className="cursor-pointer inline-block hover:opacity-80 active:scale-95 transition-all duration-200"
+            >
+              <img
+                src={atihmamLogo}
+                alt="ATS Platform Logo"
+                className="h-30 w-75"
+              />
+          </div>
           <h1 className="text-xl font-bold text-primary-600">ATS Platform</h1>
           <p className="text-xs text-gray-500 mt-0.5">Applicant Tracking System</p>
         </div>
