@@ -1,31 +1,23 @@
 # backend/app/services/scoring_service.py
 # =============================================================================
-# CŒUR DU SYSTÈME DE NOTATION DES CANDIDATS — v3.0 (fusion v1 + v2)
+# CŒUR DU SYSTÈME DE NOTATION DES CANDIDATS — v3.1 (bugfix v3.0)
 #
-# Rôle : comparer un CV avec une offre d'emploi et produire un score de 0–100.
-#
-# Nouveautés v3 (issues de v2) :
-#   • HierarchyLevel (4 niveaux) remplace ProfessionalLevel (6)
-#   • HierarchyProfile : poids gelés par niveau hiérarchique
-#   • Détection du leadership : verbes d'action + titres passés
-#   • Système de pénalités de carence : 5 courbes (linear/exp/step)
-#   • Certifications non-tech : OHADA, IFRS, ACCA, CFA, PMP, HACCP…
-#   • DOMAIN_SKILLS allégés (détection rapide) en supplément des DomainProfile
-#   • FeedbackRecord + descente de gradient (apprentissage recruteur)
-#
-# API publique INCHANGÉE (compatible avec ai_service.py) :
-#   compute_candidate_score()       — scoring synchrone
-#   compute_candidate_score_async() — version async
-#   compute_cv_quality_score()      — qualité autonome
-#   batch_score_candidates()        — lot synchrone
-#   batch_score_candidates_async()  — lot async
-#   update_weights_from_feedback()  — adaptation des poids
-#   classify_domain()               — détection de domaine
-#   Domain, ProfessionalLevel       — enums exportées
-#
-# IMPORTANT – imports circulaires :
-#   compute_final_score() et get_final_candidate_assessment() vivent dans
-#   ai_service.py car ils dépendent de analyze_cv_depth() définie là-bas.
+# CORRECTIONS v3.1 :
+#   • BUG #1 — keyword_score toujours 0 :
+#       Ancienne logique : extrait les mots-clés du JOB TEXT via profile.keywords
+#       → le job text est court/peu dense → job_kws vide → score 50 ou 0.
+#       CORRECTION : approche CV-centric — on mesure combien de keywords du
+#       profil apparaissent dans le CV, normalisé sur le total détecté dans
+#       le job OU sur l'ensemble des keywords du profil si job trop pauvre.
+#   • BUG #2 — semantic_score (Compétences) toujours 0 :
+#       Le modèle SentenceTransformer peut crasher silencieusement en prod.
+#       CORRECTION : fallback TF-IDF cosine similarity intégré ; le modèle
+#       neural n'est tenté qu'une fois, puis on bascule sur le fallback.
+#   • BUG #3 — normalisation des accents :
+#       La fonction _norm() faisait un lower() mais ne retirait pas les accents,
+#       causant des non-matchs entre "négociation" (CV) et "negociation" (index).
+#       CORRECTION : _norm() utilise unicodedata pour supprimer les accents.
+#   • Reste 100 % rétro-compatible avec ai_service.py (API publique inchangée).
 # =============================================================================
 
 from __future__ import annotations
@@ -37,16 +29,13 @@ import math
 import os
 import re
 import threading
-import torch
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -62,27 +51,60 @@ _MODEL_NAME = "all-MiniLM-L6-v2"
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
+
+# Flag pour ne tenter le modèle neural qu'une seule fois (évite boucles d'erreur)
+_neural_model_available: bool | None = None  # None = pas encore testé
+_neural_model_lock = threading.Lock()
+
+try:
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
 
 @lru_cache(maxsize=1)
-def _get_model() -> SentenceTransformer:
-    print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME}) in low memory mode…")
-    model = SentenceTransformer(
-    _MODEL_NAME,
-    device="cpu",
-    model_kwargs={"torch_dtype": "float16"}
-)
-    return model
+def _get_model():
+    """Charge le SentenceTransformer. Retourne None si indisponible."""
+    if not _TORCH_AVAILABLE:
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer
+        print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME})…")
+        model = SentenceTransformer(
+            _MODEL_NAME,
+            device="cpu",
+            model_kwargs={"torch_dtype": "float16"},
+        )
+        return model
+    except Exception as exc:
+        print(f"[scoring] SentenceTransformer unavailable: {exc}")
+        return None
 
 
 # =============================================================================
 # UTILITAIRES COMMUNS
 # =============================================================================
 
+def _strip_accents(text: str) -> str:
+    """Supprime les accents pour une comparaison robuste."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
 def _norm(text: str | None) -> str:
-    return (text or "").lower().strip()
+    """
+    Normalisation : minuscules + suppression des accents.
+    CORRECTION v3.1 : l'ancienne version ne supprimait pas les accents,
+    causant des non-matchs entre CV et mots-clés indexés.
+    """
+    if not text:
+        return ""
+    return _strip_accents(text.lower().strip())
 
 
 def _clamp(value: float) -> float:
@@ -155,10 +177,6 @@ class Domain(str, Enum):
     SOCIAL             = "Travail Social & ONG"
 
 
-# ---------------------------------------------------------------------------
-# ProfessionalLevel — CONSERVÉ pour compatibilité ascendante
-# (utilisé par ai_service.py et d'autres modules)
-# ---------------------------------------------------------------------------
 class ProfessionalLevel(str, Enum):
     JUNIOR    = "Junior / Employé"
     MID_LEVEL = "Confirmé / Mid-level"
@@ -168,9 +186,6 @@ class ProfessionalLevel(str, Enum):
     EXECUTIVE = "C-Level / DG / Executive"
 
 
-# ---------------------------------------------------------------------------
-# HierarchyLevel (v2) — nouveau moteur de détection
-# ---------------------------------------------------------------------------
 class HierarchyLevel(str, Enum):
     COLLABORATEUR         = "collaborateur"
     MANAGER_INTERMEDIAIRE = "manager_intermediaire"
@@ -224,9 +239,6 @@ CERTIFICATION_SCORES: dict[str, int] = {
     "oracle": 35,
 }
 
-# ---------------------------------------------------------------------------
-# Certifications enrichies (v2) — non-tech incluses
-# ---------------------------------------------------------------------------
 CERTIFICATION_REGISTRY: dict[str, dict[str, Any]] = {
     "aws":      {"name": "AWS Certification",        "domain": Domain.TECH,       "level": 3, "weight": 1.0},
     "azure":    {"name": "Microsoft Azure",          "domain": Domain.TECH,       "level": 3, "weight": 1.0},
@@ -259,17 +271,17 @@ LEADERSHIP_TERMS: tuple[str, ...] = (
     "code review", "scrum", "encadrement",
 )
 
-# Verbes d'action de leadership (v2) — score pondéré
 LEADERSHIP_ACTION_VERBS: dict[str, float] = {
-    "dirigé": 1.0, "diriger": 0.9, "dirige": 1.0,
-    "piloté": 1.0, "piloter": 0.9, "pilote": 1.0,
-    "managé": 0.9, "manager": 0.8, "manage": 0.8,
-    "supervisé": 0.8, "superviser": 0.7, "supervise": 0.8,
-    "encadré": 0.8, "encadrer": 0.7, "encadre": 0.8,
-    "coordonné": 0.7, "coordonner": 0.6, "coordonne": 0.7,
-    "animé": 0.6, "animer": 0.5, "anime": 0.6,
-    "conduit": 0.7, "initié": 0.7, "transformé": 0.8,
-    "restructuré": 0.8, "fondé": 0.9, "créé": 0.6,
+    "dirige": 1.0, "pilote": 1.0, "manage": 0.8,
+    "supervise": 0.8, "encadre": 0.8, "coordonne": 0.7,
+    "anime": 0.6, "conduit": 0.7, "initie": 0.7, "transforme": 0.8,
+    "restructure": 0.8, "fonde": 0.9, "cree": 0.6,
+    # formes passées (accents supprimés par _norm)
+    "dirige": 1.0, "pilote": 1.0, "manage": 0.9,
+    "supervise": 0.8, "encadre": 0.8, "coordonne": 0.7,
+    "anime": 0.6, "conduit": 0.7, "initie": 0.7, "transforme": 0.8,
+    "restructure": 0.8, "fonde": 0.9, "cree": 0.6,
+    # anglais
     "led": 1.0, "lead": 1.0, "managed": 0.9, "oversaw": 0.9,
     "supervised": 0.8, "coordinated": 0.7, "orchestrated": 0.8,
     "headed": 0.9, "directed": 1.0, "spearheaded": 0.9,
@@ -326,37 +338,37 @@ _weights_lock = threading.Lock()
 
 
 # =============================================================================
-# HIÉRARCHIE — profils gelés (v2)
+# HIÉRARCHIE
 # =============================================================================
 
 HIERARCHY_TITLE_MARKERS: dict[HierarchyLevel, list[str]] = {
     HierarchyLevel.COLLABORATEUR: [
-        "opérateur", "technicien", "analyste", "assistant", "agent",
-        "ouvrier", "employé", "stagiaire", "junior", "débutant",
-        "secrétaire", "comptable", "caissier", "chauffeur",
+        "operateur", "technicien", "analyste", "assistant", "agent",
+        "ouvrier", "employe", "stagiaire", "junior", "debutant",
+        "secretaire", "comptable", "caissier", "chauffeur",
         "operator", "technician", "analyst", "junior", "staff", "clerk",
     ],
     HierarchyLevel.MANAGER_INTERMEDIAIRE: [
         "chef de service", "chef service", "supervisor", "superviseur",
         "team lead", "team leader", "coordonnateur", "coordinateur",
-        "chef d'équipe", "chef equipe", "responsable d'équipe",
-        "contremaître", "contremaitre", "superintendent", "foreman",
+        "chef d'equipe", "chef equipe", "responsable d'equipe",
+        "contremaitre", "superintendent", "foreman",
     ],
     HierarchyLevel.MANAGER_SENIOR: [
-        "responsable", "chef de département", "chef departement",
+        "responsable", "chef de departement", "chef departement",
         "head of", "directeur adjoint", "directrice adjointe",
         "deputy director", "senior manager", "manager senior",
         "chef de division", "chef division", "chef de projet senior",
-        "senior project manager", "responsable pôle", "responsable pole",
+        "senior project manager", "responsable pole",
         "business unit manager", "head of department",
     ],
     HierarchyLevel.DIRECTION: [
-        "directeur général", "directrice générale", "dg", "ceo",
-        "directeur", "directrice", "president", "président",
-        "vice-président", "vice president", "vp", "c-level",
+        "directeur general", "directrice generale", "dg", "ceo",
+        "directeur", "directrice", "president",
+        "vice-president", "vice president", "vp", "c-level",
         "chief", "comex", "codir", "managing director",
-        "executive director", "directeur exécutif", "pdg",
-        "secrétaire général", "secretaire general",
+        "executive director", "directeur executif", "pdg",
+        "secretaire general",
     ],
 }
 
@@ -419,7 +431,6 @@ HIERARCHY_PROFILES: dict[HierarchyLevel, HierarchyProfile] = {
     ),
 }
 
-# Mapping HierarchyLevel → ProfessionalLevel (compat ascendante)
 _HIER_TO_PROF: dict[HierarchyLevel, ProfessionalLevel] = {
     HierarchyLevel.COLLABORATEUR:         ProfessionalLevel.MID_LEVEL,
     HierarchyLevel.MANAGER_INTERMEDIAIRE: ProfessionalLevel.MANAGER,
@@ -429,7 +440,7 @@ _HIER_TO_PROF: dict[HierarchyLevel, ProfessionalLevel] = {
 
 
 # =============================================================================
-# SYSTÈME DE PÉNALITÉS DE CARENCE (v2)
+# SYSTÈME DE PÉNALITÉS DE CARENCE
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -454,10 +465,6 @@ def _compute_careness_penalty(
     dim_scores_normalized: dict[str, float],
     hierarchy_level: HierarchyLevel,
 ) -> tuple[float, list[dict[str, Any]]]:
-    """
-    dim_scores_normalized : valeurs en [0, 1] (dimensions / 100).
-    Retourne (pénalité_0_à_1, détails).
-    """
     total_penalty = 0.0
     activated: list[dict[str, Any]] = []
 
@@ -489,121 +496,131 @@ def _compute_careness_penalty(
 # DÉTECTION DE DOMAINE
 # =============================================================================
 
+# -----------------------------------------------------------------------
+# CORRECTION v3.1 : les clés du dictionnaire de détection sont maintenant
+# stockées sans accents (via _strip_accents) pour correspondre au texte
+# normalisé produit par _norm().
+# -----------------------------------------------------------------------
+def _build_detection_set(keywords: set[str]) -> frozenset[str]:
+    """Normalise un ensemble de mots-clés pour la détection de domaine."""
+    return frozenset(_strip_accents(k.lower()) for k in keywords)
+
+
 _DOMAIN_DETECTION: dict[Domain, frozenset[str]] = {
-    Domain.TECH: frozenset({
+    Domain.TECH: _build_detection_set({
         "python", "java", "react", "docker", "kubernetes",
         "api", "backend", "frontend", "devops", "software",
-        "développement logiciel", "informatique", "programmation",
+        "developpement logiciel", "informatique", "programmation",
     }),
-    Domain.NETWORKS: frozenset({
-        "réseau", "network", "cybersécurité", "cisco", "firewall",
-        "switch", "vpn", "télécoms", "infrastructure réseau",
+    Domain.NETWORKS: _build_detection_set({
+        "reseau", "network", "cybersecurite", "cisco", "firewall",
+        "switch", "vpn", "telecoms", "infrastructure reseau",
     }),
-    Domain.ENGINEERING: frozenset({
-        "mécanique", "électrique", "conception", "autocad",
-        "solidworks", "bureau d'études", "ingénierie",
+    Domain.ENGINEERING: _build_detection_set({
+        "mecanique", "electrique", "conception", "autocad",
+        "solidworks", "bureau d'etudes", "ingenierie",
     }),
-    Domain.SCIENCE: frozenset({
-        "laboratoire", "recherche", "publication", "thèse",
-        "protocole", "expérimentation", "chimie", "biologie",
+    Domain.SCIENCE: _build_detection_set({
+        "laboratoire", "recherche", "publication", "these",
+        "protocole", "experimentation", "chimie", "biologie",
     }),
-    Domain.ENERGY: frozenset({
-        "pétrole", "mines", "forage", "géologie", "raffinage",
-        "énergie renouvelable", "solaire", "hydraulique",
+    Domain.ENERGY: _build_detection_set({
+        "petrole", "mines", "forage", "geologie", "raffinage",
+        "energie renouvelable", "solaire", "hydraulique",
     }),
-    Domain.INDUSTRY: frozenset({
-        "production", "usine", "chaîne de montage", "lean",
+    Domain.INDUSTRY: _build_detection_set({
+        "production", "usine", "chaine de montage", "lean",
         "maintenance industrielle", "5s", "kaizen",
     }),
-    Domain.QHSE: frozenset({
-        "hse", "qualité", "iso 9001", "iso 14001",
-        "sécurité au travail", "audit qualité", "non-conformité",
+    Domain.QHSE: _build_detection_set({
+        "hse", "qualite", "iso 9001", "iso 14001",
+        "securite au travail", "audit qualite", "non-conformite",
     }),
-    Domain.SUPPLY_CHAIN: frozenset({
+    Domain.SUPPLY_CHAIN: _build_detection_set({
         "achat", "supply chain", "approvisionnement", "logistique",
-        "fournisseur", "négociation achat", "erp", "stock", "sla",
+        "fournisseur", "negociation achat", "erp", "stock", "sla",
     }),
-    Domain.PURCHASING_MANAGER: frozenset({
+    Domain.PURCHASING_MANAGER: _build_detection_set({
         "responsable achats", "chef des achats", "directeur achats",
         "sla", "service-level agreement",
     }),
-    Domain.ADMIN: frozenset({
-        "secrétariat", "assistante", "agenda", "courrier",
+    Domain.ADMIN: _build_detection_set({
+        "secretariat", "assistante", "agenda", "courrier",
         "accueil", "classement", "bureautique", "archivage",
     }),
-    Domain.AGRI: frozenset({
-        "agriculture", "élevage", "agronomie", "semences",
+    Domain.AGRI: _build_detection_set({
+        "agriculture", "elevage", "agronomie", "semences",
         "cultures", "agroalimentaire", "terrain agricole",
     }),
-    Domain.ART: frozenset({
+    Domain.ART: _build_detection_set({
         "design", "graphisme", "photographie", "illustration",
-        "créatif", "adobe", "figma", "ux", "ui", "artiste",
+        "creatif", "adobe", "figma", "ux", "ui", "artiste",
     }),
-    Domain.BANKING: frozenset({
-        "banque", "assurance", "crédit", "risque", "bâle",
-        "conformité", "actuariat", "portefeuille clients",
+    Domain.BANKING: _build_detection_set({
+        "banque", "assurance", "credit", "risque", "bale",
+        "conformite", "actuariat", "portefeuille clients",
     }),
-    Domain.SALES: frozenset({
+    Domain.SALES: _build_detection_set({
         "vente", "commercial", "prospection", "crm", "ca",
-        "chiffre d'affaires", "b2b", "b2c", "négociation commerciale",
+        "chiffre d'affaires", "b2b", "b2c", "negociation commerciale",
     }),
-    Domain.ACCOUNTING: frozenset({
-        "comptabilité", "fiscalité", "bilan", "audit financier",
-        "ifrs", "ohada", "contrôle de gestion", "trésorerie",
+    Domain.ACCOUNTING: _build_detection_set({
+        "comptabilite", "fiscalite", "bilan", "audit financier",
+        "ifrs", "ohada", "controle de gestion", "tresorerie",
     }),
-    Domain.BTP: frozenset({
-        "construction", "btp", "chantier", "génie civil",
-        "maçonnerie", "conducteur de travaux", "bâtiment",
+    Domain.BTP: _build_detection_set({
+        "construction", "btp", "chantier", "genie civil",
+        "maconnerie", "conducteur de travaux", "batiment",
     }),
-    Domain.LEGAL: frozenset({
+    Domain.LEGAL: _build_detection_set({
         "droit", "juridique", "contrat", "avocat", "notaire",
-        "procédure", "contentieux", "réglementation",
+        "procedure", "contentieux", "reglementation",
     }),
-    Domain.EDUCATION: frozenset({
-        "enseignement", "formateur", "pédagogie", "curriculum",
-        "professeur", "élèves", "formation professionnelle",
+    Domain.EDUCATION: _build_detection_set({
+        "enseignement", "formateur", "pedagogie", "curriculum",
+        "professeur", "eleves", "formation professionnelle",
     }),
-    Domain.HOSPITALITY: frozenset({
-        "hôtellerie", "restauration", "cuisine", "chef",
+    Domain.HOSPITALITY: _build_detection_set({
+        "hotellerie", "restauration", "cuisine", "chef",
         "service en salle", "accueil client", "f&b",
     }),
-    Domain.REAL_ESTATE: frozenset({
-        "immobilier", "transaction", "bail", "copropriété",
-        "expertise immobilière", "promotion immobilière",
+    Domain.REAL_ESTATE: _build_detection_set({
+        "immobilier", "transaction", "bail", "copropriete",
+        "expertise immobiliere", "promotion immobiliere",
     }),
-    Domain.JOURNALISM: frozenset({
-        "journalisme", "rédaction", "médias", "presse",
-        "reportage", "édition", "publication", "contenu éditorial",
+    Domain.JOURNALISM: _build_detection_set({
+        "journalisme", "redaction", "medias", "presse",
+        "reportage", "edition", "publication", "contenu editorial",
     }),
-    Domain.MARKETING: frozenset({
-        "marketing", "communication", "stratégie digitale",
-        "seo", "sem", "brand", "campagne", "publicité",
+    Domain.MARKETING: _build_detection_set({
+        "marketing", "communication", "strategie digitale",
+        "seo", "sem", "brand", "campagne", "publicite",
     }),
-    Domain.HR: frozenset({
+    Domain.HR: _build_detection_set({
         "ressources humaines", "recrutement", "paie", "gpec",
         "formation", "relations sociales", "rh", "talent",
     }),
-    Domain.HEALTH: frozenset({
-        "médecin", "infirmier", "pharmacie", "santé", "clinique",
-        "patient", "soins", "hôpital", "médical",
+    Domain.HEALTH: _build_detection_set({
+        "medecin", "infirmier", "pharmacie", "sante", "clinique",
+        "patient", "soins", "hopital", "medical",
     }),
-    Domain.GENERAL_SERVICES: frozenset({
+    Domain.GENERAL_SERVICES: _build_detection_set({
         "maintenance", "facility", "nettoyage", "gardiennage",
-        "services généraux", "prestataires",
+        "services generaux", "prestataires",
     }),
-    Domain.INTERN: frozenset({
-        "stage", "jeune diplômé", "alternance", "apprentissage",
+    Domain.INTERN: _build_detection_set({
+        "stage", "jeune diplome", "alternance", "apprentissage",
     }),
-    Domain.TOURISM: frozenset({
-        "tourisme", "voyage", "hôtel", "agence de voyage",
+    Domain.TOURISM: _build_detection_set({
+        "tourisme", "voyage", "hotel", "agence de voyage",
         "guide touristique", "loisirs",
     }),
-    Domain.TRANSPORT: frozenset({
+    Domain.TRANSPORT: _build_detection_set({
         "transport", "logistique", "chauffeur", "fret",
         "douane", "transit", "fleet management",
     }),
-    Domain.SOCIAL: frozenset({
-        "travail social", "ong", "humanitaire", "développement communautaire",
+    Domain.SOCIAL: _build_detection_set({
+        "travail social", "ong", "humanitaire", "developpement communautaire",
         "action sociale", "volontariat", "ngo",
     }),
 }
@@ -622,7 +639,7 @@ def classify_domain(cv_text: str, job_title: str, job_requirements: str) -> Doma
 
 
 # =============================================================================
-# PROFILS DE DOMAINE (v1 — conservation intégrale)
+# PROFILS DE DOMAINE
 # =============================================================================
 
 _NON_TECH_WEIGHT_DEFAULT: dict[str, float] = {
@@ -630,17 +647,31 @@ _NON_TECH_WEIGHT_DEFAULT: dict[str, float] = {
     "leadership": 0.10, "complexity": 0.25, "education": 0.05,
 }
 
-_DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
+
+def _norm_keywords(kws: tuple[str, ...]) -> tuple[str, ...]:
+    """
+    Pré-normalise les mots-clés d'un profil (suppression accents + minuscules).
+    CORRECTION v3.1 : permet la comparaison avec le texte normalisé par _norm().
+    """
+    return tuple(_strip_accents(k.lower()) for k in kws)
+
+
+def _norm_indicators(ind: dict[str, int]) -> dict[str, int]:
+    """Pré-normalise les clés d'indicateurs."""
+    return {_strip_accents(k.lower()): v for k, v in ind.items()}
+
+
+_DOMAIN_PROFILES_RAW: dict[Domain, DomainProfile] = {
 
     Domain.SUPPLY_CHAIN: DomainProfile(
         keywords=(
             "achat", "approvisionnement", "supply chain", "erp", "sap",
-            "négociation", "fournisseur", "inventaire", "logistique",
+            "negociation", "fournisseur", "inventaire", "logistique",
             "appel d'offres", "sourcing", "stock", "s&op",
-            "gestion des stocks", "planification", "prévision de la demande",
-            "réduction des coûts", "optimisation des achats", "contrat fournisseur",
-            "cahier des charges", "évaluation fournisseurs", "référencement fournisseur",
-            "commande", "bon de commande", "délai de livraison", "rupture de stock",
+            "gestion des stocks", "planification", "prevision de la demande",
+            "reduction des couts", "optimisation des achats", "contrat fournisseur",
+            "cahier des charges", "evaluation fournisseurs", "referencement fournisseur",
+            "commande", "bon de commande", "delai de livraison", "rupture de stock",
             "just-in-time", "kanban", "lean supply chain", "audit fournisseur",
             "panel fournisseurs", "portefeuille fournisseurs", "contrat-cadre",
             "transport", "incoterms", "import", "export", "douane",
@@ -652,7 +683,7 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
         ),
         indicators={
             "sap": 20, "erp": 15, "s&op": 20,
-            "négociation": 15, "sourcing international": 20, "réduction coûts": 15,
+            "negociation": 15, "sourcing international": 20, "reduction couts": 15,
         },
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
         leadership_terms=("chef des achats", "responsable supply chain", "directeur achats"),
@@ -661,22 +692,22 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.PURCHASING_MANAGER: DomainProfile(
         keywords=(
             "responsable achats", "chef des achats", "directeur achats",
-            "strategie achat", "sla", "gestion fournisseurs", "négociation achat",
+            "strategie achat", "sla", "gestion fournisseurs", "negociation achat",
             "supply chain", "politique d'achat", "service level agreement",
-            "réduction des coûts", "p and l", "profit and loss",
+            "reduction des couts", "p and l", "profit and loss",
             "portefeuille fournisseurs", "gestion des contrats d'achat",
             "wallet", "gestion des stocks", "gestion des approvisionnements",
-            "stock", "appel d'offres", "procédure d'achat",
-            "contrat-cadre", "cahier des charges", "évaluation fournisseurs",
-            "panel fournisseurs", "audit fournisseur", "référencement fournisseur",
+            "stock", "appel d'offres", "procedure d'achat",
+            "contrat-cadre", "cahier des charges", "evaluation fournisseurs",
+            "panel fournisseurs", "audit fournisseur", "referencement fournisseur",
             "sourcing", "sourcing international", "centrale d'achat",
             "budget achats", "kpi achats", "tco", "total cost of ownership",
             "rfq", "rfp", "bon de commande", "commande", "catalogue achats",
             "procure-to-pay", "p2p", "edi", "erp", "sap", "demand planning",
             "performance fournisseur", "sla fournisseur", "vendor management",
             "achat durable", "rse fournisseurs", "import", "export", "incoterms",
-            "plan d'achat", "stratégie de négociation", "économies d'achats",
-            "tableau de bord achats", "reporting achats", "délai de livraison",
+            "plan d'achat", "strategie de negociation", "economies d'achats",
+            "tableau de bord achats", "reporting achats", "delai de livraison",
         ),
         indicators={"sla": 20, "service-level agreement": 20, "slas": 20},
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
@@ -684,24 +715,24 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.ADMIN: DomainProfile(
         keywords=(
-            "secrétariat", "bureautique", "word", "excel", "agenda",
+            "secretariat", "bureautique", "word", "excel", "agenda",
             "courrier", "classement", "archivage", "accueil", "office",
-            "powerpoint", "outlook", "saisie", "rédaction administrative",
-            "compte rendu", "procès-verbal", "gestion administrative",
-            "secrétaire de direction", "assistante de direction",
+            "powerpoint", "outlook", "saisie", "redaction administrative",
+            "compte rendu", "proces-verbal", "gestion administrative",
+            "secretaire de direction", "assistante de direction",
             "office manager", "gestion documentaire", "ged",
-            "numérisation", "tri du courrier", "standard téléphonique",
-            "planification", "réservation", "gestion des déplacements",
-            "organisation de réunions", "prise de notes", "frappe",
+            "numerisation", "tri du courrier", "standard telephonique",
+            "planification", "reservation", "gestion des deplacements",
+            "organisation de reunions", "prise de notes", "frappe",
             "mise en page", "publipostage", "office 365", "teams",
             "sharepoint", "google workspace", "google docs", "google sheets",
-            "administration du personnel", "gestion des congés",
+            "administration du personnel", "gestion des conges",
             "tableau de bord", "suivi administratif", "relance",
             "facturation", "devis", "bon de commande", "suivi des paiements",
-            "accueil physique", "accueil téléphonique", "agenda électronique",
-            "confidentialité", "discrétion", "polyvalence administrative",
+            "accueil physique", "accueil telephonique", "agenda electronique",
+            "confidentialite", "discretion", "polyvalence administrative",
             "gestion des fournitures", "commandes de bureau",
-            "organisation d'événements", "protocole",
+            "organisation d'evenements", "protocole",
         ),
         indicators={"bilingue": 20, "office 365": 15, "gestion agenda": 15},
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
@@ -709,22 +740,22 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.AGRI: DomainProfile(
         keywords=(
-            "agronomie", "agriculture", "élevage", "cultures", "semences",
+            "agronomie", "agriculture", "elevage", "cultures", "semences",
             "irrigation", "fertilisation", "agroalimentaire", "phytosanitaire",
             "agronome", "exploitation agricole", "gestion d'exploitation",
-            "production végétale", "production animale", "maraîchage",
+            "production vegetale", "production animale", "maraichage",
             "arboriculture", "viticulture", "sylviculture", "aquaculture",
             "pisciculture", "aviculture", "bovins", "ovins", "caprins",
-            "sorgho", "maïs", "riz", "cacao", "café", "coton", "palmier à huile",
+            "sorgho", "mais", "riz", "cacao", "cafe", "coton", "palmier a huile",
             "intrants agricoles", "pesticides", "herbicides", "fongicides",
             "engrais", "amendement", "compostage", "agriculture biologique",
-            "certification bio", "agriculture durable", "agroécologie",
-            "agroforesterie", "permaculture", "géospatial", "sig agricole",
-            "météorologie agricole", "chaîne de valeur agricole",
-            "stockage post-récolte", "transformation agroalimentaire",
-            "commercialisation agricole", "coopérative agricole",
+            "certification bio", "agriculture durable", "agroecologie",
+            "agroforesterie", "permaculture", "geospatial", "sig agricole",
+            "meteorologie agricole", "chaine de valeur agricole",
+            "stockage post-recolte", "transformation agroalimentaire",
+            "commercialisation agricole", "cooperative agricole",
             "conseil agricole", "vulgarisation agricole", "financement agricole",
-            "crédit rural", "microcrédit agricole", "projet de développement rural",
+            "credit rural", "microcredit agricole", "projet de developpement rural",
         ),
         indicators={
             "agriculture biologique": 20, "certification bio": 20,
@@ -736,9 +767,9 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.ART: DomainProfile(
         keywords=(
             "design", "graphisme", "illustrator", "photoshop", "figma",
-            "ux", "ui", "créatif", "branding", "motion design",
-            "photographie", "vidéo", "3d", "after effects",
-            "direction artistique", "identité visuelle", "charte graphique",
+            "ux", "ui", "creatif", "branding", "motion design",
+            "photographie", "video", "3d", "after effects",
+            "direction artistique", "identite visuelle", "charte graphique",
             "typographie", "mise en page", "infographie", "conception graphique",
             "design d'interface", "design produit", "design web",
             "ux research", "user testing", "wireframe", "prototype",
@@ -746,14 +777,14 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
             "cinema 4d", "blender", "zbrush", "substance painter",
             "animation 3d", "vfx", "storyboard", "illustration",
             "dessin", "aquarelle", "peinture digitale", "retouche photo",
-            "color grading", "montage vidéo", "réalisation", "scénario",
-            "créativité", "concept art", "design thinking", "design system",
-            "accessibilité numérique", "responsive design", "mobile-first",
+            "color grading", "montage video", "realisation", "scenario",
+            "creativite", "concept art", "design thinking", "design system",
+            "accessibilite numerique", "responsive design", "mobile-first",
             "landing page design", "ui kit", "design sprint",
-            "communication visuelle", "arts plastiques", "multimédia",
+            "communication visuelle", "arts plastiques", "multimedia",
         ),
         indicators={
-            "direction artistique": 20, "identité visuelle": 15,
+            "direction artistique": 20, "identite visuelle": 15,
             "motion design": 15, "ux research": 20,
         },
         weight_overrides={
@@ -764,26 +795,26 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.BANKING: DomainProfile(
         keywords=(
-            "banque", "assurance", "crédit", "risque", "portefeuille",
-            "conformité", "bâle iii", "solvabilité", "actuariat",
+            "banque", "assurance", "credit", "risque", "portefeuille",
+            "conformite", "bale iii", "solvabilite", "actuariat",
             "kyc", "aml", "produits financiers", "taux",
-            "analyse financière", "trésorerie bancaire", "liquidité",
-            "fonds propres", "ratio de solvabilité", "stress test",
-            "risque de crédit", "risque de marché", "risque opérationnel",
-            "risque de liquidité", "notation financière", "scoring",
+            "analyse financiere", "tresorerie bancaire", "liquidite",
+            "fonds propres", "ratio de solvabilite", "stress test",
+            "risque de credit", "risque de marche", "risque operationnel",
+            "risque de liquidite", "notation financiere", "scoring",
             "recouvrement", "contentieux bancaire", "garantie bancaire",
-            "lettre de crédit", "trade finance", "financement structuré",
-            "marchés financiers", "obligations", "actions", "dérivés",
-            "swift", "sepa", "virement", "prélèvement", "mobile banking",
+            "lettre de credit", "trade finance", "financement structure",
+            "marches financiers", "obligations", "actions", "derives",
+            "swift", "sepa", "virement", "prelevement", "mobile banking",
             "fintech", "open banking", "paiements digitaux", "microfinance",
-            "crédit immobilier", "crédit consommation", "leasing",
-            "assurance vie", "assurance dommages", "courtage", "prévoyance",
-            "réassurance", "ifrs 9", "ifrs 17", "règlementation bancaire",
-            "contrôle interne bancaire", "audit bancaire", "inspection",
-            "direction des risques", "comité de crédit",
+            "credit immobilier", "credit consommation", "leasing",
+            "assurance vie", "assurance dommages", "courtage", "prevoyance",
+            "reassurance", "ifrs 9", "ifrs 17", "reglementation bancaire",
+            "controle interne bancaire", "audit bancaire", "inspection",
+            "direction des risques", "comite de credit",
         ),
         indicators={
-            "bâle iii": 20, "kyc/aml": 20, "actuariat": 20,
+            "bale iii": 20, "kyc/aml": 20, "actuariat": 20,
             "gestion risque": 15, "ifrs 9": 20,
         },
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
@@ -792,9 +823,9 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.SALES: DomainProfile(
         keywords=(
             "vente", "commercial", "prospection", "crm", "b2b", "b2c",
-            "négociation", "chiffre d'affaires", "pipeline", "closing",
-            "account manager", "fidélisation", "développement commercial",
-            "téléprospection", "cold calling", "lead generation",
+            "negociation", "chiffre d'affaires", "pipeline", "closing",
+            "account manager", "fidelisation", "developpement commercial",
+            "teleprospection", "cold calling", "lead generation",
             "qualification", "cycle de vente", "funnel commercial",
             "grand compte", "key account", "vente complexe",
             "argumentaire de vente", "objections", "rebond commercial",
@@ -803,17 +834,17 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
             "variable commerciale", "incentive", "sales force",
             "salesforce", "hubspot", "zoho", "reporting commercial",
             "tableau de bord commercial", "kpi ventes",
-            "prévision de ventes", "forecasting", "business development",
-            "partenariat commercial", "réseau de distribution",
+            "prevision de ventes", "forecasting", "business development",
+            "partenariat commercial", "reseau de distribution",
             "agent commercial", "vente indirecte", "vente directe",
-            "pitch commercial", "démonstration produit", "offre commerciale",
+            "pitch commercial", "demonstration produit", "offre commerciale",
             "devis", "proposition commerciale", "appel d'offres",
-            "renouvellement", "rétention client", "satisfaction client",
+            "renouvellement", "retention client", "satisfaction client",
             "nps", "customer success",
         ),
         indicators={
-            "développement commercial": 15, "grand compte": 20,
-            "b2b": 10, "crm": 10, "objectifs dépassés": 20,
+            "developpement commercial": 15, "grand compte": 20,
+            "b2b": 10, "crm": 10, "objectifs depasses": 20,
         },
         weight_overrides={
             "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
@@ -824,27 +855,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.ACCOUNTING: DomainProfile(
         keywords=(
-            "comptabilité", "fiscalité", "bilan", "ohada", "ifrs",
-            "contrôle de gestion", "audit", "trésorerie", "sage",
-            "déclarations fiscales", "rapprochement bancaire", "budget",
-            "comptabilité générale", "comptabilité analytique",
-            "comptabilité clients", "comptabilité fournisseurs",
+            "comptabilite", "fiscalite", "bilan", "ohada", "ifrs",
+            "controle de gestion", "audit", "tresorerie", "sage",
+            "declarations fiscales", "rapprochement bancaire", "budget",
+            "comptabilite generale", "comptabilite analytique",
+            "comptabilite clients", "comptabilite fournisseurs",
             "grand livre", "journal comptable", "balance", "liasse fiscale",
-            "compte de résultat", "flux de trésorerie", "cash flow",
+            "compte de resultat", "flux de tresorerie", "cash flow",
             "immobilisations", "amortissement", "provision", "charges",
-            "produits", "tva", "is", "impôt sur les sociétés", "cit",
-            "impôt sur le revenu", "paie comptable", "charges sociales",
+            "produits", "tva", "is", "impot sur les societes", "cit",
+            "impot sur le revenu", "paie comptable", "charges sociales",
             "commissaire aux comptes", "expert-comptable", "commissariat",
             "due diligence", "consolidation", "normes comptables",
-            "reporting financier", "états financiers", "normes ifrs",
-            "normes syscohada", "syscoa", "bsc", "budget prévisionnel",
-            "contrôle budgétaire", "suivi des coûts", "prix de revient",
-            "coûts standards", "écarts", "analyse des écarts",
+            "reporting financier", "etats financiers", "normes ifrs",
+            "normes syscohada", "syscoa", "bsc", "budget previsionnel",
+            "controle budgetaire", "suivi des couts", "prix de revient",
+            "couts standards", "ecarts", "analyse des ecarts",
             "erp comptable", "odoo", "cegid", "wave", "navision",
         ),
         indicators={
             "ifrs": 20, "ohada": 20, "audit externe": 20,
-            "contrôle de gestion": 15, "sage": 10,
+            "controle de gestion": 15, "sage": 10,
         },
         weight_overrides={
             "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
@@ -854,48 +885,48 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.BTP: DomainProfile(
         keywords=(
-            "construction", "btp", "génie civil", "conducteur de travaux",
-            "chantier", "maçonnerie", "béton armé", "autocad",
-            "planification", "lot technique", "métré", "vrd",
-            "gros œuvre", "second œuvre", "infrastructure", "superstructure",
+            "construction", "btp", "genie civil", "conducteur de travaux",
+            "chantier", "maconnerie", "beton arme", "autocad",
+            "planification", "lot technique", "metre", "vrd",
+            "gros oeuvre", "second oeuvre", "infrastructure", "superstructure",
             "terrassement", "fondations", "charpente", "couverture",
-            "plomberie", "électricité", "hvac", "climatisation",
-            "revêtement", "carrelage", "peinture bâtiment", "menuiserie",
-            "architecture", "plan d'exécution", "plan as-built",
+            "plomberie", "electricite", "hvac", "climatisation",
+            "revetement", "carrelage", "peinture batiment", "menuiserie",
+            "architecture", "plan d'execution", "plan as-built",
             "dossier technique", "permis de construire", "cctp",
-            "dpgf", "avant-métré", "appel d'offres btp", "budget chantier",
+            "dpgf", "avant-metre", "appel d'offres btp", "budget chantier",
             "planning travaux", "gantt", "ms project", "primavera",
-            "contrôle qualité chantier", "réception des travaux",
-            "levée de réserves", "ged chantier", "étude de sol",
-            "bureau de contrôle", "sps", "coordinateur sps",
+            "controle qualite chantier", "reception des travaux",
+            "levee de reserves", "ged chantier", "etude de sol",
+            "bureau de controle", "sps", "coordinateur sps",
             "inspection travaux", "suivi technique", "visa",
-            "hse chantier", "plan phs", "prévention accidents",
-            "bim", "revit", "maquette numérique",
+            "hse chantier", "plan phs", "prevention accidents",
+            "bim", "revit", "maquette numerique",
         ),
         indicators={
             "conducteur de travaux senior": 20, "autocad": 15,
-            "gestion multi-chantiers": 20, "vrd": 15, "béton armé": 10,
+            "gestion multi-chantiers": 20, "vrd": 15, "beton arme": 10,
         },
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
-        leadership_terms=("directeur de travaux", "chef de chantier", "ingénieur génie civil"),
+        leadership_terms=("directeur de travaux", "chef de chantier", "ingenieur genie civil"),
     ),
 
     Domain.LEGAL: DomainProfile(
         keywords=(
-            "droit", "juridique", "contrat", "contentieux", "procédure",
-            "réglementation", "conformité", "ohada", "droit du travail",
-            "droit des sociétés", "code civil", "tribunal",
+            "droit", "juridique", "contrat", "contentieux", "procedure",
+            "reglementation", "conformite", "ohada", "droit du travail",
+            "droit des societes", "code civil", "tribunal",
             "avocat", "juriste", "conseil juridique", "veille juridique",
             "droit des affaires", "droit commercial", "droit fiscal",
-            "droit pénal", "droit administratif", "droit international",
-            "arbitrage", "médiation", "conciliation", "négociation juridique",
+            "droit penal", "droit administratif", "droit international",
+            "arbitrage", "mediation", "conciliation", "negociation juridique",
             "acte juridique", "statuts", "pacte d'actionnaires",
             "protocole d'accord", "mou", "nda", "contrat de travail",
-            "convention collective", "règlement intérieur",
+            "convention collective", "reglement interieur",
             "relations sociales", "licenciement", "rupture conventionnelle",
-            "prud'hommes", "conseil d'état", "cour d'appel",
-            "due diligence juridique", "audit juridique", "conformité réglementaire",
-            "protection des données", "rgpd", "propriété intellectuelle",
+            "prud'hommes", "conseil d'etat", "cour d'appel",
+            "due diligence juridique", "audit juridique", "conformite reglementaire",
+            "protection des donnees", "rgpd", "propriete intellectuelle",
             "marque", "brevet", "droit d'auteur", "contrats internationaux",
             "droit ohada", "acte uniforme", "registre du commerce",
             "immatriculation", "dissolution", "liquidation",
@@ -912,27 +943,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.EDUCATION: DomainProfile(
         keywords=(
-            "enseignement", "formation", "pédagogie", "curriculum",
-            "e-learning", "évaluation", "professeur", "ingénierie pédagogique",
+            "enseignement", "formation", "pedagogie", "curriculum",
+            "e-learning", "evaluation", "professeur", "ingenierie pedagogique",
             "formateur", "instructeur", "facilitateur", "coach",
             "enseignant", "tuteur", "mentor", "programme scolaire",
-            "syllabus", "plan de cours", "objectifs pédagogiques",
-            "compétences", "évaluation formative", "évaluation sommative",
-            "contrôle continu", "examen", "certification",
-            "formation professionnelle", "développement des compétences",
+            "syllabus", "plan de cours", "objectifs pedagogiques",
+            "competences", "evaluation formative", "evaluation sommative",
+            "controle continu", "examen", "certification",
+            "formation professionnelle", "developpement des competences",
             "formation initiale", "formation continue", "upskilling",
             "reskilling", "lms", "moodle", "google classroom",
-            "blended learning", "classe inversée", "gamification",
-            "pédagogie active", "apprentissage par projet",
-            "différenciation pédagogique", "inclusion scolaire",
-            "soutien scolaire", "remédiation", "accompagnement",
-            "orientation scolaire", "conseil pédagogique",
-            "administration scolaire", "direction d'établissement",
-            "inspection pédagogique", "recherche en éducation",
-            "thèse", "publication académique", "université",
+            "blended learning", "classe inversee", "gamification",
+            "pedagogie active", "apprentissage par projet",
+            "differenciation pedagogique", "inclusion scolaire",
+            "soutien scolaire", "remediation", "accompagnement",
+            "orientation scolaire", "conseil pedagogique",
+            "administration scolaire", "direction d'etablissement",
+            "inspection pedagogique", "recherche en education",
+            "these", "publication academique", "universite",
         ),
         indicators={
-            "ingénierie pédagogique": 20, "e-learning": 15,
+            "ingenierie pedagogique": 20, "e-learning": 15,
             "formation certifiante": 20,
         },
         weight_overrides={
@@ -943,27 +974,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.HOSPITALITY: DomainProfile(
         keywords=(
-            "hôtellerie", "restauration", "cuisine", "service en salle",
-            "f&b", "sommellerie", "haccp", "réception", "housekeeping",
-            "hôtel", "restaurant", "brigade", "chef cuisinier", "chef de partie",
-            "commis de cuisine", "pâtisserie", "boulangerie", "traiteur",
-            "banquet", "événementiel", "room service", "concierge",
-            "réservation", "check-in", "check-out", "pms",
+            "hotellerie", "restauration", "cuisine", "service en salle",
+            "f&b", "sommellerie", "haccp", "reception", "housekeeping",
+            "hotel", "restaurant", "brigade", "chef cuisinier", "chef de partie",
+            "commis de cuisine", "patisserie", "boulangerie", "traiteur",
+            "banquet", "evenementiel", "room service", "concierge",
+            "reservation", "check-in", "check-out", "pms",
             "front office", "back office", "yield management",
             "revenue management", "taux d'occupation", "revpar",
-            "guest experience", "satisfaction client", "qualité hôtelière",
-            "classification hôtelière", "étoiles", "label qualité",
-            "bar", "cave à vins", "cocktail", "mixologie",
-            "menu", "carte", "food cost", "ratio matière",
+            "guest experience", "satisfaction client", "qualite hoteliere",
+            "classification hoteliere", "etoiles", "label qualite",
+            "bar", "cave a vins", "cocktail", "mixologie",
+            "menu", "carte", "food cost", "ratio matiere",
             "gestion des stocks restauration", "approvisionnement cuisine",
-            "normes sanitaires", "hygiène alimentaire", "traçabilité",
-            "plan de nettoyage", "désinfection", "contrôle qualité alimentaire",
-            "maître d'hôtel", "directeur de restaurant", "directeur d'hôtel",
-            "manager f&b", "directeur hébergement",
+            "normes sanitaires", "hygiene alimentaire", "tracabilite",
+            "plan de nettoyage", "desinfection", "controle qualite alimentaire",
+            "maitre d'hotel", "directeur de restaurant", "directeur d'hotel",
+            "manager f&b", "directeur hebergement",
         ),
         indicators={
-            "étoile michelin": 20, "haccp": 15,
-            "revenue management": 20, "classification hôtelière": 15,
+            "etoile michelin": 20, "haccp": 15,
+            "revenue management": 20, "classification hoteliere": 15,
         },
         weight_overrides={
             "keyword": 0.10, "semantic": 0.30, "experience": 0.35,
@@ -973,26 +1004,26 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.REAL_ESTATE: DomainProfile(
         keywords=(
-            "immobilier", "transaction", "bail", "promotion immobilière",
-            "expertise", "copropriété", "aménagement", "négociation immobilière",
+            "immobilier", "transaction", "bail", "promotion immobiliere",
+            "expertise", "copropriete", "amenagement", "negociation immobiliere",
             "agent immobilier", "mandataire immobilier", "courtier immobilier",
-            "vente immobilière", "location", "gestion locative", "syndic",
+            "vente immobiliere", "location", "gestion locative", "syndic",
             "bien immobilier", "appartement", "villa", "immeuble", "terrain",
             "foncier", "lotissement", "programme immobilier", "vefa",
             "permis de construire", "plan local d'urbanisme", "plu",
-            "dossier de financement", "prêt immobilier", "crédit immobilier",
-            "taux immobilier", "apport personnel", "garantie hypothécaire",
+            "dossier de financement", "pret immobilier", "credit immobilier",
+            "taux immobilier", "apport personnel", "garantie hypothecaire",
             "acte de vente", "notaire", "compromis de vente",
-            "promesse de vente", "due diligence immobilière",
-            "état des lieux", "quittance de loyer", "charges locatives",
-            "évaluation immobilière", "estimation immobilière", "valeur vénale",
+            "promesse de vente", "due diligence immobiliere",
+            "etat des lieux", "quittance de loyer", "charges locatives",
+            "evaluation immobiliere", "estimation immobiliere", "valeur venale",
             "diagnostic immobilier", "dpe", "amiante", "plomb",
-            "réhabilitation", "rénovation", "travaux immobiliers",
+            "rehabilitation", "renovation", "travaux immobiliers",
             "gestion de patrimoine immobilier", "investissement locatif",
-            "rendement locatif", "fiscalité immobilière", "sci",
+            "rendement locatif", "fiscalite immobiliere", "sci",
         ),
         indicators={
-            "promotion immobilière": 20, "expertise immobilière": 20,
+            "promotion immobiliere": 20, "expertise immobiliere": 20,
             "vente de programmes": 15,
         },
         weight_overrides={
@@ -1003,25 +1034,25 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.JOURNALISM: DomainProfile(
         keywords=(
-            "journalisme", "rédaction", "presse", "reportage", "médias",
-            "enquête", "édition", "contenu éditorial", "interview",
+            "journalisme", "redaction", "presse", "reportage", "medias",
+            "enquete", "edition", "contenu editorial", "interview",
             "photojournalisme", "digital media",
-            "journaliste", "rédacteur", "chroniqueur", "correspondant",
-            "grand reporter", "envoyé spécial", "pigiste", "freelance",
-            "news", "actualité", "breaking news", "fact-checking",
-            "vérification des faits", "sources journalistiques",
-            "déontologie journalistique", "liberté de la presse",
-            "journal", "magazine", "web média", "blog", "newsletter",
-            "podcast", "radio", "télévision", "web tv", "streaming",
-            "réseaux sociaux", "twitter journalisme", "community manager",
-            "seo éditorial", "trafic", "audience", "analytics",
-            "éditeur en chef", "rédacteur en chef", "secrétaire de rédaction",
+            "journaliste", "redacteur", "chroniqueur", "correspondant",
+            "grand reporter", "envoye special", "pigiste", "freelance",
+            "news", "actualite", "breaking news", "fact-checking",
+            "verification des faits", "sources journalistiques",
+            "deontologie journalistique", "liberte de la presse",
+            "journal", "magazine", "web media", "blog", "newsletter",
+            "podcast", "radio", "television", "web tv", "streaming",
+            "reseaux sociaux", "twitter journalisme", "community manager",
+            "seo editorial", "trafic", "audience", "analytics",
+            "editeur en chef", "redacteur en chef", "secretaire de redaction",
             "maquette presse", "une", "titraille", "photographie de presse",
-            "agence de presse", "fil d'information", "dépêche", "revue de presse",
-            "veille médias", "relations presse", "attaché de presse",
+            "agence de presse", "fil d'information", "depeche", "revue de presse",
+            "veille medias", "relations presse", "attache de presse",
         ),
         indicators={
-            "grand reportage": 20, "rédacteur en chef": 20, "digital media": 15,
+            "grand reportage": 20, "redacteur en chef": 20, "digital media": 15,
         },
         weight_overrides={
             "keyword": 0.10, "semantic": 0.40, "experience": 0.20,
@@ -1033,25 +1064,25 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
         keywords=(
             "marketing", "communication", "seo", "sem", "google ads",
             "social media", "brand", "campagne", "inbound", "cms",
-            "stratégie digitale", "content marketing", "kpi",
-            "marketing digital", "marketing opérationnel", "marketing stratégique",
-            "étude de marché", "segmentation", "ciblage", "positionnement",
+            "strategie digitale", "content marketing", "kpi",
+            "marketing digital", "marketing operationnel", "marketing strategique",
+            "etude de marche", "segmentation", "ciblage", "positionnement",
             "mix marketing", "4p", "persona", "customer journey",
-            "tunnel de conversion", "acquisition", "rétention", "fidélisation",
+            "tunnel de conversion", "acquisition", "retention", "fidelisation",
             "email marketing", "newsletter", "automation marketing",
             "marketing automation", "hubspot", "mailchimp", "sendinblue",
             "facebook ads", "instagram ads", "linkedin ads", "tiktok ads",
             "google analytics", "tag manager", "pixel", "a/b testing",
             "landing page", "conversion rate optimization", "cro",
             "affiliation", "influence marketing", "influenceur",
-            "community management", "gestion des réseaux sociaux",
-            "brand management", "notoriété", "image de marque",
-            "plan de communication", "brief créatif", "message marketing",
-            "rp", "relations publiques", "événementiel marketing",
+            "community management", "gestion des reseaux sociaux",
+            "brand management", "notoriete", "image de marque",
+            "plan de communication", "brief creatif", "message marketing",
+            "rp", "relations publiques", "evenementiel marketing",
             "trade marketing", "merchandising", "plv",
         ),
         indicators={
-            "stratégie omnicanale": 20, "google ads": 15,
+            "strategie omnicanale": 20, "google ads": 15,
             "brand management": 20, "inbound marketing": 15,
             "marketing automation": 20,
         },
@@ -1065,27 +1096,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
         keywords=(
             "recrutement", "paie", "gpec", "sirh", "droit du travail",
             "formation", "relations sociales", "talent management",
-            "onboarding", "évaluation des performances", "rémunération",
+            "onboarding", "evaluation des performances", "remuneration",
             "ressources humaines", "gestion des ressources humaines",
             "gestion des talents", "marque employeur", "employer branding",
             "sourcing candidats", "entretien de recrutement",
-            "assessment center", "intégration", "période d'essai",
+            "assessment center", "integration", "periode d'essai",
             "plan de formation", "besoin en formation", "cpf",
-            "plan de développement", "coaching", "feedback 360",
+            "plan de developpement", "coaching", "feedback 360",
             "entretien annuel", "entretien professionnel",
-            "gestion de carrière", "mobilité interne", "succession planning",
+            "gestion de carriere", "mobilite interne", "succession planning",
             "contrat de travail", "avenant", "rupture conventionnelle",
-            "licenciement", "procédure disciplinaire", "sanctions",
-            "délégués du personnel", "comité social et économique", "cse",
-            "syndicats", "négociation collective", "accord d'entreprise",
-            "règlement intérieur", "politique rh", "charte rh",
-            "absentéisme", "turnover", "taux de rotation", "engagement",
-            "qvt", "qualité de vie au travail", "bien-être", "rsst",
-            "diversité", "inclusion", "égalité professionnelle",
+            "licenciement", "procedure disciplinaire", "sanctions",
+            "delegues du personnel", "comite social et economique", "cse",
+            "syndicats", "negociation collective", "accord d'entreprise",
+            "reglement interieur", "politique rh", "charte rh",
+            "absenteisme", "turnover", "taux de rotation", "engagement",
+            "qvt", "qualite de vie au travail", "bien-etre", "rsst",
+            "diversite", "inclusion", "egalite professionnelle",
         ),
         indicators={
-            "gpec": 20, "sirh": 15, "négociation syndicale": 20,
-            "talent management": 15, "rémunération variable": 10,
+            "gpec": 20, "sirh": 15, "negociation syndicale": 20,
+            "talent management": 15, "remuneration variable": 10,
         },
         weight_overrides={
             "keyword": 0.22, "semantic": 0.33, "experience": 0.20,
@@ -1096,26 +1127,26 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.HEALTH: DomainProfile(
         keywords=(
-            "médecine", "soins infirmiers", "pharmacie", "chirurgie",
-            "diagnostic", "patient", "urgences", "bloc opératoire",
-            "radiologie", "biologie médicale", "clinique", "protocole médical",
-            "médecin", "infirmier", "infirmière", "aide-soignant",
-            "sage-femme", "kinésithérapeute", "orthophoniste",
-            "psychologue", "psychiatre", "cardiologue", "pédiatre",
-            "dermatologue", "ophtalmologue", "gynécologue", "urologue",
-            "orthopédiste", "anesthésiste", "réanimation", "soins intensifs",
-            "unité de soins", "consultation", "hospitalisation",
-            "ambulatoire", "télémédecine", "dossier médical",
-            "dossier patient informatisé", "dpi", "prescription",
-            "ordonnance", "traitement", "thérapie", "médicament",
-            "pharmacovigilance", "essai clinique", "recherche médicale",
-            "santé publique", "épidémiologie", "prévention",
-            "vaccination", "dépistage", "promotion de la santé",
-            "hygiène hospitalière", "infection nosocomiale",
-            "stérilisation", "biomédicale", "dispositif médical",
+            "medecine", "soins infirmiers", "pharmacie", "chirurgie",
+            "diagnostic", "patient", "urgences", "bloc operatoire",
+            "radiologie", "biologie medicale", "clinique", "protocole medical",
+            "medecin", "infirmier", "infirmiere", "aide-soignant",
+            "sage-femme", "kinesitherapeute", "orthophoniste",
+            "psychologue", "psychiatre", "cardiologue", "pediatre",
+            "dermatologue", "ophtalmologue", "gynecologue", "urologue",
+            "orthopediste", "anesthesiste", "reanimation", "soins intensifs",
+            "unite de soins", "consultation", "hospitalisation",
+            "ambulatoire", "telemedecine", "dossier medical",
+            "dossier patient informatise", "dpi", "prescription",
+            "ordonnance", "traitement", "therapie", "medicament",
+            "pharmacovigilance", "essai clinique", "recherche medicale",
+            "sante publique", "epidemiologie", "prevention",
+            "vaccination", "depistage", "promotion de la sante",
+            "hygiene hospitaliere", "infection nosocomiale",
+            "sterilisation", "biomedicale", "dispositif medical",
         ),
         indicators={
-            "spécialité médicale": 25, "chef de service": 20,
+            "specialite medicale": 25, "chef de service": 20,
             "recherche clinique": 20, "urgences": 15,
         },
         weight_overrides={
@@ -1127,23 +1158,23 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.GENERAL_SERVICES: DomainProfile(
         keywords=(
             "facility management", "maintenance", "nettoyage", "gardiennage",
-            "prestataires", "services généraux", "parc automobile", "hse",
+            "prestataires", "services generaux", "parc automobile", "hse",
             "gestion des installations", "facilities", "building management",
-            "entretien des locaux", "propreté", "nettoyage industriel",
-            "sécurité des bâtiments", "contrôle d'accès", "vidéosurveillance",
-            "alarme incendie", "sécurité incendie", "évacuation",
-            "maintenance préventive", "maintenance curative",
+            "entretien des locaux", "proprete", "nettoyage industriel",
+            "securite des batiments", "controle d'acces", "videosurveillance",
+            "alarme incendie", "securite incendie", "evacuation",
+            "maintenance preventive", "maintenance curative",
             "maintenance corrective", "gmao", "ticketing maintenance",
             "prestataires de services", "contrats de maintenance",
             "appel d'offres prestataires", "sla prestataires",
-            "espaces verts", "jardinage", "entretien extérieur",
-            "gestion des déchets", "tri sélectif", "développement durable",
-            "flotte automobile", "gestion des véhicules", "carnet d'entretien",
-            "assurance flotte", "télématique", "gps",
-            "énergie", "eau", "électricité", "gaz", "fluides",
-            "réduction des coûts énergie", "audit énergétique",
-            "plan de prévention", "document unique", "risques professionnels",
-            "espace de travail", "aménagement des bureaux",
+            "espaces verts", "jardinage", "entretien exterieur",
+            "gestion des dechets", "tri selectif", "developpement durable",
+            "flotte automobile", "gestion des vehicules", "carnet d'entretien",
+            "assurance flotte", "telematique", "gps",
+            "energie", "eau", "electricite", "gaz", "fluides",
+            "reduction des couts energie", "audit energetique",
+            "plan de prevention", "document unique", "risques professionnels",
+            "espace de travail", "amenagement des bureaux",
         ),
         indicators={"facility management": 20, "gestion prestataires": 15},
         weight_overrides={
@@ -1154,26 +1185,26 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.INTERN: DomainProfile(
         keywords=(
-            "stage", "alternance", "apprentissage", "projet académique",
-            "mémoire", "rapport de stage",
-            "stagiaire", "alternant", "apprenti", "étudiant",
+            "stage", "alternance", "apprentissage", "projet academique",
+            "memoire", "rapport de stage",
+            "stagiaire", "alternant", "apprenti", "etudiant",
             "licence", "master", "bts", "dut", "bachelor",
-            "première expérience", "début de carrière", "junior",
-            "encadrement", "tuteur de stage", "maître d'apprentissage",
-            "projet de fin d'études", "pfe", "soutenance", "jury",
+            "premiere experience", "debut de carriere", "junior",
+            "encadrement", "tuteur de stage", "maitre d'apprentissage",
+            "projet de fin d'etudes", "pfe", "soutenance", "jury",
             "convention de stage", "contrat d'apprentissage",
             "contrat de professionnalisation", "formation en alternance",
             "centre de formation", "cfai", "cfa",
-            "compétences transversales", "savoir-être", "soft skills",
-            "motivation", "curiosité", "rigueur", "ponctualité",
-            "travail en équipe", "adaptabilité", "autonomie",
-            "langue étrangère", "anglais scolaire", "niveau b2",
+            "competences transversales", "savoir-etre", "soft skills",
+            "motivation", "curiosite", "rigueur", "ponctualite",
+            "travail en equipe", "adaptabilite", "autonomie",
+            "langue etrangere", "anglais scolaire", "niveau b2",
             "excel basique", "word traitement de texte",
-            "initiation professionnelle", "découverte métier",
+            "initiation professionnelle", "decouverte metier",
             "immersion professionnelle", "projet transversal",
-            "stage longue durée", "stage de fin d'études",
+            "stage longue duree", "stage de fin d'etudes",
         ),
-        indicators={"projet transversal": 10, "stage longue durée": 15},
+        indicators={"projet transversal": 10, "stage longue duree": 15},
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
     ),
 
@@ -1181,21 +1212,21 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
         keywords=(
             "tourisme", "voyage", "agence de voyage", "guide touristique",
             "billetterie", "crm touristique", "gds", "amadeus",
-            "tour opérateur", "to", "voyagiste", "circuit touristique",
-            "package voyage", "séjour", "excursion", "croisière",
-            "tourisme d'affaires", "mice", "congrès", "séminaire",
-            "tourisme balnéaire", "tourisme culturel", "écotourisme",
+            "tour operateur", "to", "voyagiste", "circuit touristique",
+            "package voyage", "sejour", "excursion", "croisiere",
+            "tourisme d'affaires", "mice", "congres", "seminaire",
+            "tourisme balneaire", "tourisme culturel", "ecotourisme",
             "tourisme solidaire", "tourisme de luxe", "tourisme local",
             "office du tourisme", "destination marketing",
-            "booking", "réservation en ligne", "hébergement touristique",
-            "hôtel", "auberge de jeunesse", "gîte", "airbnb", "campsite",
-            "transport touristique", "transfert aéroport",
-            "guide de voyage", "interprète touristique",
+            "booking", "reservation en ligne", "hebergement touristique",
+            "hotel", "auberge de jeunesse", "gite", "airbnb", "campsite",
+            "transport touristique", "transfert aeroport",
+            "guide de voyage", "interprete touristique",
             "visa", "passeport", "assurance voyage", "assistance",
             "galileo", "sabre", "worldspan", "travelport",
-            "tarification aérienne", "yield aérien", "billet d'avion",
-            "tourisme médical", "wellness tourism", "agritourisme",
-            "itinéraire", "road trip", "travel blogger",
+            "tarification aerienne", "yield aerien", "billet d'avion",
+            "tourisme medical", "wellness tourism", "agritourisme",
+            "itineraire", "road trip", "travel blogger",
         ),
         indicators={"amadeus": 20, "gds": 15, "tourisme international": 20},
         weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
@@ -1204,27 +1235,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.TRANSPORT: DomainProfile(
         keywords=(
             "transport", "logistique", "chauffeur", "fret", "douane",
-            "transit", "affrètement", "tms", "déclaration en douane",
+            "transit", "affretement", "tms", "declaration en douane",
             "incoterms", "fleet management",
-            "transport routier", "transport maritime", "transport aérien",
+            "transport routier", "transport maritime", "transport aerien",
             "transport ferroviaire", "multimodal", "intermodal",
             "commissionnaire de transport", "freight forwarder",
             "transitaire", "freight broker", "courtier de fret",
             "bill of lading", "connaissement", "airway bill", "cmr",
-            "import", "export", "dédouanement", "tarif douanier",
-            "nomenclature douanière", "hs code", "origine des marchandises",
-            "entrepôt sous douane", "mise à la consommation",
-            "fret aérien", "fret maritime", "conteneur", "vrac",
+            "import", "export", "dedouanement", "tarif douanier",
+            "nomenclature douaniere", "hs code", "origine des marchandises",
+            "entrepot sous douane", "mise a la consommation",
+            "fret aerien", "fret maritime", "conteneur", "vrac",
             "palettisation", "emballage", "conditionnement",
-            "messagerie", "express", "courrier", "dernier kilomètre",
-            "livraison", "tournée", "optimisation des tournées",
-            "routing", "gps", "télématique", "géolocalisation",
-            "réglementation transport", "adr", "matières dangereuses",
+            "messagerie", "express", "courrier", "dernier kilometre",
+            "livraison", "tournee", "optimisation des tournees",
+            "routing", "gps", "telematique", "geolocalisation",
+            "reglementation transport", "adr", "matieres dangereuses",
             "conducteur poids lourd", "permis de conduire",
         ),
         indicators={
             "incoterms": 20, "tms": 20,
-            "affrètement international": 20, "douane": 15, "fleet management": 15,
+            "affretement international": 20, "douane": 15, "fleet management": 15,
         },
         weight_overrides={
             "keyword": 0.25, "semantic": 0.30, "experience": 0.25,
@@ -1234,29 +1265,29 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.SOCIAL: DomainProfile(
         keywords=(
-            "travail social", "ong", "humanitaire", "développement communautaire",
+            "travail social", "ong", "humanitaire", "developpement communautaire",
             "action sociale", "volontariat", "projet social", "plaidoyer",
-            "protection sociale", "assistance aux personnes vulnérables",
-            "assistant social", "travailleur social", "éducateur spécialisé",
+            "protection sociale", "assistance aux personnes vulnerables",
+            "assistant social", "travailleur social", "educateur specialise",
             "animateur socioculturel", "coordinateur", "chef de projet social",
-            "bénévolat", "service civique", "corps de la paix",
-            "droits humains", "droits de l'homme", "genre", "égalité",
-            "inclusion sociale", "lutte contre la pauvreté",
-            "protection de l'enfance", "violences basées sur le genre",
+            "benevolat", "service civique", "corps de la paix",
+            "droits humains", "droits de l'homme", "genre", "egalite",
+            "inclusion sociale", "lutte contre la pauvrete",
+            "protection de l'enfance", "violences basees sur le genre",
             "vbg", "autonomisation des femmes", "jeunesse",
-            "développement local", "participation communautaire",
-            "diagnostic communautaire", "enquête sociale",
-            "gestion de cas", "case management", "suivi bénéficiaires",
-            "rapport de mission", "monitoring évaluation", "me",
+            "developpement local", "participation communautaire",
+            "diagnostic communautaire", "enquete sociale",
+            "gestion de cas", "case management", "suivi beneficiaires",
+            "rapport de mission", "monitoring evaluation", "me",
             "bailleurs de fonds", "donors", "ue", "usaid", "banque mondiale",
             "gestion de projet ong", "cadre logique", "logframe",
             "rapport narratif", "rapport financier bailleur",
-            "appel à propositions", "concept note", "proposal writing",
-            "terrain humanitaire", "urgence humanitaire", "camp de réfugiés",
+            "appel a propositions", "concept note", "proposal writing",
+            "terrain humanitaire", "urgence humanitaire", "camp de refugies",
         ),
         indicators={
             "gestion de projet ong": 20, "plaidoyer": 15,
-            "financement bailleur": 20, "développement communautaire": 15,
+            "financement bailleur": 20, "developpement communautaire": 15,
         },
         weight_overrides={
             "keyword": 0.20, "semantic": 0.40, "experience": 0.18,
@@ -1266,8 +1297,8 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.NETWORKS: DomainProfile(
         keywords=(
-            "réseau", "cisco", "firewall", "switch", "vpn", "infrastructure",
-            "cybersécurité", "pentest", "soc", "ids", "ips", "télécoms",
+            "reseau", "cisco", "firewall", "switch", "vpn", "infrastructure",
+            "cybersecurite", "pentest", "soc", "ids", "ips", "telecoms",
             "5g", "lte", "sd-wan",
             "routeur", "vlan", "tcp/ip", "dns", "dhcp", "bgp", "ospf",
             "mpls", "wan", "lan", "wifi", "bluetooth", "nfc",
@@ -1282,11 +1313,11 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
             "test d'intrusion", "vulnerability assessment", "ctf",
             "malware analysis", "threat intelligence", "incident response",
             "voip", "sip", "unified communications", "uc",
-            "télécommunications", "fibre optique", "4g", "backbone",
+            "telecommunications", "fibre optique", "4g", "backbone",
         ),
         indicators={
             "pentest": 20, "soc": 20, "sd-wan": 20,
-            "certifié ccna": 20, "certifié cissp": 25,
+            "certifie ccna": 20, "certifie cissp": 25,
         },
         weight_overrides={
             "keyword": 0.25, "semantic": 0.30, "experience": 0.20,
@@ -1297,24 +1328,24 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.ENGINEERING: DomainProfile(
         keywords=(
-            "mécanique", "électrique", "hydraulique", "conception", "autocad",
-            "solidworks", "catia", "bureau d'études", "simulation", "erd",
-            "maintenance préventive",
-            "génie mécanique", "génie électrique", "génie industriel",
-            "thermodynamique", "résistance des matériaux", "rdm",
-            "éléments finis", "fem", "cfm", "cfd",
-            "prototypage", "fabrication", "procédés de fabrication",
+            "mecanique", "electrique", "hydraulique", "conception", "autocad",
+            "solidworks", "catia", "bureau d'etudes", "simulation", "erd",
+            "maintenance preventive",
+            "genie mecanique", "genie electrique", "genie industriel",
+            "thermodynamique", "resistance des materiaux", "rdm",
+            "elements finis", "fem", "cfm", "cfd",
+            "prototypage", "fabrication", "procedes de fabrication",
             "usinage", "soudure", "chaudronnerie", "tuyauterie",
-            "électronique", "automatisme", "plc", "api",
+            "electronique", "automatisme", "plc", "api",
             "siemens", "schneider", "allen bradley", "hmi", "scada",
             "instrumentation", "capteur", "mesure", "calibration",
-            "maintenance industrielle", "fiabilité", "mttf", "mttr",
+            "maintenance industrielle", "fiabilite", "mttf", "mttr",
             "gmao", "maintenance totale", "tpm",
             "gestion de projet technique", "planning", "jalons",
             "normes techniques", "iso", "en", "astm", "asme",
             "certification de produit", "homologation", "essais",
             "calcul de structure", "dimensionnement", "contraintes",
-            "tolérances", "métrologie", "contrôle qualité",
+            "tolerances", "metrologie", "controle qualite",
             "audit technique", "revue de conception",
         ),
         indicators={
@@ -1330,27 +1361,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.SCIENCE: DomainProfile(
         keywords=(
-            "laboratoire", "protocole", "expérimentation", "publication",
-            "thèse", "r&d", "chimie", "biologie", "statistiques",
+            "laboratoire", "protocole", "experimentation", "publication",
+            "these", "r&d", "chimie", "biologie", "statistiques",
             "matlab", "spss", "r", "python",
             "recherche scientifique", "sciences fondamentales",
-            "sciences appliquées", "physique", "mathématiques",
-            "biochimie", "microbiologie", "génétique", "immunologie",
-            "virologie", "botanique", "zoologie", "écologie",
+            "sciences appliquees", "physique", "mathematiques",
+            "biochimie", "microbiologie", "genetique", "immunologie",
+            "virologie", "botanique", "zoologie", "ecologie",
             "chimie organique", "chimie analytique", "chimie physique",
-            "chromatographie", "spectroscopie", "électrophorèse", "pcr",
+            "chromatographie", "spectroscopie", "electrophorese", "pcr",
             "cell culture", "culture cellulaire", "flow cytometry",
-            "imagerie médicale", "histologie", "anatomopathologie",
-            "analyse de données", "big data", "machine learning scientifique",
-            "modélisation", "simulation numérique", "calcul scientifique",
-            "hpc", "cluster", "publication indexée", "peer review",
-            "brevet", "propriété intellectuelle scientifique",
+            "imagerie medicale", "histologie", "anatomopathologie",
+            "analyse de donnees", "big data", "machine learning scientifique",
+            "modelisation", "simulation numerique", "calcul scientifique",
+            "hpc", "cluster", "publication indexee", "peer review",
+            "brevet", "propriete intellectuelle scientifique",
             "financement de la recherche", "anr", "h2020",
             "rapport d'avancement", "revue bibliographique",
-            "état de l'art", "doctorat", "post-doctorat", "habilitation",
+            "etat de l'art", "doctorat", "post-doctorat", "habilitation",
         ),
         indicators={
-            "publication indexée": 25, "thèse": 20,
+            "publication indexee": 25, "these": 20,
             "brevet": 20, "financement recherche": 15,
         },
         weight_overrides={
@@ -1362,29 +1393,29 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.ENERGY: DomainProfile(
         keywords=(
-            "pétrole", "mines", "forage", "géologie", "raffinage",
-            "énergie renouvelable", "solaire", "hydraulique", "reservoir",
-            "hse pétrolier", "offshore",
-            "gaz naturel", "gaz de pétrole", "gnl", "gpl",
+            "petrole", "mines", "forage", "geologie", "raffinage",
+            "energie renouvelable", "solaire", "hydraulique", "reservoir",
+            "hse petrolier", "offshore",
+            "gaz naturel", "gaz de petrole", "gnl", "gpl",
             "pipeline", "transport d'hydrocarbures", "stockage",
-            "exploration pétrolière", "sismique", "géophysique",
-            "pétrophysique", "diagraphie", "carottage",
+            "exploration petroliere", "sismique", "geophysique",
+            "petrophy sique", "diagraphie", "carottage",
             "drilling", "well completion", "stimulation",
-            "production pétrolière", "enhanced oil recovery", "eor",
-            "reservoir simulation", "modélisation de réservoir",
-            "éolien", "éolienne offshore", "solaire photovoltaïque",
+            "production petroliere", "enhanced oil recovery", "eor",
+            "reservoir simulation", "modelisation de reservoir",
+            "eolien", "eolienne offshore", "solaire photovoltaique",
             "solaire thermique", "biomasse", "biogaz",
-            "géothermie", "hydroélectricité", "stockage d'énergie",
-            "batterie", "hydrogène", "pile à combustible",
-            "réseau électrique", "smart grid", "power plant",
+            "geothermie", "hydroelectricite", "stockage d'energie",
+            "batterie", "hydrogene", "pile a combustible",
+            "reseau electrique", "smart grid", "power plant",
             "centrale thermique", "centrale solaire", "centrale hydraulique",
-            "mining", "extraction minière", "minerai", "or", "diamant",
+            "mining", "extraction miniere", "minerai", "or", "diamant",
             "cuivre", "bauxite", "phosphate", "traitement des minerais",
-            "métallurgie", "hydrométallurgie", "pyrométallurgie",
+            "metallurgie", "hydrometallurgie", "pyrometallurgie",
         ),
         indicators={
             "offshore": 20, "reservoir engineering": 25,
-            "hse pétrolier": 20, "énergie solaire": 15,
+            "hse petrolier": 20, "energie solaire": 15,
         },
         weight_overrides={
             "keyword": 0.25, "semantic": 0.30, "experience": 0.25,
@@ -1396,25 +1427,25 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     Domain.INDUSTRY: DomainProfile(
         keywords=(
             "production", "usine", "lean manufacturing", "5s", "kaizen",
-            "maintenance industrielle", "chaîne de montage", "plc",
+            "maintenance industrielle", "chaine de montage", "plc",
             "automatisme", "erp", "ordonnancement",
             "chef de production", "responsable de production",
             "directeur d'usine", "responsable usine",
-            "amélioration continue", "amélioration des processus",
+            "amelioration continue", "amelioration des processus",
             "six sigma", "black belt", "green belt", "vsm",
             "tpm", "smed", "poka yoke", "jidoka",
-            "takt time", "cycle time", "efficacité globale", "trs", "oee",
-            "contrôle de production", "suivi de production",
+            "takt time", "cycle time", "efficacite globale", "trs", "oee",
+            "controle de production", "suivi de production",
             "planning de production", "ordonnancement de fabrication",
             "gestion de la production", "mrp", "mrp2",
-            "qualité de production", "contrôle qualité",
-            "non-conformité", "rebut", "retraitement",
-            "traçabilité", "gestion des lots", "sérialisation",
+            "qualite de production", "controle qualite",
+            "non-conformite", "rebut", "retraitement",
+            "tracabilite", "gestion des lots", "serialisation",
             "emballage industriel", "conditionnement",
             "gestion des flux", "flux physiques",
             "gestion des outillages", "gestionnaire outillage",
-            "sécurité industrielle", "epi", "plan de prévention",
-            "habilitations électriques", "caces", "travail en hauteur",
+            "securite industrielle", "epi", "plan de prevention",
+            "habilitations electriques", "caces", "travail en hauteur",
         ),
         indicators={
             "lean manufacturing": 20, "automatisme plc": 20,
@@ -1429,27 +1460,27 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
 
     Domain.QHSE: DomainProfile(
         keywords=(
-            "hse", "qualité", "iso 9001", "iso 14001", "ohsas 18001",
-            "iso 45001", "audit qualité", "non-conformité", "plan de prévention",
+            "hse", "qualite", "iso 9001", "iso 14001", "ohsas 18001",
+            "iso 45001", "audit qualite", "non-conformite", "plan de prevention",
             "document unique", "analyse des risques",
-            "responsable qhse", "directeur qhse", "animateur sécurité",
-            "ingénieur hse", "technicien qse",
-            "système de management", "smq", "sme", "sms",
+            "responsable qhse", "directeur qhse", "animateur securite",
+            "ingenieur hse", "technicien qse",
+            "systeme de management", "smq", "sme", "sms",
             "certification", "recertification", "surveillance", "tierce partie",
-            "accréditation", "cofrac", "iatf 16949", "iso 13485",
+            "accreditation", "cofrac", "iatf 16949", "iso 13485",
             "iso 22000", "haccp", "brc", "ifs",
-            "risque professionnel", "évaluation des risques", "duer",
+            "risque professionnel", "evaluation des risques", "duer",
             "plan d'action", "suivi des actions correctives",
-            "action préventive", "amélioration continue",
-            "indicateurs qualité", "kpi qualité", "tableau de bord qhse",
+            "action preventive", "amelioration continue",
+            "indicateurs qualite", "kpi qualite", "tableau de bord qhse",
             "revue de direction", "audit interne", "audit externe",
             "programme d'audit", "rapport d'audit",
-            "accident du travail", "enquête accident", "arbre des causes",
-            "presqu'accident", "near miss", "reporting sécurité",
-            "formation sécurité", "sensibilisation", "causerie sécurité",
+            "accident du travail", "enquete accident", "arbre des causes",
+            "presqu'accident", "near miss", "reporting securite",
+            "formation securite", "sensibilisation", "causerie securite",
             "permit to work", "permis de travail", "lock out tag out",
-            "environnement", "émissions", "déchets industriels",
-            "sol pollué", "dépollution", "veille réglementaire",
+            "environnement", "emissions", "dechets industriels",
+            "sol pollue", "depollution", "veille reglementaire",
         ),
         indicators={
             "iso 9001": 20, "iso 45001": 20,
@@ -1463,6 +1494,19 @@ _DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
     ),
 }
 
+# -----------------------------------------------------------------------
+# Pré-normalise tous les profils une seule fois au chargement du module
+# -----------------------------------------------------------------------
+_DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
+    domain: DomainProfile(
+        keywords=_norm_keywords(profile.keywords),
+        indicators=_norm_indicators(profile.indicators),
+        weight_overrides=profile.weight_overrides,
+        leadership_terms=_norm_keywords(profile.leadership_terms),
+    )
+    for domain, profile in _DOMAIN_PROFILES_RAW.items()
+}
+
 _FALLBACK_PROFILE = DomainProfile()
 
 # =============================================================================
@@ -1470,23 +1514,25 @@ _FALLBACK_PROFILE = DomainProfile()
 # =============================================================================
 
 _EDUCATION_RELEVANCE: dict[Domain, tuple[str, ...]] = {
-    Domain.ACCOUNTING: ("comptabilité", "finance", "gestion", "fiscalité", "ohada", "ifrs", "sage"),
-    Domain.BANKING:    ("banque", "finance", "économie", "actuariat"),
-    Domain.TECH:       ("informatique", "développement", "ingénieur", "systèmes"),
+    Domain.ACCOUNTING: ("comptabilite", "finance", "gestion", "fiscalite", "ohada", "ifrs", "sage"),
+    Domain.BANKING:    ("banque", "finance", "economie", "actuariat"),
+    Domain.TECH:       ("informatique", "developpement", "ingenieur", "systemes"),
     Domain.MARKETING:  ("marketing", "communication", "digital"),
     Domain.HR:         ("ressources humaines", "rh"),
-    Domain.BTP:        ("génie civil", "bâtiment", "architecture"),
+    Domain.BTP:        ("genie civil", "batiment", "architecture"),
     Domain.AGRI:       ("agronomie", "agriculture"),
     Domain.LEGAL:      ("droit", "juridique"),
-    Domain.HEALTH:     ("médecine", "pharmacie"),
+    Domain.HEALTH:     ("medecine", "pharmacie"),
     Domain.SALES:      ("commerce", "vente"),
 }
 
+
 # =============================================================================
-# DÉTECTION DU NIVEAU HIÉRARCHIQUE (v2 — remplace detect_professional_level)
+# DÉTECTION DU NIVEAU HIÉRARCHIQUE
 # =============================================================================
 
 def detect_hierarchy_level(title_lower: str) -> HierarchyLevel:
+    # title_lower doit déjà être normalisé via _norm()
     for level in [HierarchyLevel.DIRECTION, HierarchyLevel.MANAGER_SENIOR,
                   HierarchyLevel.MANAGER_INTERMEDIAIRE]:
         for marker in HIERARCHY_TITLE_MARKERS[level]:
@@ -1496,10 +1542,6 @@ def detect_hierarchy_level(title_lower: str) -> HierarchyLevel:
 
 
 def detect_professional_level(cv_text: str, job_title: str = "") -> ProfessionalLevel:
-    """
-    Conservé pour compatibilité ascendante.
-    Utilise detect_hierarchy_level en interne puis mappe vers ProfessionalLevel.
-    """
     text = _norm(f"{cv_text} {job_title}")
     hier = detect_hierarchy_level(text)
     return _HIER_TO_PROF.get(hier, ProfessionalLevel.MID_LEVEL)
@@ -1611,7 +1653,23 @@ def infer_experience_years(work_history: list[Any]) -> float:
 
 
 # =============================================================================
-# MATCHING MOTS-CLÉS
+# MATCHING MOTS-CLÉS — CORRECTION v3.1
+# =============================================================================
+#
+# ANCIEN comportement (bugué) :
+#   - Extrayait les mots-clés du JOB TEXT via profile.keywords
+#   - Si le job text est court/peu dense → job_kws = {} → score 50 ou 0
+#   - Si le job text est modérément dense mais sans les bons termes → 0
+#
+# NOUVEAU comportement :
+#   - Pour les domaines non-tech : approche CV-centric.
+#     On mesure combien de mots-clés du profil sont présents dans le CV.
+#     On utilise le job text UNIQUEMENT pour affiner la liste "requis"
+#     (les keywords du profil qui sont aussi dans le job), ou l'ensemble
+#     complet si le job est trop pauvre.
+#   - Pour les domaines tech : comportement inchangé (keywords tech bien
+#     présents dans les offres d'emploi).
+#
 # =============================================================================
 
 def _extract_tech_keywords(text: str) -> set[str]:
@@ -1619,57 +1677,147 @@ def _extract_tech_keywords(text: str) -> set[str]:
 
 
 def _extract_keywords_from_set(text: str, keywords: tuple[str, ...]) -> set[str]:
+    """Retourne les mots-clés (déjà normalisés) présents dans text (déjà normalisé)."""
     result: set[str] = set()
     for kw in keywords:
-        pat = re.compile(
-            rf"\b{re.escape(kw)}\b" if " " not in kw else re.escape(kw),
-            re.IGNORECASE,
-        )
-        if pat.search(text):
-            result.add(kw)
+        if " " in kw:
+            if kw in text:
+                result.add(kw)
+        else:
+            # word-boundary simulé : vérifie que le mot n'est pas collé à d'autres lettres
+            idx = text.find(kw)
+            while idx != -1:
+                before_ok = (idx == 0 or not text[idx - 1].isalpha())
+                after_ok  = (idx + len(kw) == len(text) or not text[idx + len(kw)].isalpha())
+                if before_ok and after_ok:
+                    result.add(kw)
+                    break
+                idx = text.find(kw, idx + 1)
     return result
 
 
 def _keyword_match(
-    cv_text : str,
-    job_text: str,
-    keywords: tuple[str, ...] | None = None,
+    cv_text  : str,
+    job_text : str,
+    keywords : tuple[str, ...] | None = None,
+    is_tech  : bool = False,
 ) -> dict[str, Any]:
-    if keywords is None:
+    """
+    CORRECTION v3.1 — logique CV-centric pour domaines non-tech.
+
+    Pour les domaines tech (is_tech=True) :
+      On extrait les mots-clés du CV ET du job (offre riche en termes tech).
+      Score = intersection / job_keywords.
+
+    Pour les domaines non-tech (is_tech=False) :
+      On extrait les mots-clés du CV ET du job.
+      Si le job contient suffisamment de keywords (>=3), on score sur ceux-là.
+      Sinon (job trop pauvre) on score sur l'ensemble des keywords du profil
+      présents dans le CV, normalisé sur le total du profil.
+      Cela évite un score 0 quand le job text ne contient aucun keyword.
+    """
+    if is_tech or keywords is None:
         cv_kws  = _extract_tech_keywords(cv_text)
         job_kws = _extract_tech_keywords(job_text)
-    else:
-        cv_kws  = _extract_keywords_from_set(cv_text, keywords)
-        job_kws = _extract_keywords_from_set(job_text, keywords)
+        matched = sorted(cv_kws & job_kws)
+        missing = sorted(job_kws - cv_kws)
+        score   = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
+        return {"score": _clamp(score), "matched": matched, "missing": missing}
 
-    matched = sorted(cv_kws & job_kws)
-    missing = sorted(job_kws - cv_kws)
-    score   = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
+    # --- Domaine non-tech : approche CV-centric ---
+    cv_kws  = _extract_keywords_from_set(cv_text,  keywords)
+    job_kws = _extract_keywords_from_set(job_text, keywords)
+
+    if len(job_kws) >= 3:
+        # Le job est suffisamment dense : on mesure l'alignement CV ↔ job
+        matched = sorted(cv_kws & job_kws)
+        missing = sorted(job_kws - cv_kws)
+        score   = (len(matched) / len(job_kws)) * 100
+    else:
+        # Le job est trop pauvre : on mesure la couverture du CV sur le profil entier
+        total_profile_kws = len(keywords)
+        matched = sorted(cv_kws)
+        missing = []  # on ne peut pas déterminer ce qui "manque" depuis le job
+        score   = (len(cv_kws) / max(total_profile_kws, 1)) * 100 if cv_kws else 0.0
+        # Normalise : un CV couvrant 20 % du profil → bon score (scale ×3, cap 100)
+        score   = min(score * 3.0, 100.0)
 
     return {"score": _clamp(score), "matched": matched, "missing": missing}
 
 
 # =============================================================================
-# SCORE SÉMANTIQUE
+# SCORE SÉMANTIQUE — CORRECTION v3.1
+# =============================================================================
+#
+# Deux niveaux de fallback :
+#   1. Modèle neural SentenceTransformer (si disponible)
+#   2. Similarité cosinus TF-IDF via sklearn (toujours disponible)
+#
+# Le flag _neural_model_available mémorise si le modèle a déjà échoué
+# pour ne pas retenter à chaque appel.
+#
 # =============================================================================
 
+def _tfidf_cosine_similarity(text_a: str, text_b: str) -> float:
+    """
+    Fallback sémantique : similarité cosinus TF-IDF.
+    Fonctionne sans GPU ni téléchargement de modèle.
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
+
+        vectorizer = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            min_df=1,
+            max_features=5000,
+        )
+        tfidf = vectorizer.fit_transform([text_a, text_b])
+        sim   = sk_cosine(tfidf[0], tfidf[1])[0][0]
+        return _clamp(float(sim) * 100)
+    except Exception as exc:
+        print(f"[scoring] TF-IDF fallback error: {exc}")
+        return 0.0
+
+
 def _semantic_score(cv_text: str, job_text: str) -> float:
+    global _neural_model_available
+
     cv_text  = cv_text[:4000]
     job_text = job_text[:2000]
+
     if not cv_text or not job_text:
         return 0.0
-    try:
-        model      = _get_model()
-        embeddings = model.encode(
-            [cv_text, job_text],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-        similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
-        return _clamp(float(similarity) * 100)
-    except Exception as exc:
-        print(f"[scoring] Semantic similarity error: {exc}")
-        return 0.0
+
+    # Tente le modèle neural seulement si pas encore marqué indisponible
+    with _neural_model_lock:
+        try_neural = (_neural_model_available is not False)
+
+    if try_neural:
+        try:
+            from sklearn.metrics.pairwise import cosine_similarity
+            model = _get_model()
+            if model is not None:
+                embeddings = model.encode(
+                    [cv_text, job_text],
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+                with _neural_model_lock:
+                    _neural_model_available = True
+                return _clamp(float(similarity) * 100)
+            else:
+                with _neural_model_lock:
+                    _neural_model_available = False
+        except Exception as exc:
+            print(f"[scoring] Neural semantic error (switching to TF-IDF): {exc}")
+            with _neural_model_lock:
+                _neural_model_available = False
+
+    # Fallback TF-IDF
+    return _tfidf_cosine_similarity(cv_text, job_text)
 
 
 # =============================================================================
@@ -1693,19 +1841,15 @@ def _experience_score(candidate_years: float, required_years: float) -> float:
 
 
 def _certification_score(cv_text: str, domain: Domain | None = None) -> float:
-    """
-    Score certifications.
-    Utilise CERTIFICATION_REGISTRY enrichi (v2) avec bonus domaine.
-    """
     text = _norm(cv_text)
     total_weight = 0.0
     for cert_key, cert_info in CERTIFICATION_REGISTRY.items():
-        if cert_key in text:
+        cert_key_norm = _strip_accents(cert_key.lower())
+        if cert_key_norm in text:
             w = cert_info["weight"]
             if domain and cert_info["domain"] == domain:
                 w *= 1.3
             total_weight += w
-    # Normalise sur 100 (max raisonnable ≈ 3.0)
     return _clamp(min(total_weight / 3.0, 1.0) * 100)
 
 
@@ -1728,7 +1872,7 @@ def _education_score(
     cv_lower = _norm(cv_text)
     if "doctorat" in cv_lower or "phd" in cv_lower:
         level_score = 100.0
-    elif any(x in cv_lower for x in ("master", "mastère", "ingénieur")):
+    elif any(x in cv_lower for x in ("master", "mastere", "ingenieur")):
         level_score = 85.0
     elif any(x in cv_lower for x in ("licence", "bachelor", "bts", "dut")):
         level_score = 70.0
@@ -1747,24 +1891,18 @@ def _leadership_score(
     extra_terms : tuple[str, ...] = (),
     past_titles : list[str] | None = None,
 ) -> float:
-    """
-    Score de leadership combinant :
-    - verbes d'action pondérés (v2, 60%)
-    - mots-clés LEADERSHIP_TERMS + extra_terms (v1, 20%)
-    - titres passés avec marqueurs hiérarchiques (v2, 20%)
-    """
     text = _norm(cv_text)
 
-    # 1. Verbes d'action
+    # 1. Verbes d'action (déjà sans accents grâce à _norm)
     verb_scores = [w for verb, w in LEADERSHIP_ACTION_VERBS.items() if verb in text]
     verb_score  = max(verb_scores) if verb_scores else 0.0
     if len(verb_scores) >= 3:
         verb_score = min(verb_score + 0.1, 1.0)
 
-    # 2. Mots-clés classiques (v1)
-    all_terms   = LEADERSHIP_TERMS + extra_terms
-    kw_matches  = sum(1 for t in all_terms if t in text)
-    kw_score    = min(kw_matches * 0.2, 1.0)
+    # 2. Mots-clés classiques
+    all_terms  = LEADERSHIP_TERMS + extra_terms
+    kw_matches = sum(1 for t in all_terms if _norm(t) in text)
+    kw_score   = min(kw_matches * 0.2, 1.0)
 
     # 3. Titres passés
     title_score = 0.0
@@ -1784,8 +1922,11 @@ def _complexity_score(
     cv_text   : str,
     indicators: dict[str, int] | None = None,
 ) -> float:
+    # cv_text est déjà normalisé (sans accents) par _norm()
     source = indicators if indicators is not None else COMPLEXITY_INDICATORS
-    return _clamp(sum(pts for term, pts in source.items() if term in cv_text))
+    # Normalise aussi les clés des indicateurs si nécessaire
+    norm_source = {_strip_accents(k.lower()): v for k, v in source.items()}
+    return _clamp(sum(pts for term, pts in norm_source.items() if term in cv_text))
 
 
 def _language_score(cv_text: str) -> float:
@@ -1869,16 +2010,13 @@ def _save_weights(weights: dict[str, float], supabase=None) -> None:
         print(f"[scoring] Failed to save weights to DB: {exc}")
 
 
-# ---------------------------------------------------------------------------
-# FeedbackRecord (v2) — pour la descente de gradient
-# ---------------------------------------------------------------------------
 @dataclass
 class FeedbackRecord:
     candidate_id    : str
     job_title       : str
     predicted_score : float
-    actual_outcome  : str    # "hired", "interviewed", "rejected"
-    actual_rating   : float  # 0–1
+    actual_outcome  : str
+    actual_rating   : float
     timestamp       : str = ""
     notes           : str = ""
 
@@ -1890,23 +2028,12 @@ def update_weights_from_feedback(
     liked           : bool                     = True,
     dimension_scores: dict[str, float] | None  = None,
     feedback_data   : dict[str, float] | None  = None,
-    # Nouveau (v2)
     feedback_records: list[FeedbackRecord] | None = None,
     learning_rate   : float = 0.01,
 ) -> None:
-    """
-    Adapte les poids selon le feedback recruteur.
-
-    Mode 1 — feedback_data   : remplace directement les valeurs.
-    Mode 2 — dimension_scores + liked : delta sur dimensions > 50.
-    Mode 3 — feedback_records : descente de gradient (v2).
-    Supabase persist si fourni.
-    """
     global _active_weights
-
     weights = _load_weights(supabase)
 
-    # ---- Mode 3 : descente de gradient (v2) ----
     if feedback_records:
         new_w = dict(weights)
         for fb in feedback_records:
@@ -1918,7 +2045,6 @@ def update_weights_from_feedback(
         if total > 0:
             weights = {k: round(v / total, 4) for k, v in new_w.items()}
 
-    # ---- Mode 1 : remplacement direct ----
     elif feedback_data:
         for key, value in feedback_data.items():
             if key in weights:
@@ -1927,7 +2053,6 @@ def update_weights_from_feedback(
                 except (TypeError, ValueError):
                     continue
 
-    # ---- Mode 2 : delta like/dislike ----
     elif dimension_scores:
         delta = _LIKE_BOOST if liked else -_DISLIKE_DECAY
         for dim_key, dim_val in dimension_scores.items():
@@ -1944,7 +2069,7 @@ def update_weights_from_feedback(
 
 
 # =============================================================================
-# GUARDRAILS (v1 conservé, enrichi par pénalités v2)
+# GUARDRAILS
 # =============================================================================
 
 _LEVEL_THRESHOLDS: dict[ProfessionalLevel, dict[str, float]] = {
@@ -1960,11 +2085,6 @@ def _apply_dimension_guardrails(
     level     : ProfessionalLevel,
     hier_level: HierarchyLevel | None = None,
 ) -> tuple[float, list[str]]:
-    """
-    Score pondéré avec :
-    1. Pénalités de niveau (v1 — seuils par ProfessionalLevel)
-    2. Pénalités de carence (v2 — courbes exponential/step/linear)
-    """
     thresholds = _LEVEL_THRESHOLDS.get(level, {})
     warnings   : list[str] = []
     adjusted   = 0.0
@@ -1983,7 +2103,6 @@ def _apply_dimension_guardrails(
 
         adjusted += (score * weight) - penalty
 
-    # Pénalités v2 sur scores normalisés (0–1)
     if hier_level is not None:
         dim_norm = {
             "experience":    dimensions.get("experience_score",         0.0) / 100,
@@ -2013,13 +2132,6 @@ def compute_candidate_score(
     supabase           : Any        = None,
     domain             : Domain | None = None,
 ) -> dict[str, Any]:
-    """
-    Calcule le score d'adéquation CV ↔ offre d'emploi (0–100).
-
-    Retourne : score, confidence, domain, professional_level,
-               reasoning, matched_keywords, missing_keywords,
-               dimension_scores, warnings.
-    """
     base_weights = _load_weights(supabase)
     cv_text      = _build_cv_text(cv_data)
     job_text     = _build_job_text(job_title, job_requirements)
@@ -2034,19 +2146,19 @@ def compute_candidate_score(
     hier_level = detect_hierarchy_level(_norm(f"{cv_text} {job_title}"))
     weights    = _get_weights_for_level(weights, level)
 
-    kw_result  = (
-        _keyword_match(cv_text, job_text)
-        if is_tech
-        else _keyword_match(cv_text, job_text, profile.keywords)
+    # CORRECTION v3.1 : passage du flag is_tech + keywords normalisés
+    kw_result  = _keyword_match(
+        cv_text, job_text,
+        keywords=None if is_tech else profile.keywords,
+        is_tech=is_tech,
     )
     sem_score  = _semantic_score(cv_text, job_text)
     cert_score = _certification_score(cv_text, domain)
     edu_score  = _education_score(cv_text, domain, job_text, level)
     lead_score = _leadership_score(cv_text, profile.leadership_terms)
-    cmpx_score = (
-        _complexity_score(cv_text)
-        if is_tech
-        else _complexity_score(cv_text, profile.indicators)
+    cmpx_score = _complexity_score(
+        cv_text,
+        indicators=None if is_tech else profile.indicators,
     )
     lang_score = _language_score(cv_text)
 
@@ -2098,7 +2210,6 @@ def compute_cv_quality_score(
     cv_data : dict[str, Any],
     supabase: Any = None,
 ) -> dict[str, Any]:
-    """Score qualité autonome d'un CV (sans offre d'emploi)."""
     cv_text = _build_cv_text(cv_data)
 
     ai_data: dict[str, Any] = {}
@@ -2137,7 +2248,9 @@ def compute_cv_quality_score(
         cert_score = _certification_score(cv_text, domain)
         cmpx_score = _complexity_score(cv_text)
     else:
-        cert_score = _clamp(sum(1 for t in profile.indicators if t in cv_text) * 25)
+        cert_score = _clamp(
+            sum(1 for t in profile.indicators if t in cv_text) * 25
+        )
         cmpx_score = _complexity_score(cv_text, profile.indicators)
 
     base_weights = _load_weights(supabase)
