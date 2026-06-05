@@ -55,6 +55,11 @@ class CandidateBase(BaseModel):
 
         if isinstance(v, str):
             v = v.strip().replace(" ", "")
+            
+            if "@" in v:
+                local, _, domain = v.partition("@")
+                domain = domain.replace(",", ".")
+                v = f"{local}@{domain}"
 
         return v
 
