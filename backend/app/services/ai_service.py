@@ -369,27 +369,17 @@ def extract_cv_info(raw_text: str) -> dict[str, Any]:
 # Public: scoring shim
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Public: scoring shim
+# ---------------------------------------------------------------------------
+
 def score_candidate(
     cv_data: dict[str, Any],
     job_title: str,
     job_requirements: str,
 ) -> dict[str, Any]:
     """
-    Delegate to the intelligent scorer.
-
-    Returns the full scoring dict from compute_candidate_score:
-      {
-        "score":            float,   ← 0-100
-        "confidence":       float,
-        "domain":           str,
-        "reasoning":        str,
-        "matched_keywords": list,
-        "missing_keywords": list,
-        "dimension_scores": dict,
-      }
-
-    Callers must extract ["score"] — never cast the whole dict to float.
-    _compute_score in drive_sync.py handles this via _extract_scalar_score().
+    Delegate to the intelligent hierarchical scorer (v2.0).
     """
     return compute_candidate_score(
         cv_data=cv_data,
