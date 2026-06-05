@@ -69,8 +69,11 @@ torch.set_num_interop_threads(1)
 @lru_cache(maxsize=1)
 def _get_model() -> SentenceTransformer:
     print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME}) in low memory mode…")
-    model = SentenceTransformer(_MODEL_NAME, device="cpu")
-    model.model.half()
+    model = SentenceTransformer(
+    _MODEL_NAME,
+    device="cpu",
+    model_kwargs={"torch_dtype": "float16"}
+)
     return model
 
 
