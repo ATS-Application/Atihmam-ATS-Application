@@ -1585,3 +1585,43 @@ def compute_cv_quality_score(cv_text: str) -> dict[str, Any]:
             "overall_assessment": "Assessment unavailable",
             "details": {"error": str(e)}
         }
+
+
+# =============================================================================
+# FULL COMPATIBILITY LAYER FOR THE REST OF THE APP
+# =============================================================================
+
+def classify_domain(job_title: str, job_description: str = "") -> str:
+    """
+    Compatibility function expected by domain_classifier.py
+    """
+    # Reuse the rich domain detector (returns Enum, we convert to string)
+    title_lower = job_title.lower()
+    desc_lower = job_description.lower()
+    domain_enum = detect_domain(title_lower, desc_lower)
+    return domain_enum.value  # e.g. "finance", "tech", etc.
+
+
+# Alias for older naming if needed
+detect_domain_compat = classify_domain
+
+
+def compute_candidate_score_compat(cv_text: str, job_title: str, job_requirements: str) -> dict:
+    """Legacy alias if any other file uses direct text input"""
+    return compute_candidate_score(
+        cv_data={"raw_text": cv_text},
+        job_title=job_title,
+        job_requirements=job_requirements
+    )
+
+
+# Export everything needed
+__all__ = [
+    'compute_candidate_score',
+    'compute_cv_quality_score',
+    'classify_domain',
+    'score_candidate',
+    'score_to_dict',
+    'Domain',
+    # ... add more if other files complain
+]
