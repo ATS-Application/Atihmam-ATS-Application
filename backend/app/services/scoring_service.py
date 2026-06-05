@@ -1,107 +1,343 @@
-"""
-scoring_service.py — Service de scoring ATS pour le marché francophone africain.
-Version 2.0 — Architecture hiérarchique à 4 niveaux avec leadership par actions.
-Conçu pour Atihmam Conseils, adapté au contexte ivoirien et francophone.
-
-Auteur : Magic_Mind pour Hamadou / Atihmam Conseils
-Date   : 2026-06-03
-
-Architecture :
-- 27 domaines métier (Domain)
-- 4 niveaux hiérarchiques (HierarchyLevel) : COLLABORATEUR, MANAGER_INTERMEDIAIRE,
-  MANAGER_SENIOR, DIRECTION
-- Poids différenciés par niveau hiérarchique (HIERARCHY_PROFILES)
-- Pénalités de carence pour dimensions critiques sous-seuil (PENALTY_SYSTEM)
-- Modèle sémantique multilingue (paraphrase-multilingual-MiniLM-L12-v2)
-- Détection du leadership : titres passés + actions d'encadrement
-- Indicateurs de complexité différenciés par niveau
-- Certifications non-tech reconnues (OHADA, IFRS, SIRH, ISO, HACCP, etc.)
-- Seuils éducatifs éliminatoires par niveau hiérarchique
-"""
-
+# backend/app/services/scoring_service.py
 # =============================================================================
-# Imports
+# CŒUR DU SYSTÈME DE NOTATION DES CANDIDATS — v3.0 (fusion v1 + v2)
+#
+# Rôle : comparer un CV avec une offre d'emploi et produire un score de 0–100.
+#
+# Nouveautés v3 (issues de v2) :
+#   • HierarchyLevel (4 niveaux) remplace ProfessionalLevel (6)
+#   • HierarchyProfile : poids gelés par niveau hiérarchique
+#   • Détection du leadership : verbes d'action + titres passés
+#   • Système de pénalités de carence : 5 courbes (linear/exp/step)
+#   • Certifications non-tech : OHADA, IFRS, ACCA, CFA, PMP, HACCP…
+#   • DOMAIN_SKILLS allégés (détection rapide) en supplément des DomainProfile
+#   • FeedbackRecord + descente de gradient (apprentissage recruteur)
+#
+# API publique INCHANGÉE (compatible avec ai_service.py) :
+#   compute_candidate_score()       — scoring synchrone
+#   compute_candidate_score_async() — version async
+#   compute_cv_quality_score()      — qualité autonome
+#   batch_score_candidates()        — lot synchrone
+#   batch_score_candidates_async()  — lot async
+#   update_weights_from_feedback()  — adaptation des poids
+#   classify_domain()               — détection de domaine
+#   Domain, ProfessionalLevel       — enums exportées
+#
+# IMPORTANT – imports circulaires :
+#   compute_final_score() et get_final_candidate_assessment() vivent dans
+#   ai_service.py car ils dépendent de analyze_cv_depth() définie là-bas.
 # =============================================================================
-import re
-import math
+
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
-from enum import Enum
+import math
+import os
+import re
+import threading
+import torch
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Any, Set
-from collections import Counter
+from datetime import datetime
+from enum import Enum
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# CACHE HuggingFace — DOIT être défini avant tout import transformers
+# =============================================================================
+_CACHE_DIR = Path("./.hf-cache")
+_CACHE_DIR.mkdir(exist_ok=True)
+os.environ.setdefault("HF_HOME", str(_CACHE_DIR.resolve()))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(_CACHE_DIR.resolve()))
+
+_MODEL_NAME = "all-MiniLM-L6-v2"
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+
+@lru_cache(maxsize=1)
+def _get_model() -> SentenceTransformer:
+    print(f"[scoring] Loading SentenceTransformer ({_MODEL_NAME}) in low memory mode…")
+    model = SentenceTransformer(_MODEL_NAME, device="cpu")
+    model.model.half()
+    return model
+
 
 # =============================================================================
-# 1. Énumérations fondamentales
+# UTILITAIRES COMMUNS
 # =============================================================================
 
-class HierarchyLevel(str, Enum):
-    """
-    Niveau hiérarchique du poste, détecté automatiquement depuis le titre.
-    Détermine le profil de scoring (poids, seuils, indicateurs).
-    """
-    COLLABORATEUR = "collaborateur"               # Opérateur, technicien, analyste...
-    MANAGER_INTERMEDIAIRE = "manager_intermediaire"  # Chef de service, team lead...
-    MANAGER_SENIOR = "manager_senior"               # Responsable, chef de département
-    DIRECTION = "direction"                          # Directeur, DG, VP, COMEX
+def _norm(text: str | None) -> str:
+    return (text or "").lower().strip()
 
+
+def _clamp(value: float) -> float:
+    return round(max(0.0, min(value, 100.0)), 2)
+
+
+def safe_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if item]
+        except (json.JSONDecodeError, ValueError):
+            return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if item]
+    return []
+
+
+def safe_dict_list(value: Any) -> list[dict]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+# =============================================================================
+# ENUMS & TYPES
+# =============================================================================
 
 class Domain(str, Enum):
-    """
-    27 domaines métier couvrant le spectre économique ivoirien et francophone.
-    Utilisé pour l'ajustement des poids de scoring par domaine.
-    """
-    TECH = "tech"
-    LEGAL = "legal"
-    HEALTH = "health"
-    HR = "hr"
-    FINANCE = "finance"
-    MARKETING = "marketing"
-    SALES = "sales"
-    EDUCATION = "education"
-    AGRICULTURE = "agriculture"
-    CONSTRUCTION = "construction"
-    LOGISTICS = "logistics"
-    TELECOM = "telecom"
-    ENERGY = "energy"
-    MINING = "mining"
-    HOSPITALITY = "hospitality"
-    MEDIA = "media"
-    INSURANCE = "insurance"
-    REAL_ESTATE = "real_estate"
-    CONSULTING = "consulting"
-    PUBLIC_ADMIN = "public_admin"
-    NGO = "ngo"
-    PHARMA = "pharma"
-    RETAIL = "retail"
-    TRANSPORT = "transport"
-    ENVIRONMENT = "environment"
-    CRAFTSMANSHIP = "craftsmanship"
-    SECURITY = "security"
+    TECH               = "Informatique & Développement logiciel"
+    NETWORKS           = "Réseaux, Télécoms & Cybersécurité"
+    ENGINEERING        = "Ingénierie & Techniques"
+    SCIENCE            = "Sciences & Recherche"
+    ENERGY             = "Énergie, Mines & Pétrole"
+    INDUSTRY           = "Production & Industrie"
+    QHSE               = "Qualité, Hygiène, Sécurité, Environnement (QHSE)"
+    SUPPLY_CHAIN       = "Achats & Supply Chain"
+    PURCHASING_MANAGER = "Responsable Achats"
+    ADMIN              = "Administration & Secrétariat"
+    AGRI               = "Agriculture & Agroalimentaire"
+    ART                = "Art, Culture & Design"
+    BANKING            = "Banque & Assurance"
+    SALES              = "Commercial & Vente"
+    ACCOUNTING         = "Comptabilité & Finance"
+    BTP                = "Construction & BTP"
+    LEGAL              = "Droit & Juridique"
+    EDUCATION          = "Éducation & Formation"
+    HOSPITALITY        = "Hôtellerie & Restauration"
+    REAL_ESTATE        = "Immobilier"
+    JOURNALISM         = "Journalisme & Médias"
+    MARKETING          = "Marketing & Communication"
+    HR                 = "Ressources Humaines (RH)"
+    HEALTH             = "Santé & Médical"
+    GENERAL_SERVICES   = "Services Généraux"
+    INTERN             = "Stage / Jeune diplômé"
+    TOURISM            = "Tourisme & Loisirs"
+    TRANSPORT          = "Transport & Logistique"
+    SOCIAL             = "Travail Social & ONG"
+
+
+# ---------------------------------------------------------------------------
+# ProfessionalLevel — CONSERVÉ pour compatibilité ascendante
+# (utilisé par ai_service.py et d'autres modules)
+# ---------------------------------------------------------------------------
+class ProfessionalLevel(str, Enum):
+    JUNIOR    = "Junior / Employé"
+    MID_LEVEL = "Confirmé / Mid-level"
+    SENIOR    = "Senior"
+    MANAGER   = "Manager / Responsable"
+    DIRECTOR  = "Directeur / Head of"
+    EXECUTIVE = "C-Level / DG / Executive"
+
+
+# ---------------------------------------------------------------------------
+# HierarchyLevel (v2) — nouveau moteur de détection
+# ---------------------------------------------------------------------------
+class HierarchyLevel(str, Enum):
+    COLLABORATEUR         = "collaborateur"
+    MANAGER_INTERMEDIAIRE = "manager_intermediaire"
+    MANAGER_SENIOR        = "manager_senior"
+    DIRECTION             = "direction"
+
+
+TECH_DOMAINS: frozenset[Domain] = frozenset({
+    Domain.TECH,
+    Domain.NETWORKS,
+    Domain.ENGINEERING,
+    Domain.SCIENCE,
+    Domain.ENERGY,
+    Domain.INDUSTRY,
+    Domain.QHSE,
+})
+
+
+@dataclass
+class DomainProfile:
+    keywords         : tuple[str, ...] = field(default_factory=tuple)
+    indicators       : dict[str, int]  = field(default_factory=dict)
+    weight_overrides : dict[str, float]= field(default_factory=dict)
+    leadership_terms : tuple[str, ...] = field(default_factory=tuple)
 
 
 # =============================================================================
-# 2. Mapping des marqueurs de niveau hiérarchique (titres)
+# CONSTANTES GLOBALES
 # =============================================================================
 
-HIERARCHY_TITLE_MARKERS: Dict[HierarchyLevel, List[str]] = {
+TECH_KEYWORDS: tuple[str, ...] = (
+    "spring boot", "node.js", "ci/cd",
+    "python", "java", "spring", "react", "angular",
+    "docker", "kubernetes", "aws", "azure", "gcp", "nestjs",
+    "fastapi", "django", "graphql", "postgresql", "mongodb", "redis",
+    "microservices", "scrum", "kafka", "typescript", "flutter",
+    "tensorflow", "pytorch", "firebase",
+)
+
+_KW_PATTERNS: dict[str, re.Pattern] = {
+    kw: re.compile(
+        rf"\b{re.escape(kw)}\b" if " " not in kw else re.escape(kw),
+        re.IGNORECASE,
+    )
+    for kw in TECH_KEYWORDS
+}
+
+CERTIFICATION_SCORES: dict[str, int] = {
+    "aws":    35,
+    "scrum":  30,
+    "oracle": 35,
+}
+
+# ---------------------------------------------------------------------------
+# Certifications enrichies (v2) — non-tech incluses
+# ---------------------------------------------------------------------------
+CERTIFICATION_REGISTRY: dict[str, dict[str, Any]] = {
+    "aws":      {"name": "AWS Certification",        "domain": Domain.TECH,       "level": 3, "weight": 1.0},
+    "azure":    {"name": "Microsoft Azure",          "domain": Domain.TECH,       "level": 3, "weight": 1.0},
+    "gcp":      {"name": "Google Cloud",             "domain": Domain.TECH,       "level": 3, "weight": 0.9},
+    "cisco":    {"name": "Cisco (CCNA/CCNP)",        "domain": Domain.NETWORKS,   "level": 3, "weight": 1.0},
+    "pmp":      {"name": "PMP",                      "domain": Domain.ENGINEERING,"level": 4, "weight": 1.2},
+    "prince2":  {"name": "PRINCE2",                  "domain": Domain.ENGINEERING,"level": 3, "weight": 1.0},
+    "scrum":    {"name": "Scrum Master / PO",        "domain": Domain.TECH,       "level": 2, "weight": 0.7},
+    "itil":     {"name": "ITIL",                     "domain": Domain.TECH,       "level": 3, "weight": 0.8},
+    "iso 9001": {"name": "ISO 9001",                 "domain": Domain.QHSE,       "level": 3, "weight": 1.0},
+    "iso 14001":{"name": "ISO 14001",                "domain": Domain.QHSE,       "level": 3, "weight": 1.0},
+    "iso 45001":{"name": "ISO 45001",                "domain": Domain.QHSE,       "level": 3, "weight": 1.0},
+    "iso 22000":{"name": "ISO 22000",                "domain": Domain.AGRI,       "level": 3, "weight": 1.0},
+    "haccp":    {"name": "HACCP",                    "domain": Domain.AGRI,       "level": 3, "weight": 1.0},
+    "ohada":    {"name": "OHADA",                    "domain": Domain.LEGAL,      "level": 4, "weight": 1.5},
+    "ifrs":     {"name": "IFRS Certification",       "domain": Domain.ACCOUNTING, "level": 4, "weight": 1.3},
+    "acca":     {"name": "ACCA",                     "domain": Domain.ACCOUNTING, "level": 4, "weight": 1.3},
+    "cima":     {"name": "CIMA",                     "domain": Domain.ACCOUNTING, "level": 4, "weight": 1.2},
+    "cfa":      {"name": "CFA",                      "domain": Domain.ACCOUNTING, "level": 5, "weight": 1.5},
+    "cpa":      {"name": "CPA",                      "domain": Domain.ACCOUNTING, "level": 4, "weight": 1.3},
+    "sirh":     {"name": "SIRH Certification",       "domain": Domain.HR,         "level": 3, "weight": 1.0},
+    "toeic":    {"name": "TOEIC",                    "domain": Domain.EDUCATION,  "level": 1, "weight": 0.5},
+    "toefl":    {"name": "TOEFL",                    "domain": Domain.EDUCATION,  "level": 1, "weight": 0.5},
+    "ielts":    {"name": "IELTS",                    "domain": Domain.EDUCATION,  "level": 1, "weight": 0.5},
+    "oracle":   {"name": "Oracle Certification",     "domain": Domain.TECH,       "level": 3, "weight": 1.0},
+}
+
+LEADERSHIP_TERMS: tuple[str, ...] = (
+    "lead", "leader", "mentor", "management", "architect",
+    "code review", "scrum", "encadrement",
+)
+
+# Verbes d'action de leadership (v2) — score pondéré
+LEADERSHIP_ACTION_VERBS: dict[str, float] = {
+    "dirigé": 1.0, "diriger": 0.9, "dirige": 1.0,
+    "piloté": 1.0, "piloter": 0.9, "pilote": 1.0,
+    "managé": 0.9, "manager": 0.8, "manage": 0.8,
+    "supervisé": 0.8, "superviser": 0.7, "supervise": 0.8,
+    "encadré": 0.8, "encadrer": 0.7, "encadre": 0.8,
+    "coordonné": 0.7, "coordonner": 0.6, "coordonne": 0.7,
+    "animé": 0.6, "animer": 0.5, "anime": 0.6,
+    "conduit": 0.7, "initié": 0.7, "transformé": 0.8,
+    "restructuré": 0.8, "fondé": 0.9, "créé": 0.6,
+    "led": 1.0, "lead": 1.0, "managed": 0.9, "oversaw": 0.9,
+    "supervised": 0.8, "coordinated": 0.7, "orchestrated": 0.8,
+    "headed": 0.9, "directed": 1.0, "spearheaded": 0.9,
+    "championed": 0.8, "mentored": 0.6, "coached": 0.5,
+    "empowered": 0.7, "built": 0.5, "established": 0.7, "founded": 0.9,
+}
+
+COMPLEXITY_INDICATORS: dict[str, int] = {
+    "microservices":     20,
+    "kubernetes":        20,
+    "distributed":       15,
+    "millions":          15,
+    "scalable":          15,
+    "ci/cd":             10,
+    "aws":               10,
+    "architecture":      15,
+    "real-time":         15,
+    "event-driven":      15,
+    "high availability": 20,
+    "machine learning":  10,
+    "tensorflow":        10,
+    "pytorch":           10,
+}
+
+DEFAULT_REQUIRED_EXPERIENCE: int = 3
+
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "keyword":       0.10,
+    "semantic":      0.20,
+    "experience":    0.18,
+    "certification": 0.08,
+    "complexity":    0.22,
+    "education":     0.13,
+    "leadership":    0.05,
+    "language":      0.04,
+}
+
+_DIM_TO_WEIGHT: dict[str, str] = {
+    "keyword_score":            "keyword",
+    "semantic_score":           "semantic",
+    "experience_score":         "experience",
+    "certification_score":      "certification",
+    "education_score":          "education",
+    "leadership_score":         "leadership",
+    "project_complexity_score": "complexity",
+    "language_score":           "language",
+}
+
+_LIKE_BOOST    = 0.05
+_DISLIKE_DECAY = 0.05
+
+_active_weights: dict[str, float] = dict(DEFAULT_WEIGHTS)
+_weights_lock = threading.Lock()
+
+
+# =============================================================================
+# HIÉRARCHIE — profils gelés (v2)
+# =============================================================================
+
+HIERARCHY_TITLE_MARKERS: dict[HierarchyLevel, list[str]] = {
     HierarchyLevel.COLLABORATEUR: [
         "opérateur", "technicien", "analyste", "assistant", "agent",
         "ouvrier", "employé", "stagiaire", "junior", "débutant",
-        "secrétaire", "comptable", "caissier", "chauffeur", "agent de",
-        "operator", "technician", "analyst", "assistant", "agent",
-        "junior", "staff", "operator", "clerk", "secretary",
+        "secrétaire", "comptable", "caissier", "chauffeur",
+        "operator", "technician", "analyst", "junior", "staff", "clerk",
     ],
     HierarchyLevel.MANAGER_INTERMEDIAIRE: [
         "chef de service", "chef service", "supervisor", "superviseur",
         "team lead", "team leader", "coordonnateur", "coordinateur",
         "chef d'équipe", "chef equipe", "responsable d'équipe",
-        "responsable equipe", "manager de proximité", "contremaître",
-        "contremaitre", "superintendent", "foreman",
+        "contremaître", "contremaitre", "superintendent", "foreman",
     ],
     HierarchyLevel.MANAGER_SENIOR: [
         "responsable", "chef de département", "chef departement",
@@ -115,49 +351,40 @@ HIERARCHY_TITLE_MARKERS: Dict[HierarchyLevel, List[str]] = {
         "directeur général", "directrice générale", "dg", "ceo",
         "directeur", "directrice", "president", "président",
         "vice-président", "vice president", "vp", "c-level",
-        "chief", "comex", "codir", "board", "managing director",
+        "chief", "comex", "codir", "managing director",
         "executive director", "directeur exécutif", "pdg",
         "secrétaire général", "secretaire general",
     ],
 }
 
-# =============================================================================
-# 3. Profils de scoring par niveau hiérarchique
-# =============================================================================
 
 @dataclass(frozen=True)
 class HierarchyProfile:
-    """Profil de scoring complet pour un niveau hiérarchique."""
     level: HierarchyLevel
-    # Poids des 9 dimensions (total = 1.0)
-    w_experience: float = 0.25
-    w_education: float = 0.12
-    w_certifications: float = 0.08
-    w_semantic: float = 0.20
-    w_keywords: float = 0.10
-    w_leadership: float = 0.05
-    w_language: float = 0.05
-    w_complexity: float = 0.10
-    w_penalty: float = 0.05
-    # Seuils
-    min_years_experience: float = 0
-    min_education_level: str = "none"
-    require_certifications: bool = False
-    require_leadership: bool = False
-    # Multiplicateur de complexité
-    complexity_multiplier: float = 1.0
+    w_experience     : float = 0.25
+    w_education      : float = 0.12
+    w_certifications : float = 0.08
+    w_semantic       : float = 0.20
+    w_keywords       : float = 0.10
+    w_leadership     : float = 0.05
+    w_language       : float = 0.05
+    w_complexity     : float = 0.10
+    w_penalty        : float = 0.05
+    min_years_experience  : float = 0
+    min_education_level   : str   = "none"
+    require_certifications: bool  = False
+    require_leadership    : bool  = False
+    complexity_multiplier : float = 1.0
 
 
-HIERARCHY_PROFILES: Dict[HierarchyLevel, HierarchyProfile] = {
+HIERARCHY_PROFILES: dict[HierarchyLevel, HierarchyProfile] = {
     HierarchyLevel.COLLABORATEUR: HierarchyProfile(
         level=HierarchyLevel.COLLABORATEUR,
         w_experience=0.20, w_education=0.15, w_certifications=0.10,
         w_semantic=0.15, w_keywords=0.15, w_leadership=0.00,
         w_language=0.05, w_complexity=0.10, w_penalty=0.10,
-        min_years_experience=0,
-        min_education_level="cap_bep",
-        require_certifications=False,
-        require_leadership=False,
+        min_years_experience=0, min_education_level="cap_bep",
+        require_certifications=False, require_leadership=False,
         complexity_multiplier=0.8,
     ),
     HierarchyLevel.MANAGER_INTERMEDIAIRE: HierarchyProfile(
@@ -165,10 +392,8 @@ HIERARCHY_PROFILES: Dict[HierarchyLevel, HierarchyProfile] = {
         w_experience=0.22, w_education=0.12, w_certifications=0.08,
         w_semantic=0.18, w_keywords=0.12, w_leadership=0.10,
         w_language=0.05, w_complexity=0.08, w_penalty=0.05,
-        min_years_experience=3,
-        min_education_level="bac",
-        require_certifications=False,
-        require_leadership=True,
+        min_years_experience=3, min_education_level="bac",
+        require_certifications=False, require_leadership=True,
         complexity_multiplier=1.0,
     ),
     HierarchyLevel.MANAGER_SENIOR: HierarchyProfile(
@@ -176,10 +401,8 @@ HIERARCHY_PROFILES: Dict[HierarchyLevel, HierarchyProfile] = {
         w_experience=0.25, w_education=0.10, w_certifications=0.08,
         w_semantic=0.15, w_keywords=0.08, w_leadership=0.15,
         w_language=0.07, w_complexity=0.07, w_penalty=0.05,
-        min_years_experience=7,
-        min_education_level="bac+3_licence",
-        require_certifications=True,
-        require_leadership=True,
+        min_years_experience=7, min_education_level="bac+3_licence",
+        require_certifications=True, require_leadership=True,
         complexity_multiplier=1.2,
     ),
     HierarchyLevel.DIRECTION: HierarchyProfile(
@@ -187,1218 +410,1843 @@ HIERARCHY_PROFILES: Dict[HierarchyLevel, HierarchyProfile] = {
         w_experience=0.20, w_education=0.10, w_certifications=0.05,
         w_semantic=0.12, w_keywords=0.05, w_leadership=0.25,
         w_language=0.10, w_complexity=0.08, w_penalty=0.05,
-        min_years_experience=10,
-        min_education_level="bac+5_master",
-        require_certifications=False,
-        require_leadership=True,
+        min_years_experience=10, min_education_level="bac+5_master",
+        require_certifications=False, require_leadership=True,
         complexity_multiplier=1.5,
     ),
 }
 
-# =============================================================================
-# 4. Indicateurs de complexité par domaine
-# =============================================================================
-
-DOMAIN_COMPLEXITY: Dict[Domain, float] = {
-    Domain.TECH: 1.2,
-    Domain.LEGAL: 1.5,
-    Domain.HEALTH: 1.4,
-    Domain.HR: 1.0,
-    Domain.FINANCE: 1.3,
-    Domain.MARKETING: 0.9,
-    Domain.SALES: 0.8,
-    Domain.EDUCATION: 1.0,
-    Domain.AGRICULTURE: 1.3,
-    Domain.CONSTRUCTION: 1.4,
-    Domain.LOGISTICS: 1.0,
-    Domain.TELECOM: 1.2,
-    Domain.ENERGY: 1.5,
-    Domain.MINING: 1.6,
-    Domain.HOSPITALITY: 0.7,
-    Domain.MEDIA: 0.9,
-    Domain.INSURANCE: 1.2,
-    Domain.REAL_ESTATE: 1.1,
-    Domain.CONSULTING: 1.3,
-    Domain.PUBLIC_ADMIN: 1.0,
-    Domain.NGO: 0.9,
-    Domain.PHARMA: 1.5,
-    Domain.RETAIL: 0.7,
-    Domain.TRANSPORT: 1.0,
-    Domain.ENVIRONMENT: 1.2,
-    Domain.CRAFTSMANSHIP: 1.1,
-    Domain.SECURITY: 0.8,
+# Mapping HierarchyLevel → ProfessionalLevel (compat ascendante)
+_HIER_TO_PROF: dict[HierarchyLevel, ProfessionalLevel] = {
+    HierarchyLevel.COLLABORATEUR:         ProfessionalLevel.MID_LEVEL,
+    HierarchyLevel.MANAGER_INTERMEDIAIRE: ProfessionalLevel.MANAGER,
+    HierarchyLevel.MANAGER_SENIOR:        ProfessionalLevel.SENIOR,
+    HierarchyLevel.DIRECTION:             ProfessionalLevel.DIRECTOR,
 }
 
-# =============================================================================
-# 5. Dictionnaires de compétences par domaine
-# =============================================================================
-
-DOMAIN_SKILLS: Dict[Domain, List[str]] = {
-    Domain.TECH: ["python", "java", "sql", "cloud", "aws", "azure", "devops",
-                   "api", "docker", "kubernetes", "git", "agile", "scrum",
-                   "architecture", "microservices", "ci/cd", "linux"],
-    Domain.LEGAL: ["droit", "contrat", "contentieux", "ohada", "conformité",
-                    "compliance", "rgpd", "propriété intellectuelle", "arbitrage",
-                    "médiation", "due diligence", "fusion", "acquisition"],
-    Domain.HEALTH: ["médecine", "soins", "patient", "diagnostic", "chirurgie",
-                     "pharmacie", "infirmier", "santé publique", "épidémiologie"],
-    Domain.HR: ["recrutement", "formation", "gpec", "paie", "administration",
-                "relations sociales", "dialogue social", "sirh", "talent",
-                "onboarding", "assessment", "people"],
-    Domain.FINANCE: ["comptabilité", "audit", "contrôle de gestion", "trésorerie",
-                      "ifrs", "fiscalité", "reporting", "budget", "forecast",
-                      "consolidation", "clôture", "p&l", "balance sheet"],
-    Domain.MARKETING: ["digital", "branding", "seo", "sea", "content", "social media",
-                        "campagne", "études", "crm", "acquisition", "fidélisation"],
-    Domain.SALES: ["négociation", "prospection", "portefeuille", "pipeline",
-                    "key account", "business development", "b2b", "b2c", "closing"],
-    Domain.EDUCATION: ["pédagogie", "formation", "enseignement", "programme",
-                        "évaluation", "andragogie", "elearning", "campus"],
-    Domain.AGRICULTURE: ["agronomie", "culture", "élevage", "irrigation",
-                          "haccp", "sécurité alimentaire", "agriculture durable",
-                          "filière", "coopérative", "certification bio"],
-    Domain.CONSTRUCTION: ["btp", "gros œuvre", "second œuvre", "bim", "bâtiment",
-                           "travaux publics", "génie civil", "chantier", "topographie"],
-    Domain.LOGISTICS: ["supply chain", "transport", "entrepôt", "stock",
-                        "inventaire", "douane", "incoterms", "fret", "flux"],
-    Domain.TELECOM: ["réseau", "fibre", "télécommunication", "antenne",
-                      "5g", "ftth", "opérateur", "spectre", "datacenter"],
-    Domain.ENERGY: ["électricité", "renouvelable", "solaire", "éolien",
-                     "hydroélectrique", "réseau électrique", "maintenance"],
-    Domain.MINING: ["mine", "extraction", "géologie", "minerai", "carrière",
-                     "forage", "explosif", "traitement", "exploration"],
-    Domain.HOSPITALITY: ["hôtellerie", "restauration", "accueil", "service",
-                          "tourisme", "réservation", "hébergement"],
-    Domain.MEDIA: ["journalisme", "rédaction", "production", "audiovisuel",
-                    "édition", "broadcast", "streaming"],
-    Domain.INSURANCE: ["assurance", "sinistre", "souscription", "actuariat",
-                        "risque", "réassurance", "courtage", "prévoyance"],
-    Domain.REAL_ESTATE: ["immobilier", "promotion", "transaction", "gestion",
-                          "copropriété", "foncier", "syndic"],
-    Domain.CONSULTING: ["conseil", "diagnostic", "stratégie", "transformation",
-                         "audit", "mission", "recommandation"],
-    Domain.PUBLIC_ADMIN: ["administration", "marché public", "service public",
-                           "collectivité", "préfecture", "guichet"],
-    Domain.NGO: ["humanitaire", "développement", "plaidoyer", "bailleur",
-                  "subvention", "bénéficiaire", "terrain"],
-    Domain.PHARMA: ["médicament", "essai clinique", "réglementaire", "amm",
-                     "laboratoire", "bp", "biotech", "galénique"],
-    Domain.RETAIL: ["distribution", "magasin", "rayon", "caisse", "merchandising",
-                     "grande surface", "franchise", "click and collect"],
-    Domain.TRANSPORT: ["logistique transport", "flotte", "routier", "maritime",
-                        "aérien", "ferroviaire", "passager", "marchandise"],
-    Domain.ENVIRONMENT: ["environnement", "développement durable", "rse",
-                          "carbone", "bilan", "recyclage", "biodiversité"],
-    Domain.CRAFTSMANSHIP: ["artisanat", "métier", "fabrication", "manuel",
-                            "atelier", "savoir-faire", "compagnon"],
-    Domain.SECURITY: ["sécurité", "sûreté", "gardiennage", "surveillance",
-                       "télésurveillance", "contrôle d'accès", "prévention"],
-}
 
 # =============================================================================
-# 6. Niveaux d'éducation (mapping et ordre)
-# =============================================================================
-
-EDUCATION_LEVEL_ORDER: List[str] = [
-    "none",
-    "cap_bep",
-    "bac",
-    "bac+2_bts_dut",
-    "bac+3_licence",
-    "bac+4_maitrise",
-    "bac+5_master",
-    "bac+8_doctorat",
-]
-
-EDUCATION_MARKERS: Dict[str, List[str]] = {
-    "cap_bep": ["cap", "bep", "bt", "brevet de technicien", "certificat d'aptitude"],
-    "bac": ["baccalauréat", "bac", "baccalaureate", "high school diploma", "a level"],
-    "bac+2_bts_dut": ["bts", "dut", "deug", "deust", "associate degree", "hnd"],
-    "bac+3_licence": ["licence", "bachelor", "baccaleaureat", "ba ", "bsc", "b.a.", "b.s.", "llb"],
-    "bac+4_maitrise": ["maîtrise", "maitrise", "master 1", "m1", "pgd", "postgraduate diploma"],
-    "bac+5_master": ["master", "master 2", "m2", "msc", "mba", "ingénieur", "ingenieur",
-                      "diplôme d'ingénieur", "grande école", "dsc", "llm"],
-    "bac+8_doctorat": ["doctorat", "phd", "ph.d", "doctor", "docteur", "thèse"],
-}
-
-# =============================================================================
-# 7. Certifications reconnues (tech et non-tech, contexte africain)
-# =============================================================================
-
-CERTIFICATION_REGISTRY: Dict[str, Dict[str, Any]] = {
-    # Tech / IT
-    "aws": {"name": "AWS Certification", "domain": Domain.TECH, "level": 3, "weight": 1.0},
-    "azure": {"name": "Microsoft Azure", "domain": Domain.TECH, "level": 3, "weight": 1.0},
-    "gcp": {"name": "Google Cloud", "domain": Domain.TECH, "level": 3, "weight": 0.9},
-    "cisco": {"name": "Cisco (CCNA/CCNP)", "domain": Domain.TECH, "level": 3, "weight": 1.0},
-    "comptia": {"name": "CompTIA", "domain": Domain.TECH, "level": 2, "weight": 0.8},
-    "pmp": {"name": "Project Management Professional (PMP)", "domain": Domain.CONSULTING, "level": 4, "weight": 1.2},
-    "prince2": {"name": "PRINCE2", "domain": Domain.CONSULTING, "level": 3, "weight": 1.0},
-    "scrum": {"name": "Scrum Master / Product Owner", "domain": Domain.TECH, "level": 2, "weight": 0.7},
-    "itil": {"name": "ITIL", "domain": Domain.TECH, "level": 3, "weight": 0.8},
-    "iso 9001": {"name": "ISO 9001 Quality Management", "domain": Domain.CONSULTING, "level": 3, "weight": 1.0},
-    "iso 14001": {"name": "ISO 14001 Environmental", "domain": Domain.ENVIRONMENT, "level": 3, "weight": 1.0},
-    "iso 45001": {"name": "ISO 45001 OHS", "domain": Domain.SECURITY, "level": 3, "weight": 1.0},
-    "iso 22000": {"name": "ISO 22000 Food Safety", "domain": Domain.AGRICULTURE, "level": 3, "weight": 1.0},
-    "haccp": {"name": "HACCP", "domain": Domain.AGRICULTURE, "level": 3, "weight": 1.0},
-    # Contexte africain / francophone
-    "ohada": {"name": "OHADA", "domain": Domain.LEGAL, "level": 4, "weight": 1.5},
-    "ifrs": {"name": "IFRS Certification", "domain": Domain.FINANCE, "level": 4, "weight": 1.3},
-    "sirh": {"name": "SIRH Certification", "domain": Domain.HR, "level": 3, "weight": 1.0},
-    "acca": {"name": "ACCA", "domain": Domain.FINANCE, "level": 4, "weight": 1.3},
-    "cima": {"name": "CIMA", "domain": Domain.FINANCE, "level": 4, "weight": 1.2},
-    "cfa": {"name": "CFA", "domain": Domain.FINANCE, "level": 5, "weight": 1.5},
-    "cpa": {"name": "CPA", "domain": Domain.FINANCE, "level": 4, "weight": 1.3},
-    "toeic": {"name": "TOEIC", "domain": Domain.EDUCATION, "level": 1, "weight": 0.5},
-    "toefl": {"name": "TOEFL", "domain": Domain.EDUCATION, "level": 1, "weight": 0.5},
-    "ielts": {"name": "IELTS", "domain": Domain.EDUCATION, "level": 1, "weight": 0.5},
-    "delf": {"name": "DELF/DALF", "domain": Domain.EDUCATION, "level": 1, "weight": 0.4},
-}
-
-# =============================================================================
-# 8. Verbes d'action de leadership (français + anglais)
-# =============================================================================
-
-LEADERSHIP_ACTION_VERBS: Dict[str, float] = {
-    # Français - Management direct
-    "dirigé": 1.0, "diriger": 0.9, "dirige": 1.0,
-    "piloté": 1.0, "piloter": 0.9, "pilote": 1.0,
-    "managé": 0.9, "manager": 0.8, "manage": 0.8,
-    "supervisé": 0.8, "superviser": 0.7, "supervise": 0.8,
-    "encadré": 0.8, "encadrer": 0.7, "encadre": 0.8,
-    "coordonné": 0.7, "coordonner": 0.6, "coordonne": 0.7,
-    "animé": 0.6, "animer": 0.5, "anime": 0.6,
-    # Français - Leadership stratégique
-    "conduit": 0.7, "conduire": 0.6,
-    "initié": 0.7, "initier": 0.6,
-    "transformé": 0.8, "transformer": 0.7,
-    "restructuré": 0.8, "restructurer": 0.7,
-    "développé": 0.5, "développer": 0.4,
-    "fondé": 0.9, "fonder": 0.8,
-    "créé": 0.6, "créer": 0.5,
-    # Anglais
-    "led": 1.0, "lead": 1.0,
-    "managed": 0.9, "oversaw": 0.9,
-    "supervised": 0.8,
-    "coordinated": 0.7, "orchestrated": 0.8,
-    "headed": 0.9, "directed": 1.0,
-    "spearheaded": 0.9, "championed": 0.8,
-    "mentored": 0.6, "coached": 0.5,
-    "empowered": 0.7, "built": 0.5,
-    "established": 0.7, "founded": 0.9,
-}
-
-# =============================================================================
-# 9. Configuration du système de pénalités de carence
+# SYSTÈME DE PÉNALITÉS DE CARENCE (v2)
 # =============================================================================
 
 @dataclass(frozen=True)
 class DeficiencyPenalty:
-    """Configuration d'une pénalité de carence pour une dimension."""
-    dimension: str
-    threshold: float           # Score sous lequel la pénalité s'applique
-    max_penalty: float         # Pénalité maximale (proportion du score total)
-    penalty_curve: str = "linear"  # linear, exponential, step
-    description: str = ""
+    dimension    : str
+    threshold    : float
+    max_penalty  : float
+    penalty_curve: str = "linear"
+    description  : str = ""
 
 
-PENALTY_SYSTEM: List[DeficiencyPenalty] = [
-    DeficiencyPenalty(
-        dimension="experience",
-        threshold=0.15,
-        max_penalty=0.40,
-        penalty_curve="exponential",
-        description="Expérience critique insuffisante pour le poste",
-    ),
-    DeficiencyPenalty(
-        dimension="education",
-        threshold=0.10,
-        max_penalty=0.25,
-        penalty_curve="step",
-        description="Niveau d'éducation en dessous du seuil requis",
-    ),
-    DeficiencyPenalty(
-        dimension="certifications",
-        threshold=0.05,
-        max_penalty=0.15,
-        penalty_curve="linear",
-        description="Certifications obligatoires absentes",
-    ),
-    DeficiencyPenalty(
-        dimension="leadership",
-        threshold=0.10,
-        max_penalty=0.20,
-        penalty_curve="linear",
-        description="Leadership requis mais non démontré",
-    ),
-    DeficiencyPenalty(
-        dimension="language",
-        threshold=0.10,
-        max_penalty=0.10,
-        penalty_curve="linear",
-        description="Qualité linguistique insuffisante",
-    ),
+PENALTY_SYSTEM: list[DeficiencyPenalty] = [
+    DeficiencyPenalty("experience",    0.15, 0.40, "exponential", "Expérience critique insuffisante"),
+    DeficiencyPenalty("education",     0.10, 0.25, "step",        "Niveau d'éducation sous le seuil requis"),
+    DeficiencyPenalty("certification", 0.05, 0.15, "linear",      "Certifications obligatoires absentes"),
+    DeficiencyPenalty("leadership",    0.10, 0.20, "linear",      "Leadership requis mais non démontré"),
+    DeficiencyPenalty("language",      0.10, 0.10, "linear",      "Qualité linguistique insuffisante"),
 ]
 
 
-def compute_careness_penalty(
-    dimension_scores: Dict[str, float],
+def _compute_careness_penalty(
+    dim_scores_normalized: dict[str, float],
     hierarchy_level: HierarchyLevel,
-) -> Tuple[float, List[Dict[str, Any]]]:
+) -> tuple[float, list[dict[str, Any]]]:
     """
-    Calcule la pénalité totale de carence et retourne le détail.
+    dim_scores_normalized : valeurs en [0, 1] (dimensions / 100).
+    Retourne (pénalité_0_à_1, détails).
     """
     total_penalty = 0.0
-    activated = []
+    activated: list[dict[str, Any]] = []
 
     for pen in PENALTY_SYSTEM:
-        score = dimension_scores.get(pen.dimension, 1.0)
+        score = dim_scores_normalized.get(pen.dimension, 1.0)
         if score < pen.threshold:
             if pen.penalty_curve == "exponential":
                 deficit = (pen.threshold - score) / pen.threshold
                 penalty = pen.max_penalty * (1 - math.exp(-3 * deficit))
             elif pen.penalty_curve == "step":
                 penalty = pen.max_penalty
-            else:  # linear
+            else:
                 deficit = (pen.threshold - score) / pen.threshold
                 penalty = pen.max_penalty * deficit
 
             total_penalty += penalty
             activated.append({
-                "dimension": pen.dimension,
-                "score": round(score, 3),
-                "threshold": pen.threshold,
+                "dimension":       pen.dimension,
+                "score":           round(score, 3),
+                "threshold":       pen.threshold,
                 "penalty_applied": round(penalty, 3),
-                "description": pen.description,
+                "description":     pen.description,
             })
 
-    total_penalty = min(total_penalty, 0.40)
-    return total_penalty, activated
+    return min(total_penalty, 0.40), activated
 
 
 # =============================================================================
-# 10. Détection de domaine à partir du titre de poste
+# DÉTECTION DE DOMAINE
 # =============================================================================
 
-DOMAIN_TITLE_KEYWORDS: Dict[Domain, List[str]] = {
-    Domain.TECH: ["développeur", "developpeur", "ingénieur logiciel", "software",
-                   "devops", "data", "cybersécurité", "cybersecurite", "fullstack",
-                   "backend", "frontend", "mobile", "cloud", "architecte", "sre"],
-    Domain.FINANCE: ["comptable", "finance", "audit", "trésorerie", "tresorerie",
-                      "contrôleur", "controleur", "daf", "credit", "banque",
-                      "microfinance", "fiscalité", "fiscalite"],
-    Domain.HR: ["rh", "ressources humaines", "recrutement", "paie", "formation",
-                 "gpec", "talent", "people", "human resources"],
-    Domain.AGRICULTURE: ["agronome", "agricole", "agriculture", "agro",
-                          "élevage", "elevage", "cultures", "plantation"],
-    Domain.CONSTRUCTION: ["btp", "bâtiment", "batiment", "construction",
-                           "génie civil", "genie civil", "chantier", "architecte"],
-    Domain.HEALTH: ["médecin", "medecin", "infirmier", "pharmacien", "santé",
-                     "sante", "clinique", "hôpital", "hopital", "soins"],
-    Domain.LEGAL: ["juriste", "avocat", "legal", "juridique", "conformité",
-                    "conformite", "compliance", "notaire"],
-    Domain.EDUCATION: ["enseignant", "professeur", "formateur", "éducation",
-                        "education", "pédagogie", "pedagogie", "école", "ecole"],
-    Domain.LOGISTICS: ["logistique", "supply chain", "transport", "entrepôt",
-                        "entrepot", "magasinier", "douane"],
-    Domain.MARKETING: ["marketing", "communication", "digital", "brand",
-                        "social media", "community manager"],
-    Domain.SALES: ["commercial", "vente", "business developer", "kam",
-                    "account manager", "sales"],
-    Domain.TELECOM: ["télécom", "telecom", "réseau", "reseau", "fibre",
-                      "opérateur télécom"],
-    Domain.ENERGY: ["énergie", "energie", "électricien", "electricien",
-                     "électrique", "electrique", "solaire", "éolien", "eolien"],
-    Domain.MINING: ["mine", "minier", "géologue", "geologue", "extraction",
-                     "forage", "carrière", "carriere"],
-    Domain.HOSPITALITY: ["hôtel", "hotel", "restaurant", "tourisme", "accueil",
-                          "réception", "reception", "hospitality"],
-    Domain.MEDIA: ["journaliste", "journalism", "rédacteur", "redacteur",
-                    "média", "media", "presse", "tv", "radio"],
-    Domain.INSURANCE: ["assurance", "assureur", "actuaire", "sinistre",
-                        "courtier", "insurance"],
-    Domain.REAL_ESTATE: ["immobilier", "immobilier", "promoteur", "agent immobilier"],
-    Domain.CONSULTING: ["consultant", "conseil", "cabinet", "auditeur"],
-    Domain.PUBLIC_ADMIN: ["fonctionnaire", "administration", "préfet", "prefet"],
-    Domain.NGO: ["ong", "humanitaire", "développement international"],
-    Domain.PHARMA: ["pharmacien", "pharmaceutique", "médicament", "medicament"],
-    Domain.RETAIL: ["vendeur", "caissier", "magasin", "grande distribution"],
-    Domain.TRANSPORT: ["chauffeur", "conducteur", "routier", "maritime", "aérien"],
-    Domain.ENVIRONMENT: ["environnement", "environnementaliste", "rse", "durable"],
-    Domain.CRAFTSMANSHIP: ["artisan", "menuiserie", "plomberie", "électricien bâtiment"],
-    Domain.SECURITY: ["agent de sécurité", "vigile", "gardiennage", "sûreté"],
+_DOMAIN_DETECTION: dict[Domain, frozenset[str]] = {
+    Domain.TECH: frozenset({
+        "python", "java", "react", "docker", "kubernetes",
+        "api", "backend", "frontend", "devops", "software",
+        "développement logiciel", "informatique", "programmation",
+    }),
+    Domain.NETWORKS: frozenset({
+        "réseau", "network", "cybersécurité", "cisco", "firewall",
+        "switch", "vpn", "télécoms", "infrastructure réseau",
+    }),
+    Domain.ENGINEERING: frozenset({
+        "mécanique", "électrique", "conception", "autocad",
+        "solidworks", "bureau d'études", "ingénierie",
+    }),
+    Domain.SCIENCE: frozenset({
+        "laboratoire", "recherche", "publication", "thèse",
+        "protocole", "expérimentation", "chimie", "biologie",
+    }),
+    Domain.ENERGY: frozenset({
+        "pétrole", "mines", "forage", "géologie", "raffinage",
+        "énergie renouvelable", "solaire", "hydraulique",
+    }),
+    Domain.INDUSTRY: frozenset({
+        "production", "usine", "chaîne de montage", "lean",
+        "maintenance industrielle", "5s", "kaizen",
+    }),
+    Domain.QHSE: frozenset({
+        "hse", "qualité", "iso 9001", "iso 14001",
+        "sécurité au travail", "audit qualité", "non-conformité",
+    }),
+    Domain.SUPPLY_CHAIN: frozenset({
+        "achat", "supply chain", "approvisionnement", "logistique",
+        "fournisseur", "négociation achat", "erp", "stock", "sla",
+    }),
+    Domain.PURCHASING_MANAGER: frozenset({
+        "responsable achats", "chef des achats", "directeur achats",
+        "sla", "service-level agreement",
+    }),
+    Domain.ADMIN: frozenset({
+        "secrétariat", "assistante", "agenda", "courrier",
+        "accueil", "classement", "bureautique", "archivage",
+    }),
+    Domain.AGRI: frozenset({
+        "agriculture", "élevage", "agronomie", "semences",
+        "cultures", "agroalimentaire", "terrain agricole",
+    }),
+    Domain.ART: frozenset({
+        "design", "graphisme", "photographie", "illustration",
+        "créatif", "adobe", "figma", "ux", "ui", "artiste",
+    }),
+    Domain.BANKING: frozenset({
+        "banque", "assurance", "crédit", "risque", "bâle",
+        "conformité", "actuariat", "portefeuille clients",
+    }),
+    Domain.SALES: frozenset({
+        "vente", "commercial", "prospection", "crm", "ca",
+        "chiffre d'affaires", "b2b", "b2c", "négociation commerciale",
+    }),
+    Domain.ACCOUNTING: frozenset({
+        "comptabilité", "fiscalité", "bilan", "audit financier",
+        "ifrs", "ohada", "contrôle de gestion", "trésorerie",
+    }),
+    Domain.BTP: frozenset({
+        "construction", "btp", "chantier", "génie civil",
+        "maçonnerie", "conducteur de travaux", "bâtiment",
+    }),
+    Domain.LEGAL: frozenset({
+        "droit", "juridique", "contrat", "avocat", "notaire",
+        "procédure", "contentieux", "réglementation",
+    }),
+    Domain.EDUCATION: frozenset({
+        "enseignement", "formateur", "pédagogie", "curriculum",
+        "professeur", "élèves", "formation professionnelle",
+    }),
+    Domain.HOSPITALITY: frozenset({
+        "hôtellerie", "restauration", "cuisine", "chef",
+        "service en salle", "accueil client", "f&b",
+    }),
+    Domain.REAL_ESTATE: frozenset({
+        "immobilier", "transaction", "bail", "copropriété",
+        "expertise immobilière", "promotion immobilière",
+    }),
+    Domain.JOURNALISM: frozenset({
+        "journalisme", "rédaction", "médias", "presse",
+        "reportage", "édition", "publication", "contenu éditorial",
+    }),
+    Domain.MARKETING: frozenset({
+        "marketing", "communication", "stratégie digitale",
+        "seo", "sem", "brand", "campagne", "publicité",
+    }),
+    Domain.HR: frozenset({
+        "ressources humaines", "recrutement", "paie", "gpec",
+        "formation", "relations sociales", "rh", "talent",
+    }),
+    Domain.HEALTH: frozenset({
+        "médecin", "infirmier", "pharmacie", "santé", "clinique",
+        "patient", "soins", "hôpital", "médical",
+    }),
+    Domain.GENERAL_SERVICES: frozenset({
+        "maintenance", "facility", "nettoyage", "gardiennage",
+        "services généraux", "prestataires",
+    }),
+    Domain.INTERN: frozenset({
+        "stage", "jeune diplômé", "alternance", "apprentissage",
+    }),
+    Domain.TOURISM: frozenset({
+        "tourisme", "voyage", "hôtel", "agence de voyage",
+        "guide touristique", "loisirs",
+    }),
+    Domain.TRANSPORT: frozenset({
+        "transport", "logistique", "chauffeur", "fret",
+        "douane", "transit", "fleet management",
+    }),
+    Domain.SOCIAL: frozenset({
+        "travail social", "ong", "humanitaire", "développement communautaire",
+        "action sociale", "volontariat", "ngo",
+    }),
 }
 
 
-def detect_domain(title_lower: str, description_lower: str = "") -> Domain:
-    """
-    Détecte le domaine métier le plus probable à partir du titre de poste.
-    Combine titres + description pour améliorer la précision.
-    """
-    combined = f"{title_lower} {description_lower}"
-    scores: Dict[Domain, int] = {}
-
-    for domain, keywords in DOMAIN_TITLE_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in combined)
-        if score > 0:
-            scores[domain] = score
-
-    if not scores:
-        return Domain.CONSULTING  # Domaine par défaut
-
-    return max(scores, key=scores.get)
+def classify_domain(cv_text: str, job_title: str, job_requirements: str) -> Domain:
+    combined  = _norm(f"{cv_text} {job_title} {job_requirements}")
+    best      = Domain.TECH
+    best_hits = 0
+    for domain, signals in _DOMAIN_DETECTION.items():
+        hits = sum(1 for sig in signals if sig in combined)
+        if hits > best_hits:
+            best_hits = hits
+            best      = domain
+    return best
 
 
 # =============================================================================
-# 11. Détection du niveau hiérarchique
+# PROFILS DE DOMAINE (v1 — conservation intégrale)
+# =============================================================================
+
+_NON_TECH_WEIGHT_DEFAULT: dict[str, float] = {
+    "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+    "leadership": 0.10, "complexity": 0.25, "education": 0.05,
+}
+
+_DOMAIN_PROFILES: dict[Domain, DomainProfile] = {
+
+    Domain.SUPPLY_CHAIN: DomainProfile(
+        keywords=(
+            "achat", "approvisionnement", "supply chain", "erp", "sap",
+            "négociation", "fournisseur", "inventaire", "logistique",
+            "appel d'offres", "sourcing", "stock", "s&op",
+            "gestion des stocks", "planification", "prévision de la demande",
+            "réduction des coûts", "optimisation des achats", "contrat fournisseur",
+            "cahier des charges", "évaluation fournisseurs", "référencement fournisseur",
+            "commande", "bon de commande", "délai de livraison", "rupture de stock",
+            "just-in-time", "kanban", "lean supply chain", "audit fournisseur",
+            "panel fournisseurs", "portefeuille fournisseurs", "contrat-cadre",
+            "transport", "incoterms", "import", "export", "douane",
+            "demand planning", "master data", "edi", "p2p", "procure-to-pay",
+            "catalogue achats", "budget achats", "kpi achats", "tco",
+            "total cost of ownership", "achat durable", "rse fournisseurs",
+            "rfq", "rfp", "sourcing international", "centrale d'achat",
+            "vendor management", "sla fournisseur", "performance fournisseur",
+        ),
+        indicators={
+            "sap": 20, "erp": 15, "s&op": 20,
+            "négociation": 15, "sourcing international": 20, "réduction coûts": 15,
+        },
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+        leadership_terms=("chef des achats", "responsable supply chain", "directeur achats"),
+    ),
+
+    Domain.PURCHASING_MANAGER: DomainProfile(
+        keywords=(
+            "responsable achats", "chef des achats", "directeur achats",
+            "strategie achat", "sla", "gestion fournisseurs", "négociation achat",
+            "supply chain", "politique d'achat", "service level agreement",
+            "réduction des coûts", "p and l", "profit and loss",
+            "portefeuille fournisseurs", "gestion des contrats d'achat",
+            "wallet", "gestion des stocks", "gestion des approvisionnements",
+            "stock", "appel d'offres", "procédure d'achat",
+            "contrat-cadre", "cahier des charges", "évaluation fournisseurs",
+            "panel fournisseurs", "audit fournisseur", "référencement fournisseur",
+            "sourcing", "sourcing international", "centrale d'achat",
+            "budget achats", "kpi achats", "tco", "total cost of ownership",
+            "rfq", "rfp", "bon de commande", "commande", "catalogue achats",
+            "procure-to-pay", "p2p", "edi", "erp", "sap", "demand planning",
+            "performance fournisseur", "sla fournisseur", "vendor management",
+            "achat durable", "rse fournisseurs", "import", "export", "incoterms",
+            "plan d'achat", "stratégie de négociation", "économies d'achats",
+            "tableau de bord achats", "reporting achats", "délai de livraison",
+        ),
+        indicators={"sla": 20, "service-level agreement": 20, "slas": 20},
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+    ),
+
+    Domain.ADMIN: DomainProfile(
+        keywords=(
+            "secrétariat", "bureautique", "word", "excel", "agenda",
+            "courrier", "classement", "archivage", "accueil", "office",
+            "powerpoint", "outlook", "saisie", "rédaction administrative",
+            "compte rendu", "procès-verbal", "gestion administrative",
+            "secrétaire de direction", "assistante de direction",
+            "office manager", "gestion documentaire", "ged",
+            "numérisation", "tri du courrier", "standard téléphonique",
+            "planification", "réservation", "gestion des déplacements",
+            "organisation de réunions", "prise de notes", "frappe",
+            "mise en page", "publipostage", "office 365", "teams",
+            "sharepoint", "google workspace", "google docs", "google sheets",
+            "administration du personnel", "gestion des congés",
+            "tableau de bord", "suivi administratif", "relance",
+            "facturation", "devis", "bon de commande", "suivi des paiements",
+            "accueil physique", "accueil téléphonique", "agenda électronique",
+            "confidentialité", "discrétion", "polyvalence administrative",
+            "gestion des fournitures", "commandes de bureau",
+            "organisation d'événements", "protocole",
+        ),
+        indicators={"bilingue": 20, "office 365": 15, "gestion agenda": 15},
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+    ),
+
+    Domain.AGRI: DomainProfile(
+        keywords=(
+            "agronomie", "agriculture", "élevage", "cultures", "semences",
+            "irrigation", "fertilisation", "agroalimentaire", "phytosanitaire",
+            "agronome", "exploitation agricole", "gestion d'exploitation",
+            "production végétale", "production animale", "maraîchage",
+            "arboriculture", "viticulture", "sylviculture", "aquaculture",
+            "pisciculture", "aviculture", "bovins", "ovins", "caprins",
+            "sorgho", "maïs", "riz", "cacao", "café", "coton", "palmier à huile",
+            "intrants agricoles", "pesticides", "herbicides", "fongicides",
+            "engrais", "amendement", "compostage", "agriculture biologique",
+            "certification bio", "agriculture durable", "agroécologie",
+            "agroforesterie", "permaculture", "géospatial", "sig agricole",
+            "météorologie agricole", "chaîne de valeur agricole",
+            "stockage post-récolte", "transformation agroalimentaire",
+            "commercialisation agricole", "coopérative agricole",
+            "conseil agricole", "vulgarisation agricole", "financement agricole",
+            "crédit rural", "microcrédit agricole", "projet de développement rural",
+        ),
+        indicators={
+            "agriculture biologique": 20, "certification bio": 20,
+            "gestion d'exploitation": 15, "irrigation": 10,
+        },
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+    ),
+
+    Domain.ART: DomainProfile(
+        keywords=(
+            "design", "graphisme", "illustrator", "photoshop", "figma",
+            "ux", "ui", "créatif", "branding", "motion design",
+            "photographie", "vidéo", "3d", "after effects",
+            "direction artistique", "identité visuelle", "charte graphique",
+            "typographie", "mise en page", "infographie", "conception graphique",
+            "design d'interface", "design produit", "design web",
+            "ux research", "user testing", "wireframe", "prototype",
+            "sketch", "adobe xd", "indesign", "premiere pro",
+            "cinema 4d", "blender", "zbrush", "substance painter",
+            "animation 3d", "vfx", "storyboard", "illustration",
+            "dessin", "aquarelle", "peinture digitale", "retouche photo",
+            "color grading", "montage vidéo", "réalisation", "scénario",
+            "créativité", "concept art", "design thinking", "design system",
+            "accessibilité numérique", "responsive design", "mobile-first",
+            "landing page design", "ui kit", "design sprint",
+            "communication visuelle", "arts plastiques", "multimédia",
+        ),
+        indicators={
+            "direction artistique": 20, "identité visuelle": 15,
+            "motion design": 15, "ux research": 20,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+            "education": 0.10, "complexity": 0.25, "leadership": 0.05,
+        },
+    ),
+
+    Domain.BANKING: DomainProfile(
+        keywords=(
+            "banque", "assurance", "crédit", "risque", "portefeuille",
+            "conformité", "bâle iii", "solvabilité", "actuariat",
+            "kyc", "aml", "produits financiers", "taux",
+            "analyse financière", "trésorerie bancaire", "liquidité",
+            "fonds propres", "ratio de solvabilité", "stress test",
+            "risque de crédit", "risque de marché", "risque opérationnel",
+            "risque de liquidité", "notation financière", "scoring",
+            "recouvrement", "contentieux bancaire", "garantie bancaire",
+            "lettre de crédit", "trade finance", "financement structuré",
+            "marchés financiers", "obligations", "actions", "dérivés",
+            "swift", "sepa", "virement", "prélèvement", "mobile banking",
+            "fintech", "open banking", "paiements digitaux", "microfinance",
+            "crédit immobilier", "crédit consommation", "leasing",
+            "assurance vie", "assurance dommages", "courtage", "prévoyance",
+            "réassurance", "ifrs 9", "ifrs 17", "règlementation bancaire",
+            "contrôle interne bancaire", "audit bancaire", "inspection",
+            "direction des risques", "comité de crédit",
+        ),
+        indicators={
+            "bâle iii": 20, "kyc/aml": 20, "actuariat": 20,
+            "gestion risque": 15, "ifrs 9": 20,
+        },
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+    ),
+
+    Domain.SALES: DomainProfile(
+        keywords=(
+            "vente", "commercial", "prospection", "crm", "b2b", "b2c",
+            "négociation", "chiffre d'affaires", "pipeline", "closing",
+            "account manager", "fidélisation", "développement commercial",
+            "téléprospection", "cold calling", "lead generation",
+            "qualification", "cycle de vente", "funnel commercial",
+            "grand compte", "key account", "vente complexe",
+            "argumentaire de vente", "objections", "rebond commercial",
+            "upsell", "cross-sell", "panier moyen", "taux de conversion",
+            "quota", "objectifs commerciaux", "commissionnement",
+            "variable commerciale", "incentive", "sales force",
+            "salesforce", "hubspot", "zoho", "reporting commercial",
+            "tableau de bord commercial", "kpi ventes",
+            "prévision de ventes", "forecasting", "business development",
+            "partenariat commercial", "réseau de distribution",
+            "agent commercial", "vente indirecte", "vente directe",
+            "pitch commercial", "démonstration produit", "offre commerciale",
+            "devis", "proposition commerciale", "appel d'offres",
+            "renouvellement", "rétention client", "satisfaction client",
+            "nps", "customer success",
+        ),
+        indicators={
+            "développement commercial": 15, "grand compte": 20,
+            "b2b": 10, "crm": 10, "objectifs dépassés": 20,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+            "complexity": 0.25, "leadership": 0.10, "education": 0.05,
+        },
+        leadership_terms=("directeur commercial", "chef des ventes", "key account manager"),
+    ),
+
+    Domain.ACCOUNTING: DomainProfile(
+        keywords=(
+            "comptabilité", "fiscalité", "bilan", "ohada", "ifrs",
+            "contrôle de gestion", "audit", "trésorerie", "sage",
+            "déclarations fiscales", "rapprochement bancaire", "budget",
+            "comptabilité générale", "comptabilité analytique",
+            "comptabilité clients", "comptabilité fournisseurs",
+            "grand livre", "journal comptable", "balance", "liasse fiscale",
+            "compte de résultat", "flux de trésorerie", "cash flow",
+            "immobilisations", "amortissement", "provision", "charges",
+            "produits", "tva", "is", "impôt sur les sociétés", "cit",
+            "impôt sur le revenu", "paie comptable", "charges sociales",
+            "commissaire aux comptes", "expert-comptable", "commissariat",
+            "due diligence", "consolidation", "normes comptables",
+            "reporting financier", "états financiers", "normes ifrs",
+            "normes syscohada", "syscoa", "bsc", "budget prévisionnel",
+            "contrôle budgétaire", "suivi des coûts", "prix de revient",
+            "coûts standards", "écarts", "analyse des écarts",
+            "erp comptable", "odoo", "cegid", "wave", "navision",
+        ),
+        indicators={
+            "ifrs": 20, "ohada": 20, "audit externe": 20,
+            "contrôle de gestion": 15, "sage": 10,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+            "education": 0.10, "complexity": 0.25, "leadership": 0.05,
+        },
+    ),
+
+    Domain.BTP: DomainProfile(
+        keywords=(
+            "construction", "btp", "génie civil", "conducteur de travaux",
+            "chantier", "maçonnerie", "béton armé", "autocad",
+            "planification", "lot technique", "métré", "vrd",
+            "gros œuvre", "second œuvre", "infrastructure", "superstructure",
+            "terrassement", "fondations", "charpente", "couverture",
+            "plomberie", "électricité", "hvac", "climatisation",
+            "revêtement", "carrelage", "peinture bâtiment", "menuiserie",
+            "architecture", "plan d'exécution", "plan as-built",
+            "dossier technique", "permis de construire", "cctp",
+            "dpgf", "avant-métré", "appel d'offres btp", "budget chantier",
+            "planning travaux", "gantt", "ms project", "primavera",
+            "contrôle qualité chantier", "réception des travaux",
+            "levée de réserves", "ged chantier", "étude de sol",
+            "bureau de contrôle", "sps", "coordinateur sps",
+            "inspection travaux", "suivi technique", "visa",
+            "hse chantier", "plan phs", "prévention accidents",
+            "bim", "revit", "maquette numérique",
+        ),
+        indicators={
+            "conducteur de travaux senior": 20, "autocad": 15,
+            "gestion multi-chantiers": 20, "vrd": 15, "béton armé": 10,
+        },
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+        leadership_terms=("directeur de travaux", "chef de chantier", "ingénieur génie civil"),
+    ),
+
+    Domain.LEGAL: DomainProfile(
+        keywords=(
+            "droit", "juridique", "contrat", "contentieux", "procédure",
+            "réglementation", "conformité", "ohada", "droit du travail",
+            "droit des sociétés", "code civil", "tribunal",
+            "avocat", "juriste", "conseil juridique", "veille juridique",
+            "droit des affaires", "droit commercial", "droit fiscal",
+            "droit pénal", "droit administratif", "droit international",
+            "arbitrage", "médiation", "conciliation", "négociation juridique",
+            "acte juridique", "statuts", "pacte d'actionnaires",
+            "protocole d'accord", "mou", "nda", "contrat de travail",
+            "convention collective", "règlement intérieur",
+            "relations sociales", "licenciement", "rupture conventionnelle",
+            "prud'hommes", "conseil d'état", "cour d'appel",
+            "due diligence juridique", "audit juridique", "conformité réglementaire",
+            "protection des données", "rgpd", "propriété intellectuelle",
+            "marque", "brevet", "droit d'auteur", "contrats internationaux",
+            "droit ohada", "acte uniforme", "registre du commerce",
+            "immatriculation", "dissolution", "liquidation",
+        ),
+        indicators={
+            "droit ohada": 20, "contentieux complexe": 20,
+            "contrats internationaux": 20, "droit des affaires": 15,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+            "education": 0.10, "complexity": 0.25, "leadership": 0.05,
+        },
+    ),
+
+    Domain.EDUCATION: DomainProfile(
+        keywords=(
+            "enseignement", "formation", "pédagogie", "curriculum",
+            "e-learning", "évaluation", "professeur", "ingénierie pédagogique",
+            "formateur", "instructeur", "facilitateur", "coach",
+            "enseignant", "tuteur", "mentor", "programme scolaire",
+            "syllabus", "plan de cours", "objectifs pédagogiques",
+            "compétences", "évaluation formative", "évaluation sommative",
+            "contrôle continu", "examen", "certification",
+            "formation professionnelle", "développement des compétences",
+            "formation initiale", "formation continue", "upskilling",
+            "reskilling", "lms", "moodle", "google classroom",
+            "blended learning", "classe inversée", "gamification",
+            "pédagogie active", "apprentissage par projet",
+            "différenciation pédagogique", "inclusion scolaire",
+            "soutien scolaire", "remédiation", "accompagnement",
+            "orientation scolaire", "conseil pédagogique",
+            "administration scolaire", "direction d'établissement",
+            "inspection pédagogique", "recherche en éducation",
+            "thèse", "publication académique", "université",
+        ),
+        indicators={
+            "ingénierie pédagogique": 20, "e-learning": 15,
+            "formation certifiante": 20,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.35, "experience": 0.15,
+            "education": 0.10, "complexity": 0.25, "leadership": 0.05,
+        },
+    ),
+
+    Domain.HOSPITALITY: DomainProfile(
+        keywords=(
+            "hôtellerie", "restauration", "cuisine", "service en salle",
+            "f&b", "sommellerie", "haccp", "réception", "housekeeping",
+            "hôtel", "restaurant", "brigade", "chef cuisinier", "chef de partie",
+            "commis de cuisine", "pâtisserie", "boulangerie", "traiteur",
+            "banquet", "événementiel", "room service", "concierge",
+            "réservation", "check-in", "check-out", "pms",
+            "front office", "back office", "yield management",
+            "revenue management", "taux d'occupation", "revpar",
+            "guest experience", "satisfaction client", "qualité hôtelière",
+            "classification hôtelière", "étoiles", "label qualité",
+            "bar", "cave à vins", "cocktail", "mixologie",
+            "menu", "carte", "food cost", "ratio matière",
+            "gestion des stocks restauration", "approvisionnement cuisine",
+            "normes sanitaires", "hygiène alimentaire", "traçabilité",
+            "plan de nettoyage", "désinfection", "contrôle qualité alimentaire",
+            "maître d'hôtel", "directeur de restaurant", "directeur d'hôtel",
+            "manager f&b", "directeur hébergement",
+        ),
+        indicators={
+            "étoile michelin": 20, "haccp": 15,
+            "revenue management": 20, "classification hôtelière": 15,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.30, "experience": 0.35,
+            "education": 0.18, "complexity": 0.20, "leadership": 0.05,
+        },
+    ),
+
+    Domain.REAL_ESTATE: DomainProfile(
+        keywords=(
+            "immobilier", "transaction", "bail", "promotion immobilière",
+            "expertise", "copropriété", "aménagement", "négociation immobilière",
+            "agent immobilier", "mandataire immobilier", "courtier immobilier",
+            "vente immobilière", "location", "gestion locative", "syndic",
+            "bien immobilier", "appartement", "villa", "immeuble", "terrain",
+            "foncier", "lotissement", "programme immobilier", "vefa",
+            "permis de construire", "plan local d'urbanisme", "plu",
+            "dossier de financement", "prêt immobilier", "crédit immobilier",
+            "taux immobilier", "apport personnel", "garantie hypothécaire",
+            "acte de vente", "notaire", "compromis de vente",
+            "promesse de vente", "due diligence immobilière",
+            "état des lieux", "quittance de loyer", "charges locatives",
+            "évaluation immobilière", "estimation immobilière", "valeur vénale",
+            "diagnostic immobilier", "dpe", "amiante", "plomb",
+            "réhabilitation", "rénovation", "travaux immobiliers",
+            "gestion de patrimoine immobilier", "investissement locatif",
+            "rendement locatif", "fiscalité immobilière", "sci",
+        ),
+        indicators={
+            "promotion immobilière": 20, "expertise immobilière": 20,
+            "vente de programmes": 15,
+        },
+        weight_overrides={
+            "keyword": 0.20, "semantic": 0.35, "experience": 0.25,
+            "education": 0.08, "complexity": 0.07, "leadership": 0.05,
+        },
+    ),
+
+    Domain.JOURNALISM: DomainProfile(
+        keywords=(
+            "journalisme", "rédaction", "presse", "reportage", "médias",
+            "enquête", "édition", "contenu éditorial", "interview",
+            "photojournalisme", "digital media",
+            "journaliste", "rédacteur", "chroniqueur", "correspondant",
+            "grand reporter", "envoyé spécial", "pigiste", "freelance",
+            "news", "actualité", "breaking news", "fact-checking",
+            "vérification des faits", "sources journalistiques",
+            "déontologie journalistique", "liberté de la presse",
+            "journal", "magazine", "web média", "blog", "newsletter",
+            "podcast", "radio", "télévision", "web tv", "streaming",
+            "réseaux sociaux", "twitter journalisme", "community manager",
+            "seo éditorial", "trafic", "audience", "analytics",
+            "éditeur en chef", "rédacteur en chef", "secrétaire de rédaction",
+            "maquette presse", "une", "titraille", "photographie de presse",
+            "agence de presse", "fil d'information", "dépêche", "revue de presse",
+            "veille médias", "relations presse", "attaché de presse",
+        ),
+        indicators={
+            "grand reportage": 20, "rédacteur en chef": 20, "digital media": 15,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.40, "experience": 0.20,
+            "education": 0.08, "complexity": 0.27, "leadership": 0.05,
+        },
+    ),
+
+    Domain.MARKETING: DomainProfile(
+        keywords=(
+            "marketing", "communication", "seo", "sem", "google ads",
+            "social media", "brand", "campagne", "inbound", "cms",
+            "stratégie digitale", "content marketing", "kpi",
+            "marketing digital", "marketing opérationnel", "marketing stratégique",
+            "étude de marché", "segmentation", "ciblage", "positionnement",
+            "mix marketing", "4p", "persona", "customer journey",
+            "tunnel de conversion", "acquisition", "rétention", "fidélisation",
+            "email marketing", "newsletter", "automation marketing",
+            "marketing automation", "hubspot", "mailchimp", "sendinblue",
+            "facebook ads", "instagram ads", "linkedin ads", "tiktok ads",
+            "google analytics", "tag manager", "pixel", "a/b testing",
+            "landing page", "conversion rate optimization", "cro",
+            "affiliation", "influence marketing", "influenceur",
+            "community management", "gestion des réseaux sociaux",
+            "brand management", "notoriété", "image de marque",
+            "plan de communication", "brief créatif", "message marketing",
+            "rp", "relations publiques", "événementiel marketing",
+            "trade marketing", "merchandising", "plv",
+        ),
+        indicators={
+            "stratégie omnicanale": 20, "google ads": 15,
+            "brand management": 20, "inbound marketing": 15,
+            "marketing automation": 20,
+        },
+        weight_overrides={
+            "keyword": 0.25, "semantic": 0.35, "experience": 0.18,
+            "education": 0.07, "complexity": 0.10, "leadership": 0.05,
+        },
+    ),
+
+    Domain.HR: DomainProfile(
+        keywords=(
+            "recrutement", "paie", "gpec", "sirh", "droit du travail",
+            "formation", "relations sociales", "talent management",
+            "onboarding", "évaluation des performances", "rémunération",
+            "ressources humaines", "gestion des ressources humaines",
+            "gestion des talents", "marque employeur", "employer branding",
+            "sourcing candidats", "entretien de recrutement",
+            "assessment center", "intégration", "période d'essai",
+            "plan de formation", "besoin en formation", "cpf",
+            "plan de développement", "coaching", "feedback 360",
+            "entretien annuel", "entretien professionnel",
+            "gestion de carrière", "mobilité interne", "succession planning",
+            "contrat de travail", "avenant", "rupture conventionnelle",
+            "licenciement", "procédure disciplinaire", "sanctions",
+            "délégués du personnel", "comité social et économique", "cse",
+            "syndicats", "négociation collective", "accord d'entreprise",
+            "règlement intérieur", "politique rh", "charte rh",
+            "absentéisme", "turnover", "taux de rotation", "engagement",
+            "qvt", "qualité de vie au travail", "bien-être", "rsst",
+            "diversité", "inclusion", "égalité professionnelle",
+        ),
+        indicators={
+            "gpec": 20, "sirh": 15, "négociation syndicale": 20,
+            "talent management": 15, "rémunération variable": 10,
+        },
+        weight_overrides={
+            "keyword": 0.22, "semantic": 0.33, "experience": 0.20,
+            "education": 0.10, "complexity": 0.10, "leadership": 0.05,
+        },
+        leadership_terms=("drh", "directeur des ressources humaines", "hr business partner"),
+    ),
+
+    Domain.HEALTH: DomainProfile(
+        keywords=(
+            "médecine", "soins infirmiers", "pharmacie", "chirurgie",
+            "diagnostic", "patient", "urgences", "bloc opératoire",
+            "radiologie", "biologie médicale", "clinique", "protocole médical",
+            "médecin", "infirmier", "infirmière", "aide-soignant",
+            "sage-femme", "kinésithérapeute", "orthophoniste",
+            "psychologue", "psychiatre", "cardiologue", "pédiatre",
+            "dermatologue", "ophtalmologue", "gynécologue", "urologue",
+            "orthopédiste", "anesthésiste", "réanimation", "soins intensifs",
+            "unité de soins", "consultation", "hospitalisation",
+            "ambulatoire", "télémédecine", "dossier médical",
+            "dossier patient informatisé", "dpi", "prescription",
+            "ordonnance", "traitement", "thérapie", "médicament",
+            "pharmacovigilance", "essai clinique", "recherche médicale",
+            "santé publique", "épidémiologie", "prévention",
+            "vaccination", "dépistage", "promotion de la santé",
+            "hygiène hospitalière", "infection nosocomiale",
+            "stérilisation", "biomédicale", "dispositif médical",
+        ),
+        indicators={
+            "spécialité médicale": 25, "chef de service": 20,
+            "recherche clinique": 20, "urgences": 15,
+        },
+        weight_overrides={
+            "keyword": 0.04, "semantic": 0.30, "experience": 0.30,
+            "education": 0.23, "complexity": 0.10, "leadership": 0.03,
+        },
+    ),
+
+    Domain.GENERAL_SERVICES: DomainProfile(
+        keywords=(
+            "facility management", "maintenance", "nettoyage", "gardiennage",
+            "prestataires", "services généraux", "parc automobile", "hse",
+            "gestion des installations", "facilities", "building management",
+            "entretien des locaux", "propreté", "nettoyage industriel",
+            "sécurité des bâtiments", "contrôle d'accès", "vidéosurveillance",
+            "alarme incendie", "sécurité incendie", "évacuation",
+            "maintenance préventive", "maintenance curative",
+            "maintenance corrective", "gmao", "ticketing maintenance",
+            "prestataires de services", "contrats de maintenance",
+            "appel d'offres prestataires", "sla prestataires",
+            "espaces verts", "jardinage", "entretien extérieur",
+            "gestion des déchets", "tri sélectif", "développement durable",
+            "flotte automobile", "gestion des véhicules", "carnet d'entretien",
+            "assurance flotte", "télématique", "gps",
+            "énergie", "eau", "électricité", "gaz", "fluides",
+            "réduction des coûts énergie", "audit énergétique",
+            "plan de prévention", "document unique", "risques professionnels",
+            "espace de travail", "aménagement des bureaux",
+        ),
+        indicators={"facility management": 20, "gestion prestataires": 15},
+        weight_overrides={
+            "keyword": 0.20, "semantic": 0.35, "experience": 0.25,
+            "education": 0.08, "complexity": 0.07, "leadership": 0.05,
+        },
+    ),
+
+    Domain.INTERN: DomainProfile(
+        keywords=(
+            "stage", "alternance", "apprentissage", "projet académique",
+            "mémoire", "rapport de stage",
+            "stagiaire", "alternant", "apprenti", "étudiant",
+            "licence", "master", "bts", "dut", "bachelor",
+            "première expérience", "début de carrière", "junior",
+            "encadrement", "tuteur de stage", "maître d'apprentissage",
+            "projet de fin d'études", "pfe", "soutenance", "jury",
+            "convention de stage", "contrat d'apprentissage",
+            "contrat de professionnalisation", "formation en alternance",
+            "centre de formation", "cfai", "cfa",
+            "compétences transversales", "savoir-être", "soft skills",
+            "motivation", "curiosité", "rigueur", "ponctualité",
+            "travail en équipe", "adaptabilité", "autonomie",
+            "langue étrangère", "anglais scolaire", "niveau b2",
+            "excel basique", "word traitement de texte",
+            "initiation professionnelle", "découverte métier",
+            "immersion professionnelle", "projet transversal",
+            "stage longue durée", "stage de fin d'études",
+        ),
+        indicators={"projet transversal": 10, "stage longue durée": 15},
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+    ),
+
+    Domain.TOURISM: DomainProfile(
+        keywords=(
+            "tourisme", "voyage", "agence de voyage", "guide touristique",
+            "billetterie", "crm touristique", "gds", "amadeus",
+            "tour opérateur", "to", "voyagiste", "circuit touristique",
+            "package voyage", "séjour", "excursion", "croisière",
+            "tourisme d'affaires", "mice", "congrès", "séminaire",
+            "tourisme balnéaire", "tourisme culturel", "écotourisme",
+            "tourisme solidaire", "tourisme de luxe", "tourisme local",
+            "office du tourisme", "destination marketing",
+            "booking", "réservation en ligne", "hébergement touristique",
+            "hôtel", "auberge de jeunesse", "gîte", "airbnb", "campsite",
+            "transport touristique", "transfert aéroport",
+            "guide de voyage", "interprète touristique",
+            "visa", "passeport", "assurance voyage", "assistance",
+            "galileo", "sabre", "worldspan", "travelport",
+            "tarification aérienne", "yield aérien", "billet d'avion",
+            "tourisme médical", "wellness tourism", "agritourisme",
+            "itinéraire", "road trip", "travel blogger",
+        ),
+        indicators={"amadeus": 20, "gds": 15, "tourisme international": 20},
+        weight_overrides=_NON_TECH_WEIGHT_DEFAULT,
+    ),
+
+    Domain.TRANSPORT: DomainProfile(
+        keywords=(
+            "transport", "logistique", "chauffeur", "fret", "douane",
+            "transit", "affrètement", "tms", "déclaration en douane",
+            "incoterms", "fleet management",
+            "transport routier", "transport maritime", "transport aérien",
+            "transport ferroviaire", "multimodal", "intermodal",
+            "commissionnaire de transport", "freight forwarder",
+            "transitaire", "freight broker", "courtier de fret",
+            "bill of lading", "connaissement", "airway bill", "cmr",
+            "import", "export", "dédouanement", "tarif douanier",
+            "nomenclature douanière", "hs code", "origine des marchandises",
+            "entrepôt sous douane", "mise à la consommation",
+            "fret aérien", "fret maritime", "conteneur", "vrac",
+            "palettisation", "emballage", "conditionnement",
+            "messagerie", "express", "courrier", "dernier kilomètre",
+            "livraison", "tournée", "optimisation des tournées",
+            "routing", "gps", "télématique", "géolocalisation",
+            "réglementation transport", "adr", "matières dangereuses",
+            "conducteur poids lourd", "permis de conduire",
+        ),
+        indicators={
+            "incoterms": 20, "tms": 20,
+            "affrètement international": 20, "douane": 15, "fleet management": 15,
+        },
+        weight_overrides={
+            "keyword": 0.25, "semantic": 0.30, "experience": 0.25,
+            "education": 0.08, "complexity": 0.07, "leadership": 0.05,
+        },
+    ),
+
+    Domain.SOCIAL: DomainProfile(
+        keywords=(
+            "travail social", "ong", "humanitaire", "développement communautaire",
+            "action sociale", "volontariat", "projet social", "plaidoyer",
+            "protection sociale", "assistance aux personnes vulnérables",
+            "assistant social", "travailleur social", "éducateur spécialisé",
+            "animateur socioculturel", "coordinateur", "chef de projet social",
+            "bénévolat", "service civique", "corps de la paix",
+            "droits humains", "droits de l'homme", "genre", "égalité",
+            "inclusion sociale", "lutte contre la pauvreté",
+            "protection de l'enfance", "violences basées sur le genre",
+            "vbg", "autonomisation des femmes", "jeunesse",
+            "développement local", "participation communautaire",
+            "diagnostic communautaire", "enquête sociale",
+            "gestion de cas", "case management", "suivi bénéficiaires",
+            "rapport de mission", "monitoring évaluation", "me",
+            "bailleurs de fonds", "donors", "ue", "usaid", "banque mondiale",
+            "gestion de projet ong", "cadre logique", "logframe",
+            "rapport narratif", "rapport financier bailleur",
+            "appel à propositions", "concept note", "proposal writing",
+            "terrain humanitaire", "urgence humanitaire", "camp de réfugiés",
+        ),
+        indicators={
+            "gestion de projet ong": 20, "plaidoyer": 15,
+            "financement bailleur": 20, "développement communautaire": 15,
+        },
+        weight_overrides={
+            "keyword": 0.20, "semantic": 0.40, "experience": 0.18,
+            "education": 0.12, "complexity": 0.05, "leadership": 0.05,
+        },
+    ),
+
+    Domain.NETWORKS: DomainProfile(
+        keywords=(
+            "réseau", "cisco", "firewall", "switch", "vpn", "infrastructure",
+            "cybersécurité", "pentest", "soc", "ids", "ips", "télécoms",
+            "5g", "lte", "sd-wan",
+            "routeur", "vlan", "tcp/ip", "dns", "dhcp", "bgp", "ospf",
+            "mpls", "wan", "lan", "wifi", "bluetooth", "nfc",
+            "fortinet", "palo alto", "checkpoint", "juniper",
+            "sophos", "stormshield", "snort", "suricata",
+            "siem", "splunk", "elk", "graylog", "qradar",
+            "edr", "ndr", "xdr", "zero trust", "ztna",
+            "identity access management", "iam", "ldap", "active directory",
+            "okta", "sso", "mfa", "pki", "certificats ssl tls",
+            "cloud networking", "aws vpc", "azure networking",
+            "nist", "iso 27001", "pci dss", "rgpd technique",
+            "test d'intrusion", "vulnerability assessment", "ctf",
+            "malware analysis", "threat intelligence", "incident response",
+            "voip", "sip", "unified communications", "uc",
+            "télécommunications", "fibre optique", "4g", "backbone",
+        ),
+        indicators={
+            "pentest": 20, "soc": 20, "sd-wan": 20,
+            "certifié ccna": 20, "certifié cissp": 25,
+        },
+        weight_overrides={
+            "keyword": 0.25, "semantic": 0.30, "experience": 0.20,
+            "certification": 0.10, "complexity": 0.10,
+            "education": 0.03, "leadership": 0.02,
+        },
+    ),
+
+    Domain.ENGINEERING: DomainProfile(
+        keywords=(
+            "mécanique", "électrique", "hydraulique", "conception", "autocad",
+            "solidworks", "catia", "bureau d'études", "simulation", "erd",
+            "maintenance préventive",
+            "génie mécanique", "génie électrique", "génie industriel",
+            "thermodynamique", "résistance des matériaux", "rdm",
+            "éléments finis", "fem", "cfm", "cfd",
+            "prototypage", "fabrication", "procédés de fabrication",
+            "usinage", "soudure", "chaudronnerie", "tuyauterie",
+            "électronique", "automatisme", "plc", "api",
+            "siemens", "schneider", "allen bradley", "hmi", "scada",
+            "instrumentation", "capteur", "mesure", "calibration",
+            "maintenance industrielle", "fiabilité", "mttf", "mttr",
+            "gmao", "maintenance totale", "tpm",
+            "gestion de projet technique", "planning", "jalons",
+            "normes techniques", "iso", "en", "astm", "asme",
+            "certification de produit", "homologation", "essais",
+            "calcul de structure", "dimensionnement", "contraintes",
+            "tolérances", "métrologie", "contrôle qualité",
+            "audit technique", "revue de conception",
+        ),
+        indicators={
+            "catia": 20, "simulation cfd": 20,
+            "certification iso": 15, "projet r&d": 15,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.30, "experience": 0.30,
+            "certification": 0.05, "complexity": 0.15,
+            "education": 0.07, "leadership": 0.02,
+        },
+    ),
+
+    Domain.SCIENCE: DomainProfile(
+        keywords=(
+            "laboratoire", "protocole", "expérimentation", "publication",
+            "thèse", "r&d", "chimie", "biologie", "statistiques",
+            "matlab", "spss", "r", "python",
+            "recherche scientifique", "sciences fondamentales",
+            "sciences appliquées", "physique", "mathématiques",
+            "biochimie", "microbiologie", "génétique", "immunologie",
+            "virologie", "botanique", "zoologie", "écologie",
+            "chimie organique", "chimie analytique", "chimie physique",
+            "chromatographie", "spectroscopie", "électrophorèse", "pcr",
+            "cell culture", "culture cellulaire", "flow cytometry",
+            "imagerie médicale", "histologie", "anatomopathologie",
+            "analyse de données", "big data", "machine learning scientifique",
+            "modélisation", "simulation numérique", "calcul scientifique",
+            "hpc", "cluster", "publication indexée", "peer review",
+            "brevet", "propriété intellectuelle scientifique",
+            "financement de la recherche", "anr", "h2020",
+            "rapport d'avancement", "revue bibliographique",
+            "état de l'art", "doctorat", "post-doctorat", "habilitation",
+        ),
+        indicators={
+            "publication indexée": 25, "thèse": 20,
+            "brevet": 20, "financement recherche": 15,
+        },
+        weight_overrides={
+            "keyword": 0.10, "semantic": 0.30, "experience": 0.20,
+            "certification": 0.05, "complexity": 0.15,
+            "education": 0.15, "leadership": 0.05,
+        },
+    ),
+
+    Domain.ENERGY: DomainProfile(
+        keywords=(
+            "pétrole", "mines", "forage", "géologie", "raffinage",
+            "énergie renouvelable", "solaire", "hydraulique", "reservoir",
+            "hse pétrolier", "offshore",
+            "gaz naturel", "gaz de pétrole", "gnl", "gpl",
+            "pipeline", "transport d'hydrocarbures", "stockage",
+            "exploration pétrolière", "sismique", "géophysique",
+            "pétrophysique", "diagraphie", "carottage",
+            "drilling", "well completion", "stimulation",
+            "production pétrolière", "enhanced oil recovery", "eor",
+            "reservoir simulation", "modélisation de réservoir",
+            "éolien", "éolienne offshore", "solaire photovoltaïque",
+            "solaire thermique", "biomasse", "biogaz",
+            "géothermie", "hydroélectricité", "stockage d'énergie",
+            "batterie", "hydrogène", "pile à combustible",
+            "réseau électrique", "smart grid", "power plant",
+            "centrale thermique", "centrale solaire", "centrale hydraulique",
+            "mining", "extraction minière", "minerai", "or", "diamant",
+            "cuivre", "bauxite", "phosphate", "traitement des minerais",
+            "métallurgie", "hydrométallurgie", "pyrométallurgie",
+        ),
+        indicators={
+            "offshore": 20, "reservoir engineering": 25,
+            "hse pétrolier": 20, "énergie solaire": 15,
+        },
+        weight_overrides={
+            "keyword": 0.25, "semantic": 0.30, "experience": 0.25,
+            "certification": 0.05, "complexity": 0.10,
+            "education": 0.03, "leadership": 0.02,
+        },
+    ),
+
+    Domain.INDUSTRY: DomainProfile(
+        keywords=(
+            "production", "usine", "lean manufacturing", "5s", "kaizen",
+            "maintenance industrielle", "chaîne de montage", "plc",
+            "automatisme", "erp", "ordonnancement",
+            "chef de production", "responsable de production",
+            "directeur d'usine", "responsable usine",
+            "amélioration continue", "amélioration des processus",
+            "six sigma", "black belt", "green belt", "vsm",
+            "tpm", "smed", "poka yoke", "jidoka",
+            "takt time", "cycle time", "efficacité globale", "trs", "oee",
+            "contrôle de production", "suivi de production",
+            "planning de production", "ordonnancement de fabrication",
+            "gestion de la production", "mrp", "mrp2",
+            "qualité de production", "contrôle qualité",
+            "non-conformité", "rebut", "retraitement",
+            "traçabilité", "gestion des lots", "sérialisation",
+            "emballage industriel", "conditionnement",
+            "gestion des flux", "flux physiques",
+            "gestion des outillages", "gestionnaire outillage",
+            "sécurité industrielle", "epi", "plan de prévention",
+            "habilitations électriques", "caces", "travail en hauteur",
+        ),
+        indicators={
+            "lean manufacturing": 20, "automatisme plc": 20,
+            "tpm": 15, "six sigma": 25,
+        },
+        weight_overrides={
+            "keyword": 0.25, "semantic": 0.30, "experience": 0.25,
+            "certification": 0.05, "complexity": 0.10,
+            "education": 0.03, "leadership": 0.02,
+        },
+    ),
+
+    Domain.QHSE: DomainProfile(
+        keywords=(
+            "hse", "qualité", "iso 9001", "iso 14001", "ohsas 18001",
+            "iso 45001", "audit qualité", "non-conformité", "plan de prévention",
+            "document unique", "analyse des risques",
+            "responsable qhse", "directeur qhse", "animateur sécurité",
+            "ingénieur hse", "technicien qse",
+            "système de management", "smq", "sme", "sms",
+            "certification", "recertification", "surveillance", "tierce partie",
+            "accréditation", "cofrac", "iatf 16949", "iso 13485",
+            "iso 22000", "haccp", "brc", "ifs",
+            "risque professionnel", "évaluation des risques", "duer",
+            "plan d'action", "suivi des actions correctives",
+            "action préventive", "amélioration continue",
+            "indicateurs qualité", "kpi qualité", "tableau de bord qhse",
+            "revue de direction", "audit interne", "audit externe",
+            "programme d'audit", "rapport d'audit",
+            "accident du travail", "enquête accident", "arbre des causes",
+            "presqu'accident", "near miss", "reporting sécurité",
+            "formation sécurité", "sensibilisation", "causerie sécurité",
+            "permit to work", "permis de travail", "lock out tag out",
+            "environnement", "émissions", "déchets industriels",
+            "sol pollué", "dépollution", "veille réglementaire",
+        ),
+        indicators={
+            "iso 9001": 20, "iso 45001": 20,
+            "audit tierce partie": 20, "analyse des risques": 15,
+        },
+        weight_overrides={
+            "keyword": 0.25, "semantic": 0.30, "experience": 0.20,
+            "certification": 0.10, "complexity": 0.10,
+            "education": 0.03, "leadership": 0.02,
+        },
+    ),
+}
+
+_FALLBACK_PROFILE = DomainProfile()
+
+# =============================================================================
+# PERTINENCE DU DIPLÔME PAR DOMAINE
+# =============================================================================
+
+_EDUCATION_RELEVANCE: dict[Domain, tuple[str, ...]] = {
+    Domain.ACCOUNTING: ("comptabilité", "finance", "gestion", "fiscalité", "ohada", "ifrs", "sage"),
+    Domain.BANKING:    ("banque", "finance", "économie", "actuariat"),
+    Domain.TECH:       ("informatique", "développement", "ingénieur", "systèmes"),
+    Domain.MARKETING:  ("marketing", "communication", "digital"),
+    Domain.HR:         ("ressources humaines", "rh"),
+    Domain.BTP:        ("génie civil", "bâtiment", "architecture"),
+    Domain.AGRI:       ("agronomie", "agriculture"),
+    Domain.LEGAL:      ("droit", "juridique"),
+    Domain.HEALTH:     ("médecine", "pharmacie"),
+    Domain.SALES:      ("commerce", "vente"),
+}
+
+# =============================================================================
+# DÉTECTION DU NIVEAU HIÉRARCHIQUE (v2 — remplace detect_professional_level)
 # =============================================================================
 
 def detect_hierarchy_level(title_lower: str) -> HierarchyLevel:
-    """
-    Détecte le niveau hiérarchique à partir du titre de poste.
-    Priorité : DIRECTION > MANAGER_SENIOR > MANAGER_INTERMEDIAIRE > COLLABORATEUR
-    """
-    # Vérification par ordre de priorité décroissante
     for level in [HierarchyLevel.DIRECTION, HierarchyLevel.MANAGER_SENIOR,
                   HierarchyLevel.MANAGER_INTERMEDIAIRE]:
-        markers = HIERARCHY_TITLE_MARKERS[level]
-        for marker in markers:
+        for marker in HIERARCHY_TITLE_MARKERS[level]:
             if marker in title_lower:
                 return level
-
     return HierarchyLevel.COLLABORATEUR
 
 
-# =============================================================================
-# 12. Détection du niveau d'éducation
-# =============================================================================
-
-def detect_education_level(education_text: str) -> str:
+def detect_professional_level(cv_text: str, job_title: str = "") -> ProfessionalLevel:
     """
-    Détecte le plus haut niveau d'éducation mentionné dans le texte.
-    Retourne la clé EDUCATION_LEVEL_ORDER correspondante.
+    Conservé pour compatibilité ascendante.
+    Utilise detect_hierarchy_level en interne puis mappe vers ProfessionalLevel.
     """
-    text_lower = education_text.lower()
-    best_level = "none"
-    best_index = 0
-
-    for level_key, markers in EDUCATION_MARKERS.items():
-        for marker in markers:
-            if marker in text_lower:
-                try:
-                    level_index = EDUCATION_LEVEL_ORDER.index(level_key)
-                    if level_index > best_index:
-                        best_index = level_index
-                        best_level = level_key
-                except ValueError:
-                    pass
-                break
-
-    return best_level
+    text = _norm(f"{cv_text} {job_title}")
+    hier = detect_hierarchy_level(text)
+    return _HIER_TO_PROF.get(hier, ProfessionalLevel.MID_LEVEL)
 
 
 # =============================================================================
-# 13. Scoring de l'expérience
+# CONSTRUCTION DES TEXTES DE SCORING
 # =============================================================================
 
-def compute_experience_score(
-    cv_years: float,
-    required_years: float,
-    hierarchy_level: HierarchyLevel,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score d'expérience normalisé (0-1).
-    Utilise une courbe sigmoïde pour éviter de pénaliser les seniors trop expérimentés.
-    """
-    profile = HIERARCHY_PROFILES[hierarchy_level]
+def _build_cv_text(cv: dict[str, Any]) -> str:
+    ai_data: dict[str, Any] = {}
+    raw_ai = cv.get("ai_extracted_data")
+    if isinstance(raw_ai, str):
+        try:
+            ai_data = json.loads(raw_ai)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    elif isinstance(raw_ai, dict):
+        ai_data = raw_ai
 
-    if required_years <= 0:
-        ratio = min(cv_years / 5.0, 1.0) if cv_years > 0 else 0.0
+    work_history = (
+        safe_dict_list(cv.get("work_history"))
+        or safe_dict_list(ai_data.get("work_history"))
+    )
+    projects = (
+        safe_dict_list(cv.get("projects"))
+        or safe_dict_list(ai_data.get("projects"))
+    )
+    education = (
+        safe_dict_list(cv.get("education"))
+        or safe_dict_list(ai_data.get("education"))
+    )
+    skills = (
+        safe_list(cv.get("skills"))
+        or safe_list(ai_data.get("skills"))
+    )
+    certifications = (
+        safe_list(cv.get("certifications"))
+        or safe_list(ai_data.get("certifications"))
+    )
+
+    parts: list[str] = [
+        str(cv.get("summary", "") or ai_data.get("summary", "")),
+        str(cv.get("current_position", "") or ai_data.get("current_position", "")),
+        " ".join(skills),
+        " ".join(certifications),
+    ]
+    for job in work_history:
+        parts += [
+            str(job.get("title", "")),
+            str(job.get("company", "")),
+            str(job.get("description", "")),
+        ]
+    for project in projects:
+        parts += [
+            str(project.get("name", "")),
+            str(project.get("tech", "")),
+            str(project.get("description", "")),
+            str(project.get("complexity", "")),
+        ]
+    for edu in education:
+        parts += [
+            str(edu.get("degree", "")),
+            str(edu.get("institution", "")),
+        ]
+    cv_raw = cv.get("cv_raw_text", "")
+    if cv_raw:
+        parts.append(str(cv_raw)[:1000])
+
+    return _norm(" ".join(filter(None, parts)))
+
+
+def _build_job_text(title: str, requirements: str) -> str:
+    return _norm(f"{title} {requirements}")
+
+
+# =============================================================================
+# CALCUL DES ANNÉES D'EXPÉRIENCE
+# =============================================================================
+
+def infer_experience_years(work_history: list[Any]) -> float:
+    total_months = 0
+    for item in work_history:
+        if not isinstance(item, dict):
+            continue
+        duration = item.get("duration_months")
+        if isinstance(duration, (int, float)) and duration > 0:
+            total_months += int(duration)
+            continue
+        start = item.get("start_date")
+        end   = item.get("end_date")
+        if not start:
+            continue
+        try:
+            start_str = start[:7] if len(start) >= 7 else f"{start[:4]}-01"
+            if end and len(end) >= 7:
+                end_str = end[:7]
+            elif end and len(end) >= 4:
+                end_str = f"{end[:4]}-01"
+            else:
+                end_str = None
+            start_dt = datetime.strptime(start_str, "%Y-%m")
+            end_dt   = datetime.strptime(end_str, "%Y-%m") if end_str else datetime.utcnow()
+            months   = (end_dt.year - start_dt.year) * 12 + end_dt.month - start_dt.month
+            total_months += max(months, 0)
+        except (ValueError, TypeError):
+            continue
+    return round(total_months / 12, 1)
+
+
+# =============================================================================
+# MATCHING MOTS-CLÉS
+# =============================================================================
+
+def _extract_tech_keywords(text: str) -> set[str]:
+    return {kw for kw, pat in _KW_PATTERNS.items() if pat.search(text)}
+
+
+def _extract_keywords_from_set(text: str, keywords: tuple[str, ...]) -> set[str]:
+    result: set[str] = set()
+    for kw in keywords:
+        pat = re.compile(
+            rf"\b{re.escape(kw)}\b" if " " not in kw else re.escape(kw),
+            re.IGNORECASE,
+        )
+        if pat.search(text):
+            result.add(kw)
+    return result
+
+
+def _keyword_match(
+    cv_text : str,
+    job_text: str,
+    keywords: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    if keywords is None:
+        cv_kws  = _extract_tech_keywords(cv_text)
+        job_kws = _extract_tech_keywords(job_text)
     else:
-        if cv_years >= required_years * 2:
-            ratio = 1.0
-        elif cv_years >= required_years:
-            surplus = (cv_years - required_years) / required_years
-            ratio = 0.7 + 0.3 * min(surplus, 1.0)
-        else:
-            ratio = cv_years / required_years
+        cv_kws  = _extract_keywords_from_set(cv_text, keywords)
+        job_kws = _extract_keywords_from_set(job_text, keywords)
 
-    # Pénalité si en dessous du seuil minimum
-    if cv_years < profile.min_years_experience:
-        ratio *= 0.5
+    matched = sorted(cv_kws & job_kws)
+    missing = sorted(job_kws - cv_kws)
+    score   = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
 
-    score = min(ratio, 1.0)
-    return score, {
-        "cv_years": cv_years,
-        "required_years": required_years,
-        "ratio": round(ratio, 3),
-        "above_threshold": cv_years >= profile.min_years_experience,
-    }
+    return {"score": _clamp(score), "matched": matched, "missing": missing}
 
 
 # =============================================================================
-# 14. Scoring de l'éducation
+# SCORE SÉMANTIQUE
 # =============================================================================
 
-def compute_education_score(
-    cv_education_level: str,
-    hierarchy_level: HierarchyLevel,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score éducatif basé sur le niveau détecté vs le niveau requis par le poste.
-    """
-    profile = HIERARCHY_PROFILES[hierarchy_level]
-
+def _semantic_score(cv_text: str, job_text: str) -> float:
+    cv_text  = cv_text[:4000]
+    job_text = job_text[:2000]
+    if not cv_text or not job_text:
+        return 0.0
     try:
-        cv_index = EDUCATION_LEVEL_ORDER.index(cv_education_level)
-    except ValueError:
-        cv_index = 0
+        model      = _get_model()
+        embeddings = model.encode(
+            [cv_text, job_text],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+        return _clamp(float(similarity) * 100)
+    except Exception as exc:
+        print(f"[scoring] Semantic similarity error: {exc}")
+        return 0.0
 
+
+# =============================================================================
+# SCORERS PAR DIMENSION
+# =============================================================================
+
+def _experience_score(candidate_years: float, required_years: float) -> float:
     try:
-        req_index = EDUCATION_LEVEL_ORDER.index(profile.min_education_level)
-    except ValueError:
-        req_index = 0
+        candidate_years = float(candidate_years or 0)
+        required_years  = float(required_years  or 0)
+        if required_years <= 0:
+            return 100.0
+        if candidate_years >= required_years * 2:
+            return 100.0
+        if candidate_years >= required_years:
+            surplus = (candidate_years - required_years) / required_years
+            return _clamp(70.0 + 30.0 * min(surplus, 1.0))
+        return _clamp((candidate_years / required_years) * 100)
+    except Exception:
+        return 0.0
 
-    if req_index == 0:
-        # Aucun niveau requis
-        score = min(cv_index / 4.0, 1.0)
-        meets_requirement = True
-    elif cv_index >= req_index + 2:
-        # Niveau largement supérieur (ex: doctorat pour poste licence)
-        score = 1.0
-        meets_requirement = True
-    elif cv_index >= req_index:
-        # Niveau atteint ou légèrement supérieur
-        score = 0.7 + 0.3 * (cv_index - req_index)
-        meets_requirement = True
-    elif cv_index >= req_index - 1:
-        # Un cran en dessous
-        score = 0.4
-        meets_requirement = False
+
+def _certification_score(cv_text: str, domain: Domain | None = None) -> float:
+    """
+    Score certifications.
+    Utilise CERTIFICATION_REGISTRY enrichi (v2) avec bonus domaine.
+    """
+    text = _norm(cv_text)
+    total_weight = 0.0
+    for cert_key, cert_info in CERTIFICATION_REGISTRY.items():
+        if cert_key in text:
+            w = cert_info["weight"]
+            if domain and cert_info["domain"] == domain:
+                w *= 1.3
+            total_weight += w
+    # Normalise sur 100 (max raisonnable ≈ 3.0)
+    return _clamp(min(total_weight / 3.0, 1.0) * 100)
+
+
+def _education_relevance_score(cv_text: str, domain: Domain, job_text: str = "") -> float:
+    text    = _norm(f"{cv_text} {job_text}")
+    matches = sum(1 for kw in _EDUCATION_RELEVANCE.get(domain, ()) if kw in text)
+    if matches >= 2:
+        return 95.0
+    if matches == 1:
+        return 75.0
+    return 40.0
+
+
+def _education_score(
+    cv_text : str,
+    domain  : Domain,
+    job_text: str = "",
+    level   : ProfessionalLevel = ProfessionalLevel.MID_LEVEL,
+) -> float:
+    cv_lower = _norm(cv_text)
+    if "doctorat" in cv_lower or "phd" in cv_lower:
+        level_score = 100.0
+    elif any(x in cv_lower for x in ("master", "mastère", "ingénieur")):
+        level_score = 85.0
+    elif any(x in cv_lower for x in ("licence", "bachelor", "bts", "dut")):
+        level_score = 70.0
     else:
-        # Plusieurs crans en dessous
-        score = max(cv_index / req_index * 0.3, 0.05)
-        meets_requirement = False
+        level_score = 50.0
 
-    return round(score, 3), {
-        "cv_level": cv_education_level,
-        "required_level": profile.min_education_level,
-        "meets_requirement": meets_requirement,
-    }
+    relevance = _education_relevance_score(cv_text, domain, job_text)
+    final     = (level_score * 0.6) + (relevance * 0.4)
+    if level in (ProfessionalLevel.DIRECTOR, ProfessionalLevel.EXECUTIVE):
+        final = min(100.0, final * 1.1)
+    return _clamp(final)
 
 
-# =============================================================================
-# 15. Scoring du leadership
-# =============================================================================
-
-def compute_leadership_score(
-    cv_text: str,
-    hierarchy_level: HierarchyLevel,
-    past_titles: Optional[List[str]] = None,
-) -> Tuple[float, Dict[str, Any]]:
+def _leadership_score(
+    cv_text     : str,
+    extra_terms : tuple[str, ...] = (),
+    past_titles : list[str] | None = None,
+) -> float:
     """
     Score de leadership combinant :
-    1. Présence de titres passés avec marqueurs hiérarchiques
-    2. Verbes d'action de leadership dans le texte du CV
+    - verbes d'action pondérés (v2, 60%)
+    - mots-clés LEADERSHIP_TERMS + extra_terms (v1, 20%)
+    - titres passés avec marqueurs hiérarchiques (v2, 20%)
     """
-    profile = HIERARCHY_PROFILES[hierarchy_level]
+    text = _norm(cv_text)
 
-    if not profile.require_leadership:
-        return 1.0, {"leadership_required": False, "score": 1.0}
-
-    text_lower = cv_text.lower()
-
-    # 1. Score via verbes d'action
-    verb_scores = []
-    for verb, weight in LEADERSHIP_ACTION_VERBS.items():
-        if verb in text_lower:
-            verb_scores.append(weight)
-
-    verb_score = max(verb_scores) if verb_scores else 0.0
+    # 1. Verbes d'action
+    verb_scores = [w for verb, w in LEADERSHIP_ACTION_VERBS.items() if verb in text]
+    verb_score  = max(verb_scores) if verb_scores else 0.0
     if len(verb_scores) >= 3:
         verb_score = min(verb_score + 0.1, 1.0)
 
-    # 2. Score via titres passés hiérarchiques
+    # 2. Mots-clés classiques (v1)
+    all_terms   = LEADERSHIP_TERMS + extra_terms
+    kw_matches  = sum(1 for t in all_terms if t in text)
+    kw_score    = min(kw_matches * 0.2, 1.0)
+
+    # 3. Titres passés
     title_score = 0.0
     if past_titles:
         for title in past_titles:
-            title_lower = title.lower()
-            detected = detect_hierarchy_level(title_lower)
-            if detected in [HierarchyLevel.MANAGER_SENIOR, HierarchyLevel.DIRECTION]:
+            detected = detect_hierarchy_level(_norm(title))
+            if detected in (HierarchyLevel.MANAGER_SENIOR, HierarchyLevel.DIRECTION):
                 title_score = max(title_score, 0.8)
             elif detected == HierarchyLevel.MANAGER_INTERMEDIAIRE:
                 title_score = max(title_score, 0.5)
 
-    # Combinaison : verbes (60%) + titres (40%)
-    combined = 0.6 * verb_score + 0.4 * title_score
-    score = round(min(combined, 1.0), 3)
-
-    return score, {
-        "leadership_required": True,
-        "verb_score": round(verb_score, 3),
-        "title_score": round(title_score, 3),
-        "combined": score,
-        "verb_count": len(verb_scores),
-    }
+    combined = 0.6 * verb_score + 0.2 * kw_score + 0.2 * title_score
+    return _clamp(combined * 100)
 
 
-# =============================================================================
-# 16. Scoring de complexité
-# =============================================================================
+def _complexity_score(
+    cv_text   : str,
+    indicators: dict[str, int] | None = None,
+) -> float:
+    source = indicators if indicators is not None else COMPLEXITY_INDICATORS
+    return _clamp(sum(pts for term, pts in source.items() if term in cv_text))
 
-def compute_complexity_score(
-    cv_text: str,
-    domain: Domain,
-    hierarchy_level: HierarchyLevel,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score de complexité mesurant la diversité du parcours.
-    Plus le poste est élevé, plus on valorise les parcours multi-domaines.
-    """
-    profile = HIERARCHY_PROFILES[hierarchy_level]
-    text_lower = cv_text.lower()
 
-    # Compter les domaines touchés (via les skills)
-    domains_touched = 0
-    for d, skills in DOMAIN_SKILLS.items():
-        if any(skill in text_lower for skill in skills[:4]):
-            domains_touched += 1
-
-    # Score de base : diversité
-    diversity_score = min(domains_touched / 5.0, 1.0)
-
-    # Ajustement par niveau
-    adjusted = diversity_score * profile.complexity_multiplier
-
-    # Bonus si le domaine principal est bien couvert
-    primary_skills = DOMAIN_SKILLS.get(domain, [])
-    if primary_skills:
-        primary_coverage = sum(1 for s in primary_skills if s in text_lower) / len(primary_skills)
-        adjusted = 0.6 * adjusted + 0.4 * min(primary_coverage, 1.0)
-
-    score = round(min(adjusted, 1.0), 3)
-    return score, {
-        "domains_touched": domains_touched,
-        "diversity_score": round(diversity_score, 3),
-        "complexity_multiplier": profile.complexity_multiplier,
-    }
+def _language_score(cv_text: str) -> float:
+    text  = _norm(cv_text)
+    score = 50.0
+    if any(x in text for x in ("anglais", "english", "toeic", "b2", "c1", "fluent", "courant")):
+        score += 30
+    if any(x in text for x in ("espagnol", "portugais")):
+        score += 10
+    return _clamp(score)
 
 
 # =============================================================================
-# 17. Scoring des certifications
+# GESTION DES POIDS
 # =============================================================================
 
-def compute_certification_score(
-    cv_text: str,
-    domain: Domain,
-    hierarchy_level: HierarchyLevel,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score basé sur les certifications détectées, pondérées par niveau et domaine.
-    """
-    profile = HIERARCHY_PROFILES[hierarchy_level]
-    text_lower = cv_text.lower()
-    found_certs = []
-    total_weight = 0.0
-    max_possible = 3.0  # Pour normalisation
-
-    for cert_key, cert_info in CERTIFICATION_REGISTRY.items():
-        if cert_key in text_lower:
-            found_certs.append(cert_info["name"])
-            weight = cert_info["weight"]
-            # Bonus si le domaine de la certification correspond au poste
-            if cert_info["domain"] == domain:
-                weight *= 1.3
-            # Bonus si certification de haut niveau pour poste senior
-            if cert_info["level"] >= 4 and hierarchy_level in [
-                HierarchyLevel.MANAGER_SENIOR, HierarchyLevel.DIRECTION
-            ]:
-                weight *= 1.2
-            total_weight += weight
-
-    score = round(min(total_weight / max_possible, 1.0), 3)
-
-    # Si certifications obligatoires mais aucune trouvée
-    if profile.require_certifications and len(found_certs) == 0:
-        score *= 0.3
-
-    return score, {
-        "found_certifications": found_certs,
-        "count": len(found_certs),
-        "total_weight": round(total_weight, 3),
-    }
+def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
+    total = sum(weights.values())
+    if total <= 0:
+        return dict(DEFAULT_WEIGHTS)
+    return {k: round(v / total, 4) for k, v in weights.items()}
 
 
-# =============================================================================
-# 18. Scoring sémantique (placeholder — modèle externe)
-# =============================================================================
-
-def compute_semantic_score(
-    cv_text: str,
-    job_description: str,
-    domain: Domain,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score sémantique utilisant paraphrase-multilingual-MiniLM-L12-v2.
-    En l'absence du modèle chargé, utilise un fallback basé sur le chevauchement lexical.
-    """
-    cv_lower = cv_text.lower()
-    jd_lower = job_description.lower()
-
-    # Fallback lexical : bigrammes communs
-    cv_words = set(re.findall(r'\b\w+\b', cv_lower))
-    jd_words = set(re.findall(r'\b\w+\b', jd_lower))
-
-    if not jd_words:
-        return 0.5, {"method": "fallback_lexical", "note": "JD vide"}
-
-    # Jaccard
-    intersection = cv_words & jd_words
-    union = cv_words | jd_words
-    jaccard = len(intersection) / len(union) if union else 0.0
-
-    # TF-IDF simplifié : pondération par rareté
-    domain_skills = set(DOMAIN_SKILLS.get(domain, []))
-    skill_matches = intersection & domain_skills
-    skill_ratio = len(skill_matches) / len(domain_skills) if domain_skills else 0.0
-
-    # Combinaison : jaccard (40%) + skill match (60%)
-    score = round(0.4 * jaccard + 0.6 * skill_ratio, 3)
-
-    return score, {
-        "method": "fallback_lexical",
-        "jaccard": round(jaccard, 3),
-        "skill_match_ratio": round(skill_ratio, 3),
-        "matched_skills": list(skill_matches)[:10],
-    }
+def _resolve_weights(
+    base     : dict[str, float],
+    overrides: dict[str, float],
+) -> dict[str, float]:
+    return _normalize_weights({**base, **overrides})
 
 
-# =============================================================================
-# 19. Scoring par mots-clés
-# =============================================================================
-
-def compute_keyword_score(
-    cv_text: str,
-    required_keywords: List[str],
-    domain: Domain,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Score de matching par mots-clés avec pondération par domaine.
-    """
-    text_lower = cv_text.lower()
-    domain_skills = set(DOMAIN_SKILLS.get(domain, []))
-    all_keywords = list(set(required_keywords) | domain_skills)
-
-    if not all_keywords:
-        return 0.5, {"method": "no_keywords"}
-
-    matched = []
-    for kw in all_keywords:
-        if kw.lower() in text_lower:
-            matched.append(kw)
-
-    ratio = len(matched) / len(all_keywords)
-    score = round(min(ratio * 1.2, 1.0), 3)
-
-    return score, {
-        "total_keywords": len(all_keywords),
-        "matched": len(matched),
-        "matched_keywords": matched[:15],
-        "ratio": round(ratio, 3),
-    }
+def _get_weights_for_level(
+    base : dict[str, float],
+    level: ProfessionalLevel,
+) -> dict[str, float]:
+    weights = base.copy()
+    if level in (ProfessionalLevel.DIRECTOR, ProfessionalLevel.EXECUTIVE):
+        weights.update({
+            "leadership": 0.15, "education": 0.15,
+            "experience": 0.22, "complexity": 0.20,
+        })
+    elif level == ProfessionalLevel.MANAGER:
+        weights.update({"leadership": 0.12, "education": 0.13, "experience": 0.20})
+    elif level == ProfessionalLevel.JUNIOR:
+        weights.update({"education": 0.18, "leadership": 0.03, "complexity": 0.22})
+    return _normalize_weights(weights)
 
 
-# =============================================================================
-# 20. Scoring de la qualité linguistique
-# =============================================================================
-
-def compute_language_quality_score(
-    cv_text: str,
-    target_languages: Optional[List[str]] = None,
-) -> Tuple[float, Dict[str, Any]]:
-    """
-    Évalue la qualité linguistique du CV et détecte la langue dominante.
-    Ne pénalise pas un CV bien écrit en anglais pour un poste francophone.
-    """
-    if target_languages is None:
-        target_languages = ["fr", "en"]
-
-    text_lower = cv_text.lower()
-    total_chars = len(cv_text)
-    if total_chars < 50:
-        return 0.3, {"error": "Texte trop court"}
-
-    # Détection de langue simplifiée
-    fr_markers = ["le ", "la ", "les ", "des ", "une ", "un ", "est ", "dans ",
-                   "pour ", "avec ", "sur ", "sous ", "chez ", "je ", "nous ",
-                   "expérience", "formation", "compétences", "entreprise"]
-    en_markers = ["the ", "and ", "with ", "for ", "from ", "have ", "has ",
-                   "experience", "education", "skills", "company", "worked"]
-
-    fr_count = sum(1 for m in fr_markers if m in text_lower)
-    en_count = sum(1 for m in en_markers if m in text_lower)
-
-    if fr_count > en_count:
-        detected_lang = "fr"
-    elif en_count > fr_count:
-        detected_lang = "en"
-    else:
-        detected_lang = "mixed"
-
-    # Score de qualité basé sur la richesse lexicale
-    words = re.findall(r'\b\w{3,}\b', text_lower)
-    unique_words = set(words)
-    lexical_richness = len(unique_words) / len(words) if words else 0.0
-
-    # Score de structure (présence de sections)
-    structure_markers = ["expérience", "experience", "formation", "education",
-                          "compétences", "skills", "langues", "languages",
-                          "certifications", "références", "references"]
-    structure_score = sum(1 for m in structure_markers if m in text_lower) / len(structure_markers)
-
-    # Longueur adéquate
-    length_score = min(len(words) / 200, 1.0)
-
-    score = round(0.3 * lexical_richness + 0.3 * structure_score + 0.2 * length_score + 0.2, 3)
-
-    return score, {
-        "detected_language": detected_lang,
-        "lexical_richness": round(lexical_richness, 3),
-        "structure_score": round(structure_score, 3),
-        "word_count": len(words),
-        "unique_words": len(unique_words),
-    }
-
-# =============================================================================
-# 21. Dataclass CandidateScore
-# =============================================================================
-
-@dataclass
-class CandidateScore:
-    """Score complet d'un candidat avec toutes les dimensions et métadonnées."""
-    candidate_id: str
-    job_title: str
-    # Hiérarchie et domaine détectés
-    hierarchy_level: HierarchyLevel
-    domain: Domain
-    profile: HierarchyProfile
-    # Scores dimensionnels (0-1)
-    score_experience: float = 0.0
-    score_education: float = 0.0
-    score_certifications: float = 0.0
-    score_semantic: float = 0.0
-    score_keywords: float = 0.0
-    score_leadership: float = 0.0
-    score_language: float = 0.0
-    score_complexity: float = 0.0
-    # Pénalités
-    penalty: float = 0.0
-    penalty_details: List[Dict[str, Any]] = field(default_factory=list)
-    # Score final
-    final_score: float = 0.0
-    # Détails
-    details: Dict[str, Any] = field(default_factory=dict)
-    # Métadonnées
-    detected_education: str = "none"
-    detected_language: str = "unknown"
-    past_titles: List[str] = field(default_factory=list)
+def _load_weights(supabase=None) -> dict[str, float]:
+    if supabase is None:
+        with _weights_lock:
+            return dict(_active_weights)
+    try:
+        resp   = (
+            supabase.table("app_config")
+            .select("value")
+            .eq("key", "ats_weights")
+            .single()
+            .execute()
+        )
+        stored = resp.data and resp.data.get("value")
+        if stored:
+            if isinstance(stored, str):
+                stored = json.loads(stored)
+            if isinstance(stored, dict) and all(k in stored for k in DEFAULT_WEIGHTS):
+                return {k: float(v) for k, v in stored.items()}
+    except Exception as exc:
+        print(f"[scoring] Failed to load weights from DB: {exc}")
+    with _weights_lock:
+        return dict(_active_weights)
 
 
-# =============================================================================
-# 22. Fonction principale de scoring
-# =============================================================================
-
-def score_candidate(
-    candidate_id: str,
-    cv_text: str,
-    job_title: str,
-    job_description: str,
-    required_years_experience: float = 0,
-    required_keywords: Optional[List[str]] = None,
-    past_titles: Optional[List[str]] = None,
-    target_languages: Optional[List[str]] = None,
-) -> CandidateScore:
-    """
-    Fonction principale de scoring d'un candidat pour un poste donné.
-
-    Args:
-        candidate_id: Identifiant unique du candidat
-        cv_text: Texte complet du CV
-        job_title: Titre du poste visé
-        job_description: Description détaillée du poste
-        required_years_experience: Années d'expérience requises
-        required_keywords: Mots-clés requis (optionnel)
-        past_titles: Titres de postes précédents (optionnel)
-        target_languages: Langues cibles attendues (défaut: ["fr", "en"])
-
-    Returns:
-        CandidateScore complet avec toutes les dimensions
-    """
-    if required_keywords is None:
-        required_keywords = []
-    if past_titles is None:
-        past_titles = []
-    if target_languages is None:
-        target_languages = ["fr", "en"]
-
-    # ---- Détection automatique ----
-    title_lower = job_title.lower()
-    jd_lower = job_description.lower()
-    cv_lower = cv_text.lower()
-
-    hierarchy_level = detect_hierarchy_level(title_lower)
-    domain = detect_domain(title_lower, jd_lower)
-    profile = HIERARCHY_PROFILES[hierarchy_level]
-    detected_education = detect_education_level(cv_text)
-
-    # ---- Extraction des années d'expérience ----
-    # Pattern: "X ans", "X années", "X years", "X+ ans"
-    years_pattern = re.findall(
-        r'(\d+)\s*(?:\+)?\s*(?:ans?|années?|years?)(?:\s+d[\'\"](?:expérience|experience))?',
-        cv_lower
-    )
-    cv_years = max([int(y) for y in years_pattern]) if years_pattern else 0.0
-
-    # ---- Scoring des dimensions ----
-    exp_score, exp_details = compute_experience_score(
-        cv_years, required_years_experience, hierarchy_level
-    )
-    edu_score, edu_details = compute_education_score(
-        detected_education, hierarchy_level
-    )
-    cert_score, cert_details = compute_certification_score(
-        cv_text, domain, hierarchy_level
-    )
-    sem_score, sem_details = compute_semantic_score(
-        cv_text, job_description, domain
-    )
-    kw_score, kw_details = compute_keyword_score(
-        cv_text, required_keywords, domain
-    )
-    lead_score, lead_details = compute_leadership_score(
-        cv_text, hierarchy_level, past_titles
-    )
-    lang_score, lang_details = compute_language_quality_score(
-        cv_text, target_languages
-    )
-    comp_score, comp_details = compute_complexity_score(
-        cv_text, domain, hierarchy_level
-    )
-
-    # ---- Agrégation pondérée ----
-    weighted = (
-        profile.w_experience * exp_score +
-        profile.w_education * edu_score +
-        profile.w_certifications * cert_score +
-        profile.w_semantic * sem_score +
-        profile.w_keywords * kw_score +
-        profile.w_leadership * lead_score +
-        profile.w_language * lang_score +
-        profile.w_complexity * comp_score
-    )
-
-    # ---- Pénalités de carence ----
-    dimension_scores = {
-        "experience": exp_score,
-        "education": edu_score,
-        "certifications": cert_score,
-        "leadership": lead_score,
-        "language": lang_score,
-    }
-    penalty, penalty_details = compute_careness_penalty(
-        dimension_scores, hierarchy_level
-    )
-
-    # ---- Score final ----
-    raw_final = weighted - penalty + profile.w_penalty * (1.0 - penalty)
-    final_score = round(max(0.0, min(raw_final, 1.0)), 4)
-
-    # ---- Assemblage ----
-    return CandidateScore(
-        candidate_id=candidate_id,
-        job_title=job_title,
-        hierarchy_level=hierarchy_level,
-        domain=domain,
-        profile=profile,
-        score_experience=round(exp_score, 3),
-        score_education=round(edu_score, 3),
-        score_certifications=round(cert_score, 3),
-        score_semantic=round(sem_score, 3),
-        score_keywords=round(kw_score, 3),
-        score_leadership=round(lead_score, 3),
-        score_language=round(lang_score, 3),
-        score_complexity=round(comp_score, 3),
-        penalty=round(penalty, 3),
-        penalty_details=penalty_details,
-        final_score=final_score,
-        details={
-            "experience": exp_details,
-            "education": edu_details,
-            "certifications": cert_details,
-            "semantic": sem_details,
-            "keywords": kw_details,
-            "leadership": lead_details,
-            "language": lang_details,
-            "complexity": comp_details,
-            "cv_years_detected": cv_years,
-        },
-        detected_education=detected_education,
-        detected_language=lang_details.get("detected_language", "unknown"),
-        past_titles=past_titles,
-    )
+def _save_weights(weights: dict[str, float], supabase=None) -> None:
+    if supabase is None:
+        return
+    try:
+        supabase.table("app_config").upsert(
+            {"key": "ats_weights", "value": weights},
+            on_conflict="key",
+        ).execute()
+    except Exception as exc:
+        print(f"[scoring] Failed to save weights to DB: {exc}")
 
 
-# =============================================================================
-# 23. Conversion en dictionnaire
-# =============================================================================
-
-def score_to_dict(score: CandidateScore) -> Dict[str, Any]:
-    """
-    Convertit un CandidateScore en dictionnaire sérialisable (JSON).
-    """
-    return {
-        "candidate_id": score.candidate_id,
-        "job_title": score.job_title,
-        "hierarchy_level": score.hierarchy_level.value,
-        "domain": score.domain.value,
-        "final_score": score.final_score,
-        "dimensions": {
-            "experience": score.score_experience,
-            "education": score.score_education,
-            "certifications": score.score_certifications,
-            "semantic": score.score_semantic,
-            "keywords": score.score_keywords,
-            "leadership": score.score_leadership,
-            "language": score.score_language,
-            "complexity": score.score_complexity,
-        },
-        "weights": {
-            "w_experience": score.profile.w_experience,
-            "w_education": score.profile.w_education,
-            "w_certifications": score.profile.w_certifications,
-            "w_semantic": score.profile.w_semantic,
-            "w_keywords": score.profile.w_keywords,
-            "w_leadership": score.profile.w_leadership,
-            "w_language": score.profile.w_language,
-            "w_complexity": score.profile.w_complexity,
-            "w_penalty": score.profile.w_penalty,
-        },
-        "penalty": score.penalty,
-        "penalty_details": score.penalty_details,
-        "detected_education": score.detected_education,
-        "detected_language": score.detected_language,
-        "details": score.details,
-    }
-
-
-# =============================================================================
-# 24. Feedback et apprentissage (boucle apprenante)
-# =============================================================================
-
+# ---------------------------------------------------------------------------
+# FeedbackRecord (v2) — pour la descente de gradient
+# ---------------------------------------------------------------------------
 @dataclass
 class FeedbackRecord:
-    """Enregistrement de feedback recruteur pour ajustement des poids."""
-    candidate_id: str
-    job_title: str
-    predicted_score: float
-    actual_outcome: str       # "hired", "interviewed", "rejected"
-    actual_rating: float      # Note réelle (0-1) attribuée par le recruteur
-    timestamp: str = ""
-    notes: str = ""
-
-
-# Poids par défaut (état initial)
-DEFAULT_WEIGHTS: Dict[str, float] = {
-    "experience": 0.25,
-    "education": 0.12,
-    "certifications": 0.08,
-    "semantic": 0.20,
-    "keywords": 0.10,
-    "leadership": 0.10,
-    "language": 0.05,
-    "complexity": 0.10,
-}
+    candidate_id    : str
+    job_title       : str
+    predicted_score : float
+    actual_outcome  : str    # "hired", "interviewed", "rejected"
+    actual_rating   : float  # 0–1
+    timestamp       : str = ""
+    notes           : str = ""
 
 
 def update_weights_from_feedback(
-    current_weights: Dict[str, float],
-    feedback_records: List[FeedbackRecord],
-    learning_rate: float = 0.01,
-) -> Dict[str, float]:
+    *,
+    supabase        : Any                      = None,
+    candidate_id    : str | None               = None,
+    liked           : bool                     = True,
+    dimension_scores: dict[str, float] | None  = None,
+    feedback_data   : dict[str, float] | None  = None,
+    # Nouveau (v2)
+    feedback_records: list[FeedbackRecord] | None = None,
+    learning_rate   : float = 0.01,
+) -> None:
     """
-    Ajuste les poids du scoring à partir du feedback recruteur.
-    Utilise une descente de gradient simplifiée sur l'erreur de prédiction.
+    Adapte les poids selon le feedback recruteur.
 
-    Args:
-        current_weights: Poids actuels (doivent sommer à ~1.0)
-        feedback_records: Liste de feedbacks recruteur
-        learning_rate: Taux d'apprentissage (0.001 à 0.05 recommandé)
-
-    Returns:
-        Nouveaux poids ajustés et normalisés
+    Mode 1 — feedback_data   : remplace directement les valeurs.
+    Mode 2 — dimension_scores + liked : delta sur dimensions > 50.
+    Mode 3 — feedback_records : descente de gradient (v2).
+    Supabase persist si fourni.
     """
-    if not feedback_records:
-        return current_weights
+    global _active_weights
 
-    new_weights = dict(current_weights)
-    total_error = 0.0
+    weights = _load_weights(supabase)
 
-    for fb in feedback_records:
-        error = fb.actual_rating - fb.predicted_score
-        total_error += abs(error)
+    # ---- Mode 3 : descente de gradient (v2) ----
+    if feedback_records:
+        new_w = dict(weights)
+        for fb in feedback_records:
+            error = fb.actual_rating - fb.predicted_score
+            for dim in new_w:
+                gradient = -2 * error * new_w[dim]
+                new_w[dim] -= learning_rate * gradient
+        total = sum(new_w.values())
+        if total > 0:
+            weights = {k: round(v / total, 4) for k, v in new_w.items()}
 
-        # Ajustement proportionnel à l'erreur sur chaque dimension
-        for dim in new_weights:
-            gradient = -2 * error * new_weights[dim]
-            new_weights[dim] -= learning_rate * gradient
+    # ---- Mode 1 : remplacement direct ----
+    elif feedback_data:
+        for key, value in feedback_data.items():
+            if key in weights:
+                try:
+                    weights[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
 
-    # Normalisation
-    total = sum(new_weights.values())
-    if total > 0:
-        new_weights = {k: round(v / total, 4) for k, v in new_weights.items()}
+    # ---- Mode 2 : delta like/dislike ----
+    elif dimension_scores:
+        delta = _LIKE_BOOST if liked else -_DISLIKE_DECAY
+        for dim_key, dim_val in dimension_scores.items():
+            if not isinstance(dim_val, (int, float)) or dim_val <= 50:
+                continue
+            weight_key = _DIM_TO_WEIGHT.get(dim_key)
+            if weight_key and weight_key in weights:
+                weights[weight_key] = max(0.01, weights[weight_key] + delta)
 
-    logger.info(
-        f"Weights updated from {len(feedback_records)} feedbacks, "
-        f"mean_abs_error={total_error/len(feedback_records):.4f}"
+    weights = _normalize_weights(weights)
+    with _weights_lock:
+        _active_weights = weights
+    _save_weights(weights, supabase)
+
+
+# =============================================================================
+# GUARDRAILS (v1 conservé, enrichi par pénalités v2)
+# =============================================================================
+
+_LEVEL_THRESHOLDS: dict[ProfessionalLevel, dict[str, float]] = {
+    ProfessionalLevel.JUNIOR:   {"complexity": 15.0, "experience": 20.0},
+    ProfessionalLevel.MANAGER:  {"leadership": 30.0, "experience": 35.0},
+    ProfessionalLevel.DIRECTOR: {"leadership": 40.0, "education": 45.0, "experience": 40.0},
+}
+
+
+def _apply_dimension_guardrails(
+    dimensions: dict[str, float],
+    weights   : dict[str, float],
+    level     : ProfessionalLevel,
+    hier_level: HierarchyLevel | None = None,
+) -> tuple[float, list[str]]:
+    """
+    Score pondéré avec :
+    1. Pénalités de niveau (v1 — seuils par ProfessionalLevel)
+    2. Pénalités de carence (v2 — courbes exponential/step/linear)
+    """
+    thresholds = _LEVEL_THRESHOLDS.get(level, {})
+    warnings   : list[str] = []
+    adjusted   = 0.0
+
+    for dim_name, score in dimensions.items():
+        weight_key = _DIM_TO_WEIGHT.get(dim_name)
+        if weight_key is None:
+            continue
+        weight   = weights.get(weight_key, 0.0)
+        base_key = dim_name.replace("_score", "")
+
+        penalty = 0.0
+        if base_key in thresholds and score < thresholds[base_key]:
+            penalty = (thresholds[base_key] - score) * weight * 0.75
+            warnings.append(f"{base_key} faible pour {level.value} ({score:.1f})")
+
+        adjusted += (score * weight) - penalty
+
+    # Pénalités v2 sur scores normalisés (0–1)
+    if hier_level is not None:
+        dim_norm = {
+            "experience":    dimensions.get("experience_score",         0.0) / 100,
+            "education":     dimensions.get("education_score",          0.0) / 100,
+            "certification": dimensions.get("certification_score",      0.0) / 100,
+            "leadership":    dimensions.get("leadership_score",         0.0) / 100,
+            "language":      dimensions.get("language_score",           0.0) / 100,
+        }
+        carence_penalty, carence_details = _compute_careness_penalty(dim_norm, hier_level)
+        if carence_penalty > 0:
+            adjusted -= carence_penalty * 100
+            warnings += [d["description"] for d in carence_details]
+
+    return _clamp(adjusted), warnings
+
+
+# =============================================================================
+# POINT D'ENTRÉE PRINCIPAL
+# =============================================================================
+
+def compute_candidate_score(
+    *,
+    cv_data            : dict[str, Any],
+    job_title          : str,
+    job_requirements   : str,
+    required_experience: int        = DEFAULT_REQUIRED_EXPERIENCE,
+    supabase           : Any        = None,
+    domain             : Domain | None = None,
+) -> dict[str, Any]:
+    """
+    Calcule le score d'adéquation CV ↔ offre d'emploi (0–100).
+
+    Retourne : score, confidence, domain, professional_level,
+               reasoning, matched_keywords, missing_keywords,
+               dimension_scores, warnings.
+    """
+    base_weights = _load_weights(supabase)
+    cv_text      = _build_cv_text(cv_data)
+    job_text     = _build_job_text(job_title, job_requirements)
+
+    if domain is None:
+        domain = classify_domain(cv_text, job_title, job_requirements)
+
+    profile    = _DOMAIN_PROFILES.get(domain, _FALLBACK_PROFILE)
+    is_tech    = domain in TECH_DOMAINS
+    weights    = _resolve_weights(base_weights, profile.weight_overrides)
+    level      = detect_professional_level(cv_text, job_title)
+    hier_level = detect_hierarchy_level(_norm(f"{cv_text} {job_title}"))
+    weights    = _get_weights_for_level(weights, level)
+
+    kw_result  = (
+        _keyword_match(cv_text, job_text)
+        if is_tech
+        else _keyword_match(cv_text, job_text, profile.keywords)
+    )
+    sem_score  = _semantic_score(cv_text, job_text)
+    cert_score = _certification_score(cv_text, domain)
+    edu_score  = _education_score(cv_text, domain, job_text, level)
+    lead_score = _leadership_score(cv_text, profile.leadership_terms)
+    cmpx_score = (
+        _complexity_score(cv_text)
+        if is_tech
+        else _complexity_score(cv_text, profile.indicators)
+    )
+    lang_score = _language_score(cv_text)
+
+    work_history = (
+        safe_dict_list(cv_data.get("work_history"))
+        or safe_dict_list(
+            (cv_data.get("ai_extracted_data") or {}).get("work_history", [])
+            if isinstance(cv_data.get("ai_extracted_data"), dict)
+            else []
+        )
+    )
+    candidate_years = (
+        cv_data.get("experience_years")
+        or infer_experience_years(work_history)
+        or 0
+    )
+    exp_score = _experience_score(candidate_years, required_experience)
+
+    dimensions = {
+        "keyword_score":            kw_result["score"],
+        "semantic_score":           sem_score,
+        "experience_score":         exp_score,
+        "certification_score":      cert_score,
+        "education_score":          edu_score,
+        "leadership_score":         lead_score,
+        "project_complexity_score": cmpx_score,
+        "language_score":           lang_score,
+    }
+
+    final_score, warnings = _apply_dimension_guardrails(
+        dimensions, weights, level, hier_level
     )
 
-    return new_weights
+    return {
+        "score":              final_score,
+        "confidence":         round((sem_score + kw_result["score"]) / 200, 2),
+        "domain":             domain.value,
+        "professional_level": level.value,
+        "hierarchy_level":    hier_level.value,
+        "reasoning":          f"Niveau={level.value} | Hiérarchie={hier_level.value} | {warnings or ['Aucun avertissement majeur']}",
+        "matched_keywords":   kw_result["matched"],
+        "missing_keywords":   kw_result["missing"],
+        "dimension_scores":   dimensions,
+        "warnings":           warnings,
+    }
 
 
-# =============================================================================
-# 25. Fonctions utilitaires
-# =============================================================================
+def compute_cv_quality_score(
+    cv_data : dict[str, Any],
+    supabase: Any = None,
+) -> dict[str, Any]:
+    """Score qualité autonome d'un CV (sans offre d'emploi)."""
+    cv_text = _build_cv_text(cv_data)
 
-def batch_score(
-    candidates: List[Tuple[str, str]],
-    job_title: str,
-    job_description: str,
-    required_years: float = 0,
-    required_keywords: Optional[List[str]] = None,
-) -> List[CandidateScore]:
-    """
-    Score un lot de candidats pour un même poste.
-    """
-    results = []
-    for candidate_id, cv_text in candidates:
+    ai_data: dict[str, Any] = {}
+    raw_ai = cv_data.get("ai_extracted_data")
+    if isinstance(raw_ai, str):
         try:
-            score = score_candidate(
-                candidate_id=candidate_id,
-                cv_text=cv_text,
-                job_title=job_title,
-                job_description=job_description,
-                required_years_experience=required_years,
-                required_keywords=required_keywords,
-            )
-            results.append(score)
-        except Exception as e:
-            logger.error(f"Scoring failed for {candidate_id}: {e}")
-            # Créer un score d'erreur
-            results.append(CandidateScore(
-                candidate_id=candidate_id,
-                job_title=job_title,
-                hierarchy_level=HierarchyLevel.COLLABORATEUR,
-                domain=Domain.CONSULTING,
-                profile=HIERARCHY_PROFILES[HierarchyLevel.COLLABORATEUR],
-                final_score=0.0,
-                details={"error": str(e)},
-            ))
-    return results
+            ai_data = json.loads(raw_ai)
+        except Exception:
+            pass
+    elif isinstance(raw_ai, dict):
+        ai_data = raw_ai
 
+    domain     = classify_domain(cv_text, "", "")
+    level      = detect_professional_level(cv_text)
+    hier_level = detect_hierarchy_level(_norm(cv_text))
+    profile    = _DOMAIN_PROFILES.get(domain, _FALLBACK_PROFILE)
+    is_tech    = domain in TECH_DOMAINS
 
-def rank_candidates(scores: List[CandidateScore]) -> List[CandidateScore]:
-    """
-    Trie les candidats par score final décroissant.
-    """
-    return sorted(scores, key=lambda s: s.final_score, reverse=True)
-
-
-# =============================================================================
-# __main__ — Tests intégrés
-# =============================================================================
-
-if __name__ == "__main__":
-    print("=" * 70)
-    print("SCORING ATS 2.0 — Tests intégrés")
-    print("=" * 70)
-
-    # Test 1: Détection de niveau hiérarchique
-    print("\n[Test 1] Détection hiérarchique")
-    assert detect_hierarchy_level("directeur général") == HierarchyLevel.DIRECTION
-    assert detect_hierarchy_level("chef de département finances") == HierarchyLevel.MANAGER_SENIOR
-    assert detect_hierarchy_level("superviseur production") == HierarchyLevel.MANAGER_INTERMEDIAIRE
-    assert detect_hierarchy_level("opérateur machine") == HierarchyLevel.COLLABORATEUR
-    assert detect_hierarchy_level("ceo") == HierarchyLevel.DIRECTION
-    assert detect_hierarchy_level("senior manager") == HierarchyLevel.MANAGER_SENIOR
-    print("✓ 6/6 assertions OK")
-
-    # Test 2: Détection de domaine
-    print("\n[Test 2] Détection de domaine")
-    assert detect_domain("comptable senior") == Domain.FINANCE
-    assert detect_domain("chef de chantier btp") == Domain.CONSTRUCTION
-    assert detect_domain("développeur fullstack") == Domain.TECH
-    print("✓ 3/3 assertions OK")
-
-    # Test 3: Scoring complet
-    print("\n[Test 3] Scoring complet - Directeur Financier")
-    cv = """
-    Directeur Financier - 15 ans d'expérience
-    Formation : MBA Finance, IFRS certification, OHADA
-    Compétences : audit, contrôle de gestion, trésorerie, consolidation
-    A dirigé une équipe de 12 personnes, piloté la transformation financière,
-    restructuré les processus budgétaires, fondé le département contrôle de gestion.
-    Langues : Français (natif), Anglais (courant), TOEIC 950
-    Certifications : ACCA, CPA
-    """
-    score = score_candidate(
-        candidate_id="CAND-001",
-        cv_text=cv,
-        job_title="Directeur Financier",
-        job_description="Directeur financier expérimenté, management d'équipe, IFRS, consolidation",
-        required_years_experience=10,
-        required_keywords=["ifrs", "consolidation", "audit", "trésorerie"],
+    work_history = (
+        safe_dict_list(cv_data.get("work_history"))
+        or safe_dict_list(ai_data.get("work_history"))
     )
-    d = score_to_dict(score)
-    print(f"  Niveau détecté : {d['hierarchy_level']}")
-    print(f"  Domaine       : {d['domain']}")
-    print(f"  Score final   : {d['final_score']}")
-    print(f"  Leadership    : {d['dimensions']['leadership']}")
-    print(f"  Expérience    : {d['dimensions']['experience']}")
-    print(f"  Pénalités     : {len(d['penalty_details'])}")
-    assert d['hierarchy_level'] == "direction"
-    assert d['domain'] == "finance"
-    assert d['final_score'] > 0.5
-    print("✓ Score directeur financier OK")
+    candidate_years = (
+        cv_data.get("experience_years")
+        or ai_data.get("experience_years")
+        or infer_experience_years(work_history)
+        or 0
+    )
 
-    # Test 4: Feedback + apprentissage
-    print("\n[Test 4] Boucle de feedback apprenante")
-    feedback = [
-        FeedbackRecord(
-            candidate_id="CAND-001",
-            job_title="Directeur Financier",
-            predicted_score=0.72,
-            actual_outcome="hired",
-            actual_rating=0.85,
-            timestamp="2026-06-03",
+    edu_score  = _education_score(cv_text, domain, "", level)
+    exp_score  = _clamp(float(candidate_years) * 10)
+    lang_score = _language_score(cv_text)
+    lead_score = _leadership_score(cv_text, profile.leadership_terms)
+
+    if is_tech:
+        cert_score = _certification_score(cv_text, domain)
+        cmpx_score = _complexity_score(cv_text)
+    else:
+        cert_score = _clamp(sum(1 for t in profile.indicators if t in cv_text) * 25)
+        cmpx_score = _complexity_score(cv_text, profile.indicators)
+
+    base_weights = _load_weights(supabase)
+    weights      = _resolve_weights(base_weights, profile.weight_overrides)
+    weights      = _get_weights_for_level(weights, level)
+
+    dimensions = {
+        "keyword_score":            0.0,
+        "semantic_score":           0.0,
+        "experience_score":         exp_score,
+        "certification_score":      cert_score,
+        "education_score":          edu_score,
+        "leadership_score":         lead_score,
+        "project_complexity_score": cmpx_score,
+        "language_score":           lang_score,
+    }
+
+    final_score, warnings = _apply_dimension_guardrails(
+        dimensions, weights, level, hier_level
+    )
+
+    return {
+        "score":              final_score,
+        "confidence":         0.65,
+        "domain":             domain.value,
+        "professional_level": level.value,
+        "hierarchy_level":    hier_level.value,
+        "reasoning":          f"Qualité CV | {domain.value} | {level.value}",
+        "matched_keywords":   [],
+        "missing_keywords":   [],
+        "dimension_scores":   dimensions,
+        "warnings":           warnings,
+    }
+
+
+# =============================================================================
+# VERSION ASYNCHRONE
+# =============================================================================
+
+async def compute_candidate_score_async(
+    *,
+    cv_data            : dict[str, Any],
+    job_title          : str,
+    job_requirements   : str,
+    required_experience: int        = DEFAULT_REQUIRED_EXPERIENCE,
+    supabase           : Any        = None,
+    domain             : Domain | None = None,
+) -> dict[str, Any]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: compute_candidate_score(
+            cv_data=cv_data,
+            job_title=job_title,
+            job_requirements=job_requirements,
+            required_experience=required_experience,
+            supabase=supabase,
+            domain=domain,
         ),
-        FeedbackRecord(
-            candidate_id="CAND-002",
-            job_title="Directeur Financier",
-            predicted_score=0.65,
-            actual_outcome="rejected",
-            actual_rating=0.40,
-            timestamp="2026-06-03",
-        ),
+    )
+
+
+# =============================================================================
+# SCORING EN LOT
+# =============================================================================
+
+def batch_score_candidates(
+    candidates         : list[dict[str, Any]],
+    *,
+    job_title          : str,
+    job_requirements   : str,
+    required_experience: int        = DEFAULT_REQUIRED_EXPERIENCE,
+    supabase           : Any        = None,
+    domain             : Domain | None = None,
+) -> list[dict[str, Any]]:
+    results = [
+        {
+            "cv": cv,
+            **compute_candidate_score(
+                cv_data=cv,
+                job_title=job_title,
+                job_requirements=job_requirements,
+                required_experience=required_experience,
+                supabase=supabase,
+                domain=domain,
+            ),
+        }
+        for cv in candidates
     ]
-    new_weights = update_weights_from_feedback(DEFAULT_WEIGHTS, feedback, learning_rate=0.01)
-    print(f"  Poids ajustés ({len(feedback)} feedbacks):")
-    for k, v in new_weights.items():
-        print(f"    {k}: {v:.4f}")
-    total = sum(new_weights.values())
-    assert 0.99 <= total <= 1.01, f"Somme des poids = {total}, attendu ~1.0"
-    print(f"  Somme des poids = {total:.4f}")
-    print("✓ Feedback apprenant OK")
+    return sorted(results, key=lambda r: r["score"], reverse=True)
 
-    print("\n" + "=" * 70)
-    print("Tous les tests sont passés avec succès !")
-    print("=" * 70)
+
+async def batch_score_candidates_async(
+    candidates         : list[dict[str, Any]],
+    *,
+    job_title          : str,
+    job_requirements   : str,
+    required_experience: int        = DEFAULT_REQUIRED_EXPERIENCE,
+    supabase           : Any        = None,
+    domain             : Domain | None = None,
+) -> list[dict[str, Any]]:
+    tasks  = [
+        compute_candidate_score_async(
+            cv_data=cv,
+            job_title=job_title,
+            job_requirements=job_requirements,
+            required_experience=required_experience,
+            supabase=supabase,
+            domain=domain,
+        )
+        for cv in candidates
+    ]
+    scores  = await asyncio.gather(*tasks)
+    results = [{"cv": cv, **score} for cv, score in zip(candidates, scores)]
+    return sorted(results, key=lambda r: r["score"], reverse=True)
