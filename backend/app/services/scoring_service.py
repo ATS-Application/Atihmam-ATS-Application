@@ -1543,3 +1543,45 @@ def compute_candidate_score(
         "dimension_scores": score_dict["dimensions"],
         "full_details": score_dict,   # for debugging / future use
     }
+
+
+# =============================================================================
+# ADDITIONAL COMPATIBILITY LAYER
+# =============================================================================
+
+def compute_cv_quality_score(cv_text: str) -> dict[str, Any]:
+    """
+    Compatibility function for compute_cv_quality_score expected by candidates.py.
+    Returns a quality assessment (can be enhanced later with AI depth analysis).
+    """
+    # Simple fallback using the language quality + complexity scorers
+    try:
+        # Use existing functions from this module
+        lang_score, lang_details = compute_language_quality_score(cv_text)
+        comp_score, comp_details = compute_complexity_score(
+            cv_text, 
+            domain=Domain.CONSULTING,  # default
+            hierarchy_level=HierarchyLevel.COLLABORATEUR
+        )
+        
+        quality_score = round((lang_score * 0.6 + comp_score * 0.4) * 100, 2)
+        
+        return {
+            "quality_score": quality_score,
+            "language_quality": round(lang_score * 100, 2),
+            "complexity": round(comp_score * 100, 2),
+            "overall_assessment": "Good" if quality_score >= 70 else "Average" if quality_score >= 50 else "Needs Improvement",
+            "details": {
+                "language": lang_details,
+                "complexity": comp_details
+            }
+        }
+    except Exception as e:
+        print(f"[scoring_service] compute_cv_quality_score fallback error: {e}")
+        return {
+            "quality_score": 50.0,
+            "language_quality": 50.0,
+            "complexity": 50.0,
+            "overall_assessment": "Assessment unavailable",
+            "details": {"error": str(e)}
+        }
