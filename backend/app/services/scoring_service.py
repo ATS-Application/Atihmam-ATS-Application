@@ -68,7 +68,7 @@ def _get_model() -> SentenceTransformer:
     model = SentenceTransformer(_MODEL_NAME, device='cpu')
     
     # Réduction supplémentaire de mémoire
-    model.model.half()          # Passe en float16 (réduit ~50% de RAM)
+    model.half()          # Passe en float16 (réduit ~50% de RAM)
     
     return model
 
