@@ -1552,67 +1552,34 @@ def detect_professional_level(cv_text: str, job_title: str = "") -> Professional
 # =============================================================================
 
 def _build_cv_text(cv: dict[str, Any]) -> str:
-    ai_data: dict[str, Any] = {}
+    """More robust text extraction."""
+    parts: list[str] = []
+
+    for field in ["summary", "current_position", "cv_raw_text"]:
+        val = cv.get(field)
+        if val:
+            parts.append(str(val))
+
+    ai_data = {}
     raw_ai = cv.get("ai_extracted_data")
     if isinstance(raw_ai, str):
         try:
             ai_data = json.loads(raw_ai)
-        except (json.JSONDecodeError, ValueError):
+        except Exception:
             pass
     elif isinstance(raw_ai, dict):
         ai_data = raw_ai
 
-    work_history = (
-        safe_dict_list(cv.get("work_history"))
-        or safe_dict_list(ai_data.get("work_history"))
-    )
-    projects = (
-        safe_dict_list(cv.get("projects"))
-        or safe_dict_list(ai_data.get("projects"))
-    )
-    education = (
-        safe_dict_list(cv.get("education"))
-        or safe_dict_list(ai_data.get("education"))
-    )
-    skills = (
-        safe_list(cv.get("skills"))
-        or safe_list(ai_data.get("skills"))
-    )
-    certifications = (
-        safe_list(cv.get("certifications"))
-        or safe_list(ai_data.get("certifications"))
-    )
+    for section in ["work_history", "projects", "education", "skills", "certifications"]:
+        items = safe_dict_list(cv.get(section)) or safe_dict_list(ai_data.get(section))
+        for item in items:
+            if isinstance(item, dict):
+                for v in item.values():
+                    if v:
+                        parts.append(str(v))
 
-    parts: list[str] = [
-        str(cv.get("summary", "") or ai_data.get("summary", "")),
-        str(cv.get("current_position", "") or ai_data.get("current_position", "")),
-        " ".join(skills),
-        " ".join(certifications),
-    ]
-    for job in work_history:
-        parts += [
-            str(job.get("title", "")),
-            str(job.get("company", "")),
-            str(job.get("description", "")),
-        ]
-    for project in projects:
-        parts += [
-            str(project.get("name", "")),
-            str(project.get("tech", "")),
-            str(project.get("description", "")),
-            str(project.get("complexity", "")),
-        ]
-    for edu in education:
-        parts += [
-            str(edu.get("degree", "")),
-            str(edu.get("institution", "")),
-        ]
-    cv_raw = cv.get("cv_raw_text", "")
-    if cv_raw:
-        parts.append(str(cv_raw)[:1000])
-
-    return _norm(" ".join(filter(None, parts)))
-
+    combined = " ".join(filter(None, parts))
+    return _norm(combined[:8000])
 
 def _build_job_text(title: str, requirements: str) -> str:
     return _norm(f"{title} {requirements}")
@@ -1677,70 +1644,50 @@ def _extract_tech_keywords(text: str) -> set[str]:
 
 
 def _extract_keywords_from_set(text: str, keywords: tuple[str, ...]) -> set[str]:
-    """Retourne les mots-clés (déjà normalisés) présents dans text (déjà normalisé)."""
     result: set[str] = set()
+    text_norm = _norm(text)
     for kw in keywords:
-        if " " in kw:
-            if kw in text:
-                result.add(kw)
+        kw_norm = _norm(kw)
+        if not kw_norm:
+            continue
+        if " " in kw_norm:
+            if kw_norm in text_norm:
+                result.add(kw_norm)
         else:
-            # word-boundary simulé : vérifie que le mot n'est pas collé à d'autres lettres
-            idx = text.find(kw)
-            while idx != -1:
-                before_ok = (idx == 0 or not text[idx - 1].isalpha())
-                after_ok  = (idx + len(kw) == len(text) or not text[idx + len(kw)].isalpha())
-                if before_ok and after_ok:
-                    result.add(kw)
-                    break
-                idx = text.find(kw, idx + 1)
+            pattern = re.compile(r'(?<!\w)' + re.escape(kw_norm) + r'(?!\w)')
+            if pattern.search(text_norm):
+                result.add(kw_norm)
     return result
 
 
 def _keyword_match(
-    cv_text  : str,
-    job_text : str,
-    keywords : tuple[str, ...] | None = None,
-    is_tech  : bool = False,
+    cv_text: str,
+    job_text: str,
+    keywords: tuple[str, ...] | None = None,
+    is_tech: bool = False,
 ) -> dict[str, Any]:
-    """
-    CORRECTION v3.1 — logique CV-centric pour domaines non-tech.
-
-    Pour les domaines tech (is_tech=True) :
-      On extrait les mots-clés du CV ET du job (offre riche en termes tech).
-      Score = intersection / job_keywords.
-
-    Pour les domaines non-tech (is_tech=False) :
-      On extrait les mots-clés du CV ET du job.
-      Si le job contient suffisamment de keywords (>=3), on score sur ceux-là.
-      Sinon (job trop pauvre) on score sur l'ensemble des keywords du profil
-      présents dans le CV, normalisé sur le total du profil.
-      Cela évite un score 0 quand le job text ne contient aucun keyword.
-    """
     if is_tech or keywords is None:
-        cv_kws  = _extract_tech_keywords(cv_text)
+        cv_kws = _extract_tech_keywords(cv_text)
         job_kws = _extract_tech_keywords(job_text)
         matched = sorted(cv_kws & job_kws)
         missing = sorted(job_kws - cv_kws)
-        score   = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
+        score = 50.0 if not job_kws else (len(matched) / len(job_kws)) * 100
         return {"score": _clamp(score), "matched": matched, "missing": missing}
 
-    # --- Domaine non-tech : approche CV-centric ---
-    cv_kws  = _extract_keywords_from_set(cv_text,  keywords)
+    # Non-tech CV-centric
+    cv_kws = _extract_keywords_from_set(cv_text, keywords)
     job_kws = _extract_keywords_from_set(job_text, keywords)
 
     if len(job_kws) >= 3:
-        # Le job est suffisamment dense : on mesure l'alignement CV ↔ job
         matched = sorted(cv_kws & job_kws)
         missing = sorted(job_kws - cv_kws)
-        score   = (len(matched) / len(job_kws)) * 100
+        score = (len(matched) / len(job_kws)) * 100
     else:
-        # Le job est trop pauvre : on mesure la couverture du CV sur le profil entier
-        total_profile_kws = len(keywords)
+        total_profile = len(keywords)
         matched = sorted(cv_kws)
-        missing = []  # on ne peut pas déterminer ce qui "manque" depuis le job
-        score   = (len(cv_kws) / max(total_profile_kws, 1)) * 100 if cv_kws else 0.0
-        # Normalise : un CV couvrant 20 % du profil → bon score (scale ×3, cap 100)
-        score   = min(score * 3.0, 100.0)
+        missing = []
+        coverage = (len(cv_kws) / max(total_profile, 1)) * 100
+        score = min(coverage * 3.0, 100.0)
 
     return {"score": _clamp(score), "matched": matched, "missing": missing}
 
@@ -1782,42 +1729,33 @@ def _tfidf_cosine_similarity(text_a: str, text_b: str) -> float:
 
 
 def _semantic_score(cv_text: str, job_text: str) -> float:
-    global _neural_model_available
-
-    cv_text  = cv_text[:4000]
+    cv_text = cv_text[:4000]
     job_text = job_text[:2000]
 
     if not cv_text or not job_text:
+        logger.warning("[scoring] Empty text for semantic scoring")
         return 0.0
 
-    # Tente le modèle neural seulement si pas encore marqué indisponible
-    with _neural_model_lock:
-        try_neural = (_neural_model_available is not False)
-
-    if try_neural:
-        try:
-            from sklearn.metrics.pairwise import cosine_similarity
-            model = _get_model()
-            if model is not None:
-                embeddings = model.encode(
-                    [cv_text, job_text],
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                )
-                similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
-                with _neural_model_lock:
+    # Try neural (if available)
+    try:
+        with _neural_model_lock:
+            if _neural_model_available is not False:
+                model = _get_model()
+                if model:
+                    from sklearn.metrics.pairwise import cosine_similarity
+                    embeddings = model.encode([cv_text, job_text], convert_to_numpy=True, normalize_embeddings=True)
+                    sim = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
                     _neural_model_available = True
-                return _clamp(float(similarity) * 100)
-            else:
-                with _neural_model_lock:
-                    _neural_model_available = False
-        except Exception as exc:
-            print(f"[scoring] Neural semantic error (switching to TF-IDF): {exc}")
-            with _neural_model_lock:
-                _neural_model_available = False
+                    return _clamp(float(sim) * 100)
+    except Exception as e:
+        logger.debug(f"Neural failed: {e}")
+        with _neural_model_lock:
+            _neural_model_available = False
 
-    # Fallback TF-IDF
-    return _tfidf_cosine_similarity(cv_text, job_text)
+    # Pure Python fallback
+    score = _simple_semantic_similarity(cv_text, job_text)
+    logger.info(f"[scoring] Semantic score: {score:.1f} (pure Python fallback)")
+    return score
 
 
 # =============================================================================
