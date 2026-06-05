@@ -1614,6 +1614,31 @@ def compute_candidate_score_compat(cv_text: str, job_title: str, job_requirement
         job_requirements=job_requirements
     )
 
+def _build_cv_text(cv_data: dict) -> str:
+    """Private helper expected by cv_processing.py"""
+    if not isinstance(cv_data, dict):
+        return str(cv_data)
+    
+    parts = []
+    if cv_data.get("summary"):
+        parts.append(cv_data["summary"])
+    if cv_data.get("full_name"):
+        parts.append(cv_data["full_name"])
+    
+    for exp in cv_data.get("work_history", []):
+        parts.append(exp.get("title", ""))
+        parts.append(exp.get("description", ""))
+    
+    for proj in cv_data.get("projects", []):
+        parts.append(proj.get("name", ""))
+        parts.append(proj.get("description", ""))
+    
+    for cert in cv_data.get("certifications", []):
+        parts.append(str(cert))
+    
+    return " ".join(filter(None, parts))
+
+
 
 # Export everything needed
 __all__ = [
@@ -1622,6 +1647,8 @@ __all__ = [
     'classify_domain',
     'score_candidate',
     'score_to_dict',
-    'Domain',
+    'Domain','HierarchyLevel'
     # ... add more if other files complain
 ]
+
+
