@@ -1,7 +1,5 @@
-# app/tasks/drive_sync.py
-
 """
-Drive Sync Pipeline 
+Drive Sync Pipeline — v2.1
 
 Pipeline:
 1. Scan Google Drive folder
@@ -12,6 +10,12 @@ Pipeline:
 6. AI parsing
 7. Score candidate  (job match → best active job → synthetic quality fallback)
 8. Insert into DB
+
+Changelog v2.1:
+- Supabase client created once per sync, passed into process_drive_file
+- dimension_scores damping in _quality_fallback no longer mutates in-place
+- insert_candidate duplicate check uses Postgres error code 23505 as primary signal
+- Removed unused DOMAIN_SKILLS import
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import textwrap
 
 from app.config import get_settings
 from app.db.supabase_client import get_supabase_admin
@@ -34,7 +39,6 @@ from app.services.scoring_service import (
     compute_candidate_score,
     classify_domain,
     Domain,
-    DOMAIN_SKILLS,
 )
 from app.tasks.cv_processing import (
     build_candidate_payload,
@@ -44,6 +48,12 @@ from app.tasks.cv_processing import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Quality-fallback dampening constants
+_KW_DAMPEN  = 0.85
+_KW_CAP     = 85.0
+_SEM_DAMPEN = 0.80
+_SEM_CAP    = 75.0
 
 
 # --------------------------------------------------------------------------- #
@@ -77,10 +87,7 @@ def upload_cv_to_storage(
     supabase.storage.from_("cvs").upload(
         storage_path,
         pdf_bytes,
-        file_options={
-            "content-type": "application/pdf",
-            "upsert": "true",
-        },
+        file_options={"content-type": "application/pdf", "upsert": "true"},
     )
     return supabase.storage.from_("cvs").get_public_url(storage_path)
 
@@ -93,7 +100,10 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
             "candidate_id": response.data[0]["id"],
         }
     except Exception as exc:
-        if "uq_candidates_drive_file_id" in str(exc):
+        exc_str = str(exc)
+        # Postgres unique-violation error code is authoritative; constraint name
+        # is a fallback for environments that surface it differently.
+        if "23505" in exc_str or "uq_candidates_drive_file_id" in exc_str:
             return {
                 "status":        "skipped",
                 "reason":        "duplicate",
@@ -108,7 +118,8 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 
 def _quality_fallback(extracted: dict) -> dict:
     """
-    Balanced autonomous scoring - avoids giving 1.0 to everything.
+    Balanced autonomous scoring when no job is available.
+    Applies realistic dampening without mutating the score dict in-place.
     """
     position = (
         extracted.get("current_position")
@@ -117,26 +128,20 @@ def _quality_fallback(extracted: dict) -> dict:
     )
     domain_str = classify_domain(position)
 
-    skills = extracted.get("skills", [])[:25]
+    skills      = extracted.get("skills", [])[:25]
     work_history = extracted.get("work_history", [])
-    projects = extracted.get("projects", [])
+    projects    = extracted.get("projects", [])
 
-    exp_titles = [exp.get("title", "") for exp in work_history if exp.get("title")]
-    proj_names = [p.get("name", "") for p in projects if p.get("name")]
+    exp_titles = [e.get("title", "") for e in work_history if e.get("title")]
+    proj_names = [p.get("name",  "") for p in projects     if p.get("name")]
 
-    skills_str = ", ".join(skills) if skills else ""
-    exp_str = ", ".join(exp_titles[:10]) if exp_titles else ""
-    proj_str = ", ".join(proj_names[:5]) if proj_names else ""
+    synthetic_jd = textwrap.dedent(f"""
+        Nous recherchons un {position} expérimenté.
 
-    synthetic_title = position
-
-    synthetic_jd = f"""
-    Nous recherchons un {synthetic_title} expérimenté.
-
-    Compétences : {skills_str}
-    Expérience : {exp_str}
-    Projets : {proj_str}
-    """
+        Compétences : {", ".join(skills) if skills else ""}
+        Expérience  : {", ".join(exp_titles[:10]) if exp_titles else ""}
+        Projets     : {", ".join(proj_names[:5]) if proj_names else ""}
+    """).strip()
 
     cv_data = dict(extracted)
     raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
@@ -145,15 +150,18 @@ def _quality_fallback(extracted: dict) -> dict:
 
     result = compute_candidate_score(
         cv_data=cv_data,
-        job_title=synthetic_title,
-        job_requirements=synthetic_jd.strip(),
+        job_title=position,
+        job_requirements=synthetic_jd,
     )
 
-    # Force more realistic scores in quality mode
-    dims = result.get("dimension_scores", {})
-    dims["keyword_score"] = min(dims.get("keyword_score", 0) * 0.85, 85)
-    dims["semantic_score"] = min(dims.get("semantic_score", 0) * 0.8, 75)
-
+    # Dampen keyword/semantic scores without mutating the original dict
+    original_dims = result.get("dimension_scores", {})
+    dampened_dims = {
+        **original_dims,
+        "keyword_score":  min(original_dims.get("keyword_score",  0) * _KW_DAMPEN,  _KW_CAP),
+        "semantic_score": min(original_dims.get("semantic_score", 0) * _SEM_DAMPEN, _SEM_CAP),
+    }
+    result = {**result, "dimension_scores": dampened_dims}
     result["reasoning"] = f"Score qualité autonome — {domain_str}"
     return result
 
@@ -164,7 +172,10 @@ def resolve_candidate_score(
     job_id: str | None,
 ) -> tuple[dict, str | None]:
     """
-    Improved scoring with rich fallback.
+    Three-tier scoring resolution:
+      1. Explicit job_id → score against that job
+      2. Best-matching active job
+      3. Quality fallback (synthetic JD from CV content)
     """
     if job_id:
         job = fetch_job(supabase, job_id)
@@ -177,25 +188,25 @@ def resolve_candidate_score(
             )
             return score_result, job_id
 
-    # Try best matching job
     jobs = fetch_active_jobs(supabase)
     if jobs:
         best_result, best_id = compute_best_job_match(supabase, extracted, jobs)
         if best_result:
             return best_result, best_id
 
-    # RICH FALLBACK — this is the important part
-    logger.info("No active job → using rich quality fallback")
-    fallback = _quality_fallback(extracted)
-    return fallback, None
+    logger.info("No active job → using quality fallback")
+    return _quality_fallback(extracted), None
+
 
 # --------------------------------------------------------------------------- #
 # MAIN PROCESSOR
 # --------------------------------------------------------------------------- #
 
-def process_drive_file(drive_file_id: str, job_id: str | None = None) -> dict:
-    supabase = get_supabase_admin()
-
+def process_drive_file(
+    drive_file_id: str,
+    supabase,                       # ← injected by caller; no new client per file
+    job_id: str | None = None,
+) -> dict:
     try:
         # 1. Idempotency check
         if candidate_exists(supabase, drive_file_id):
@@ -214,19 +225,13 @@ def process_drive_file(drive_file_id: str, job_id: str | None = None) -> dict:
         raw_text = extract_text_from_bytes(pdf_bytes)
         if not raw_text.strip():
             logger.warning("Empty text extracted from file: %s", drive_file_id)
-            return {
-                "status":        "failed",
-                "reason":        "empty_text",
-                "drive_file_id": drive_file_id,
-            }
+            return {"status": "failed", "reason": "empty_text", "drive_file_id": drive_file_id}
 
         # 5. AI extraction
         extracted = extract_cv_info(raw_text)
 
-        # 6. Scoring (job match → best active job → synthetic quality fallback)
-        score_result, resolved_job_id = resolve_candidate_score(
-            supabase, extracted, job_id
-        )
+        # 6. Scoring
+        score_result, resolved_job_id = resolve_candidate_score(supabase, extracted, job_id)
         logger.info(
             "Scored file %s → %.1f (job_id=%s)",
             drive_file_id,
@@ -250,13 +255,9 @@ def process_drive_file(drive_file_id: str, job_id: str | None = None) -> dict:
         # 8. Insert
         return insert_candidate(supabase, payload, drive_file_id)
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Error processing Drive file %s", drive_file_id)
-        return {
-            "status":        "error",
-            "error":         str(exc),
-            "drive_file_id": drive_file_id,
-        }
+        return {"status": "error", "drive_file_id": drive_file_id}
 
 
 # --------------------------------------------------------------------------- #
@@ -269,7 +270,7 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
     if not settings.drive_folder_id:
         return {"status": "skipped", "reason": "missing_drive_folder_id"}
 
-    supabase = get_supabase_admin()
+    supabase = get_supabase_admin()  # single client for the entire sync
     files    = list_pdf_files(settings.drive_folder_id)
 
     existing = supabase.table("candidates").select("drive_file_id").execute()
@@ -280,26 +281,21 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
     }
 
     results = []
-    queued  = 0
-
     for file_data in files:
         file_id = file_data["id"]
         if file_id in processed_ids:
             continue
-        result = process_drive_file(file_id, job_id)
-        results.append(result)
-        queued += 1
+        results.append(process_drive_file(file_id, supabase, job_id))
 
     errors = [r for r in results if r.get("status") == "error"]
     logger.info(
         "sync_drive_folder complete — total=%d queued=%d errors=%d",
-        len(files), queued, len(errors),
+        len(files), len(results), len(errors),
     )
-
     return {
         "status":      "done",
         "total_files": len(files),
-        "queued":      queued,
+        "queued":      len(results),
         "errors":      len(errors),
     }
 
@@ -325,7 +321,6 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
     )
     page_token = config_row.data["value"] if config_row.data else None
 
-    # No stored token → fall back to full folder scan
     if not page_token:
         logger.info("No page token found — falling back to full folder sync")
         return sync_drive_folder(job_id)
@@ -335,7 +330,7 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
         page_token,
     )
 
-    results = [process_drive_file(f["id"], job_id) for f in new_files]
+    results = [process_drive_file(f["id"], supabase, job_id) for f in new_files]
     errors  = [r for r in results if r.get("status") == "error"]
 
     supabase.table("app_config").upsert(
@@ -346,7 +341,6 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
         "sync_drive_webhook complete — new=%d errors=%d",
         len(new_files), len(errors),
     )
-
     return {
         "status":    "done",
         "new_files": len(new_files),
