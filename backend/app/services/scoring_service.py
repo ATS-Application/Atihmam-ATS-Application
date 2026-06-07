@@ -979,7 +979,7 @@ def compute_keyword_score(
 
     # Ratio limité : matched / min(total_keywords, 12)
     ratio = len(matched) / denominator
-    score = round(min(ratio * 1.2, 1.0), 3)
+    score = round(min(ratio * 1.5, 1.0), 3)
 
     return score, {
         "total_keywords": len(all_keywords),
