@@ -1,21 +1,15 @@
 # ============================================================================
 # backend/app/api/v1/candidates.py
 # ============================================================================
-# Smart ATS Candidate API
-#
-# Features:
-# - CRUD operations for candidates
-# - Candidate status workflow transitions
-# - Safe data sanitization
-# - CV depth analysis
-# - Supabase integration
-# - Clean architecture
-# ============================================================================
-
-# ============================================================================
-# backend/app/api/v1/candidates.py
-# ============================================================================
 # Smart ATS — Candidates API
+#
+# Changelog v2.1:
+# - Removed compute_cv_quality_score import (function deleted from scoring_service)
+# - backfill_dimensions now uses _quality_fallback from cv_processing (single source)
+# - compute_candidate_score call in score_candidate_against_job: removed
+#   required_experience kwarg (not part of the scorer's public interface;
+#   scoring_service now absorbs unknown kwargs gracefully via **_ignored_kwargs)
+# - build_cv_data injects cv_raw_text as raw_text so scorer has full CV body
 # ============================================================================
 
 from __future__ import annotations
@@ -48,8 +42,8 @@ from app.models.candidate import (
     CandidateUpdate,
 )
 from app.services.ai_service import analyze_cv_depth
-from app.services.scoring_service import compute_candidate_score, compute_cv_quality_score
-from app.tasks.cv_processing import fetch_job
+from app.services.scoring_service import compute_candidate_score
+from app.tasks.cv_processing import fetch_job, _quality_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +66,6 @@ def check_rate_limit(key: str, max_calls: int = 10, window_seconds: int = 60) ->
     now = time.monotonic()
     bucket = _rate_limit_buckets[key]
 
-    # Evict timestamps older than the window
     while bucket and bucket[0] <= now - window_seconds:
         bucket.popleft()
 
@@ -81,7 +74,6 @@ def check_rate_limit(key: str, max_calls: int = 10, window_seconds: int = 60) ->
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Rate limit exceeded: max {max_calls} requests per {window_seconds}s.",
         )
-
     bucket.append(now)
 
 
@@ -89,9 +81,7 @@ def check_rate_limit(key: str, max_calls: int = 10, window_seconds: int = 60) ->
 # HELPERS
 # ============================================================================
 
-
 def ensure_list(value: Any) -> list:
-    """Normalize a field to always be a list."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -105,7 +95,6 @@ def ensure_list(value: Any) -> list:
 
 
 def sanitize_candidate(candidate: dict) -> dict:
-    """Normalize candidate fields before returning from the API."""
     for field in ("skills", "certifications", "extracted_skills"):
         candidate[field] = ensure_list(candidate.get(field))
     if candidate.get("job_id"):
@@ -114,7 +103,6 @@ def sanitize_candidate(candidate: dict) -> dict:
 
 
 def get_candidate_or_404(supabase, candidate_id: UUID) -> dict:
-    """Fetch a candidate row or raise HTTP 404."""
     resp = (
         supabase.table("candidates")
         .select("*")
@@ -130,7 +118,8 @@ def get_candidate_or_404(supabase, candidate_id: UUID) -> dict:
 def build_cv_data(candidate: dict) -> dict:
     """
     Merge top-level candidate columns with ai_extracted_data.
-    Top-level columns always take precedence.
+    Top-level columns take precedence. raw_text is injected from cv_raw_text
+    so the scorer always has the full CV body available.
     """
     ai_data = candidate.get("ai_extracted_data") or {}
     if isinstance(ai_data, str):
@@ -141,14 +130,16 @@ def build_cv_data(candidate: dict) -> dict:
 
     return {
         **ai_data,
+        # raw_text is the key the scorer reads first
+        "raw_text":         candidate.get("cv_raw_text", ""),
         "cv_raw_text":      candidate.get("cv_raw_text", ""),
-        "skills":           candidate.get("skills") or ai_data.get("skills", []),
-        "work_history":     candidate.get("work_history") or ai_data.get("work_history", []),
-        "education":        candidate.get("education") or ai_data.get("education", []),
+        "skills":           candidate.get("skills")           or ai_data.get("skills", []),
+        "work_history":     candidate.get("work_history")     or ai_data.get("work_history", []),
+        "education":        candidate.get("education")        or ai_data.get("education", []),
         "experience_years": candidate.get("experience_years") or ai_data.get("experience_years"),
-        "certifications":   candidate.get("certifications") or ai_data.get("certifications", []),
-        "projects":         candidate.get("projects") or ai_data.get("projects", []),
-        "summary":          candidate.get("summary") or ai_data.get("summary", ""),
+        "certifications":   candidate.get("certifications")   or ai_data.get("certifications", []),
+        "projects":         candidate.get("projects")         or ai_data.get("projects", []),
+        "summary":          candidate.get("summary")          or ai_data.get("summary", ""),
         "current_position": candidate.get("current_position") or ai_data.get("current_position", ""),
     }
 
@@ -157,21 +148,18 @@ def build_cv_data(candidate: dict) -> dict:
 # LIST & RETRIEVE
 # ============================================================================
 
-
 @router.get("/", response_model=list[CandidateResponse])
 async def list_candidates(
     job_id: UUID | None = Query(None),
     status_filter: str | None = Query(default=None, alias="status"),
     user: dict = Depends(get_current_user),
 ):
-    """Return all candidates, optionally filtered by job or status."""
     supabase = get_supabase()
     query = supabase.table("candidates").select("*")
     if job_id:
         query = query.eq("job_id", str(job_id))
     if status_filter:
         query = query.eq("status", status_filter)
-
     candidates = query.order("created_at", desc=True).execute().data or []
     return [sanitize_candidate(c) for c in candidates]
 
@@ -181,7 +169,6 @@ async def get_candidate(
     candidate_id: UUID,
     user: dict = Depends(get_current_user),
 ):
-    """Retrieve a single candidate by ID."""
     supabase = get_supabase()
     return sanitize_candidate(get_candidate_or_404(supabase, candidate_id))
 
@@ -190,25 +177,20 @@ async def get_candidate(
 # CREATE & UPDATE
 # ============================================================================
 
-
 @router.post("/", response_model=CandidateResponse, status_code=status.HTTP_201_CREATED)
 async def create_candidate(
     payload: CandidateCreate,
     user: dict = Depends(get_current_user),
 ):
-    """Create a new candidate record."""
     supabase = get_supabase()
     data = payload.model_dump(exclude_none=True)
-
     for field in ("skills", "certifications", "extracted_skills"):
         data[field] = ensure_list(data.get(field))
     if data.get("job_id"):
         data["job_id"] = str(data["job_id"])
-
     resp = supabase.table("candidates").insert(data).execute()
     if not resp.data:
         raise HTTPException(status_code=500, detail="Failed to create candidate")
-
     return sanitize_candidate(resp.data[0])
 
 
@@ -218,18 +200,15 @@ async def update_candidate(
     payload: CandidateUpdate,
     user: dict = Depends(get_current_user),
 ):
-    """Partially update a candidate record."""
     supabase = get_supabase()
     data = payload.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(status_code=400, detail="No fields provided for update")
-
     for field in ("skills", "certifications", "extracted_skills"):
         if field in data:
             data[field] = ensure_list(data[field])
     if data.get("job_id"):
         data["job_id"] = str(data["job_id"])
-
     resp = (
         supabase.table("candidates")
         .update(data)
@@ -238,14 +217,12 @@ async def update_candidate(
     )
     if not resp.data:
         raise HTTPException(status_code=404, detail="Candidate not found")
-
     return sanitize_candidate(resp.data[0])
 
 
 # ============================================================================
 # SCORING
 # ============================================================================
-
 
 @router.post("/{candidate_id}/score", summary="Score a candidate against a job offer")
 async def score_candidate_against_job(
@@ -256,9 +233,7 @@ async def score_candidate_against_job(
 ):
     """
     Run the full domain-aware scoring pipeline for a candidate against a job,
-    then persist the result.
-
-    Rate-limited to 10 requests per minute per user.
+    then persist the result. Rate-limited to 10 requests per minute per user.
     """
     check_rate_limit(key=f"score:{user['id']}", max_calls=10, window_seconds=60)
     supabase = get_supabase()
@@ -283,18 +258,14 @@ async def score_candidate_against_job(
             cv_data=cv_data,
             job_title=job.get("title", ""),
             job_requirements=job.get("requirements", ""),
-            required_experience=job.get("required_experience", 5),
-            supabase=supabase,
         )
 
         supabase.table("candidates").update({
-            "score":             score_result["score"],
-            "dimension_scores":  score_result["dimension_scores"],
-            "score_confidence":  score_result.get("confidence"),
-            "score_reasoning":   score_result.get("reasoning"),
-            "professional_level": score_result.get("professional_level"),
-            "warnings":          score_result.get("warnings", []),
-            "job_id":            str(job_id),
+            "score":            score_result["score"],
+            "dimension_scores": score_result["dimension_scores"],
+            "score_confidence": score_result.get("confidence"),
+            "score_reasoning":  score_result.get("reasoning"),
+            "job_id":           str(job_id),
         }).eq("id", str(candidate_id)).execute()
 
         logger.info("Score calculated for candidate %s vs job %s", candidate_id, job_id)
@@ -311,14 +282,12 @@ async def score_candidate_against_job(
 # STATUS TRANSITION
 # ============================================================================
 
-
 @router.post("/{candidate_id}/transition", response_model=CandidateResponse)
 async def transition_candidate_status(
     candidate_id: UUID,
     payload: CandidateStatusTransition,
     user: dict = Depends(get_current_user),
 ):
-    """Transition a candidate's status through the configured workflow."""
     supabase = get_supabase()
 
     row = (
@@ -359,13 +328,11 @@ async def transition_candidate_status(
 # CV DEPTH ANALYSIS
 # ============================================================================
 
-
 @router.get("/{candidate_id}/depth")
 async def get_candidate_cv_depth(
     candidate_id: UUID,
     user: dict = Depends(get_current_user),
 ):
-    """Run an AI-powered depth analysis on a candidate's CV."""
     supabase = get_supabase()
     candidate = get_candidate_or_404(supabase, candidate_id)
     report = analyze_cv_depth(candidate)
@@ -376,13 +343,11 @@ async def get_candidate_cv_depth(
 # DELETE
 # ============================================================================
 
-
 @router.delete("/{candidate_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_candidate(
     candidate_id: UUID,
     user: dict = Depends(get_current_user),
 ):
-    """Permanently delete a single candidate."""
     supabase = get_supabase()
     resp = (
         supabase.table("candidates")
@@ -397,7 +362,6 @@ async def delete_candidate(
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_all_candidates(user: dict = Depends(get_current_user)):
-    """Permanently delete every candidate record."""
     supabase = get_supabase()
     supabase.table("candidates").delete().neq(
         "id", "00000000-0000-0000-0000-000000000000"
@@ -409,13 +373,12 @@ async def delete_all_candidates(user: dict = Depends(get_current_user)):
 # ADMIN — BACKFILL
 # ============================================================================
 
-
 @router.post("/admin/backfill-dimensions")
 async def backfill_dimensions(supabase=Depends(get_supabase_admin)):
     """
     Re-score all completed candidates with the latest scoring pipeline.
-    Candidates linked to a job use `compute_candidate_score`;
-    unlinked candidates fall back to `compute_cv_quality_score`.
+    Candidates linked to a job use compute_candidate_score;
+    unlinked candidates (or those whose job was deleted) use _quality_fallback.
     """
     candidates = (
         supabase.table("candidates")
@@ -428,25 +391,28 @@ async def backfill_dimensions(supabase=Depends(get_supabase_admin)):
     updated = 0
     for c in candidates:
         try:
+            cv_data = build_cv_data(c)
+            result = None
+
             if c.get("job_id"):
                 job = fetch_job(supabase, c["job_id"])
-                result = compute_candidate_score(
-                    cv_data=build_cv_data(c),
-                    job_title=job.get("title", ""),
-                    job_requirements=job.get("requirements", ""),
-                    supabase=supabase,
-                ) if job else compute_cv_quality_score(c, supabase=supabase)
-            else:
-                result = compute_cv_quality_score(c, supabase=supabase)
+                if job:
+                    result = compute_candidate_score(
+                        cv_data=cv_data,
+                        job_title=job.get("title", ""),
+                        job_requirements=job.get("requirements", ""),
+                    )
+
+            if not result:
+                # No job, or job was deleted — quality fallback
+                result = _quality_fallback(cv_data)
 
             supabase.table("candidates").update({
-                "score":             result.get("score"),
-                "dimension_scores":  result.get("dimension_scores"),
-                "matched_keywords":  result.get("matched_keywords", []),
-                "missing_keywords":  result.get("missing_keywords", []),
-                "score_reasoning":   result.get("reasoning"),
-                "professional_level": result.get("professional_level"),
-                "warnings":          result.get("warnings", []),
+                "score":            result.get("score"),
+                "dimension_scores": result.get("dimension_scores"),
+                "matched_keywords": result.get("matched_keywords", []),
+                "missing_keywords": result.get("missing_keywords", []),
+                "score_reasoning":  result.get("reasoning"),
             }).eq("id", c["id"]).execute()
 
             updated += 1
