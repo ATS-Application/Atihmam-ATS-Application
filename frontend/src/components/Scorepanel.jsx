@@ -313,16 +313,14 @@ export default function ScorePanel({ candidate }) {
 
   // ── Derived data ────────────────────────────────────────────────────────────
 
-   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
-
    const dims = useMemo(() => {
     let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
-  
+
     if (typeof raw === "string") {
       try { raw = JSON.parse(raw); } catch { raw = {}; }
     }
     if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
-  
+
     const merged = {
       keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
       semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
@@ -333,13 +331,14 @@ export default function ScorePanel({ candidate }) {
       leadership_score: candidate?.leadership_score ?? raw.leadership_score,
       ...raw,
     };
-  
-    // Normalize all values to 0-100 scale
+
+    // Safer normalization: detect scale automatically
     return Object.fromEntries(
-      Object.entries(merged).map(([key, value]) => [
-        key,
-        value > 1 ? value : (value ?? 0) * 100   // if already >1, keep it; else convert
-      ])
+      Object.entries(merged).map(([key, value]) => {
+        const num = parseFloat(value) || 0;
+        // If value is already between 0-100, keep it. If 0-1, convert.
+        return [key, num > 5 ? num : num * 100];
+      })
     );
   }, [candidate, aiData]);
 
