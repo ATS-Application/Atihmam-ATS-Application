@@ -107,19 +107,15 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _quality_fallback(extracted: dict) -> dict:
-    """
-    HIGH-QUALITY autonomous scoring for Drive CVs.
-    """
+    """Rich autonomous scoring - This is the key function."""
     position = (
         extracted.get("current_position")
         or extracted.get("title")
         or "Acheteur Senior Logistique"
     )
 
-    # FIX: classify_domain only accepts 1 or 2 arguments
-    domain_str = classify_domain(position)   # ← Correct call
+    domain_str = classify_domain(position)   # Correct call
 
-    # Rich content extraction
     skills = extracted.get("skills", [])[:30]
     work_history = extracted.get("work_history", [])
     projects = extracted.get("projects", [])
@@ -138,19 +134,14 @@ def _quality_fallback(extracted: dict) -> dict:
 
     Compétences attendues : {skills_str}.
 
-    Expériences professionnelles : {exp_str}.
+    Expériences : {exp_str}.
 
-    Projets et réalisations : {proj_str}.
+    Projets : {proj_str}.
 
-    Missions clés :
-    - Pilotage stratégique des achats et optimisation des coûts (TCO)
-    - Sourcing international, gestion des transitaires, procédures douanières, Incoterms
-    - Négociation contractuelle et management de panels fournisseurs
-    - Suivi KPI, reporting budgétaire, utilisation SAGE X3 / ERP
-    - Gestion de projets multi-sites et sécurisation de la chaîne d'approvisionnement
+    Missions : Pilotage achats, sourcing international, Incoterms, SAGE X3, optimisation TCO, 
+    négociation fournisseurs, gestion multi-chantiers, suivi KPI.
     """
 
-    # Ensure full raw text is passed
     cv_data = dict(extracted)
     raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
     if raw_text:
@@ -162,47 +153,31 @@ def _quality_fallback(extracted: dict) -> dict:
         job_requirements=synthetic_jd.strip(),
     )
 
-    result["reasoning"] = (
-        f"Score qualité autonome — Domaine : {domain_str}. "
-        "Évaluation basée sur la richesse du parcours (Achats & Logistique)."
-    )
-    result["matched_job"] = None
-
+    result["reasoning"] = f"Score qualité autonome — {domain_str} — CV riche en Achats/Logistique"
     return result
 
+
 def resolve_candidate_score(
-    supabase,
-    extracted: dict,
-    job_id: str | None,
+    supabase, extracted: dict, job_id: str | None
 ) -> tuple[dict, str | None]:
-    """
-    Improved scoring strategy.
-    """
     if job_id:
         job = fetch_job(supabase, job_id)
         if job:
-            score_result = compute_candidate_score(
+            return compute_candidate_score(
                 cv_data=extracted,
                 job_title=job.get("title", ""),
                 job_requirements=job.get("requirements", ""),
-                supabase=supabase,
-            )
-            return score_result, job_id
+            ), job_id
 
-    # Try best job match
     jobs = fetch_active_jobs(supabase)
     if jobs:
-        score_result, resolved_job_id = compute_best_job_match(
-            supabase=supabase, cv_info=extracted, jobs=jobs
-        )
-        if score_result:
-            return score_result, resolved_job_id
+        best, best_id = compute_best_job_match(supabase, extracted, jobs)
+        if best:
+            return best, best_id
 
-    # Final fallback — RICH synthetic scoring
-    logger.info("No active jobs — using rich quality fallback")
-    fallback = _quality_fallback(extracted)
-    return fallback, None
-
+    # Rich fallback
+    logger.info("Using rich quality fallback")
+    return _quality_fallback(extracted), None
 
 # --------------------------------------------------------------------------- #
 # MAIN PROCESSOR
