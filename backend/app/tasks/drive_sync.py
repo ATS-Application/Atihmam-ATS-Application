@@ -10,7 +10,7 @@ Pipeline:
 4. Upload to Supabase storage
 5. Extract text
 6. AI parsing
-7. Score candidate  (job match → best active job → quality fallback)
+7. Score candidate  (job match → best active job → synthetic quality fallback)
 8. Insert into DB
 """
 
@@ -32,9 +32,9 @@ from app.services.drive_service import (
 )
 from app.services.scoring_service import (
     compute_candidate_score,
-    _build_cv_text,
-    compute_cv_quality_score,
     classify_domain,
+    Domain,
+    DOMAIN_SKILLS,
 )
 from app.tasks.cv_processing import (
     build_candidate_payload,
@@ -108,45 +108,39 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 
 def _quality_fallback(extracted: dict) -> dict:
     """
-    Wraps compute_cv_quality_score (plain text input) into the score_result
-    shape expected by build_candidate_payload. Stores all dimension keys
-    required by ScorePanel.jsx so nothing renders as zero unexpectedly.
+    Scores a CV without a real job posting by synthesizing a generic job
+    description from the CV's own domain and detected skills.
+    All 8 dimensions are computed; results reflect CV quality, not job fit.
     """
-    cv_text    = _build_cv_text(extracted)
-    quality    = compute_cv_quality_score(cv_text)
-    lang_score = round(quality["language_quality"] / 100.0, 3)
-    comp_score = round(quality["complexity"] / 100.0, 3)
-    exp_score  = round(min(float(extracted.get("experience_years") or 0) / 10.0, 1.0), 3)
+    position   = extracted.get("current_position") or ""
+    domain_str = classify_domain(position)
 
-    return {
-        "score":            round(quality["quality_score"], 2),
-        "confidence":       0.5,
-        "domain":           classify_domain(extracted.get("current_position") or ""),
-        "hierarchy_level":  "collaborateur",
-        "reasoning":        quality["overall_assessment"],
-        "matched_keywords": [],
-        "missing_keywords": [],
-        "dimension_scores": {
-            # canonical v2.0 keys
-            "experience":     exp_score,
-            "education":      0.0,
-            "certifications": 0.0,
-            "semantic":       0.0,
-            "keywords":       0.0,
-            "leadership":     0.0,
-            "language":       lang_score,
-            "complexity":     comp_score,
-            # frontend aliases (ScorePanel.jsx)
-            "keyword_score":            0.0,
-            "semantic_score":           0.0,
-            "experience_score":         exp_score,
-            "project_complexity_score": comp_score,
-            "education_score":          0.0,
-            "certification_score":      0.0,
-            "leadership_score":         0.0,
-            "language_score":           lang_score,
-        },
-    }
+    try:
+        domain_enum   = Domain(domain_str)
+        domain_skills = DOMAIN_SKILLS.get(domain_enum, [])
+    except ValueError:
+        domain_skills = []
+
+    skills_str      = ", ".join(domain_skills[:15]) if domain_skills else "expérience professionnelle"
+    synthetic_title = position or f"Professionnel {domain_str}"
+    synthetic_jd    = (
+        f"Profil recherché : {synthetic_title}. "
+        f"Compétences attendues : {skills_str}. "
+        f"Expérience significative dans le domaine {domain_str} requise."
+    )
+
+    result = compute_candidate_score(
+        cv_data=extracted,
+        job_title=synthetic_title,
+        job_requirements=synthetic_jd,
+    )
+
+    result["reasoning"] = (
+        f"Score qualité autonome — domaine détecté : {domain_str}. "
+        "Aucun poste actif associé."
+    )
+    result["matched_job"] = None
+    return result
 
 
 def resolve_candidate_score(
@@ -158,7 +152,7 @@ def resolve_candidate_score(
     Scoring strategy (mirrors process_cv exactly):
       1. Explicit job_id  → score against that job
       2. No job_id        → find best match among active jobs
-      3. No active jobs   → standalone CV quality score
+      3. No active jobs   → synthetic JD quality score (all 8 dimensions)
 
     Returns (score_result, resolved_job_id).
     """
@@ -185,7 +179,7 @@ def resolve_candidate_score(
                 return score_result, resolved_job_id
 
     # Fallback: no job linked and no active jobs
-    logger.info("No active jobs found — computing standalone CV quality score")
+    logger.info("No active jobs — computing synthetic quality score")
     return _quality_fallback(extracted), resolved_job_id
 
 
@@ -223,7 +217,7 @@ def process_drive_file(drive_file_id: str, job_id: str | None = None) -> dict:
         # 5. AI extraction
         extracted = extract_cv_info(raw_text)
 
-        # 6. Scoring (job match → best active job → quality fallback)
+        # 6. Scoring (job match → best active job → synthetic quality fallback)
         score_result, resolved_job_id = resolve_candidate_score(
             supabase, extracted, job_id
         )
