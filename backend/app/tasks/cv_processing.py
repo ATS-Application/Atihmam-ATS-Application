@@ -406,3 +406,66 @@ def build_candidate_payload(
         payload["job_id"] = job_id
 
     return payload
+
+def _quality_fallback(extracted: dict) -> dict:
+    """
+    HIGH-QUALITY autonomous scoring for CVs without linked job.
+    Used by both Drive sync and manual upload.
+    """
+    position = (
+        extracted.get("current_position")
+        or extracted.get("title")
+        or "Acheteur Senior Logistique"
+    )
+
+    # Correct call - classify_domain accepts 1 or 2 arguments
+    domain_str = classify_domain(position)
+
+    # Rich content extraction
+    skills = extracted.get("skills", [])[:30]
+    work_history = extracted.get("work_history", [])
+    projects = extracted.get("projects", [])
+
+    exp_titles = [exp.get("title", "") for exp in work_history if exp.get("title")]
+    proj_names = [p.get("name", "") for p in projects if p.get("name")]
+
+    skills_str = ", ".join(skills) if skills else "achats, logistique, négociation"
+    exp_str = ", ".join(exp_titles[:12]) if exp_titles else ""
+    proj_str = ", ".join(proj_names[:6]) if proj_names else ""
+
+    synthetic_title = position
+
+    synthetic_jd = f"""
+    Nous recherchons un {synthetic_title} expérimenté en Achats et Logistique Internationale.
+
+    Compétences attendues : {skills_str}.
+
+    Expériences professionnelles : {exp_str}.
+
+    Projets et réalisations : {proj_str}.
+
+    Missions clés :
+    - Pilotage stratégique des achats et optimisation des coûts (TCO)
+    - Sourcing international, gestion des transitaires, procédures douanières, Incoterms
+    - Négociation contractuelle et management de panels fournisseurs
+    - Suivi KPI, reporting budgétaire, utilisation SAGE X3 / ERP
+    - Gestion de projets multi-sites et sécurisation de la chaîne d'approvisionnement
+    """
+
+    # Ensure full raw text is passed
+    cv_data = dict(extracted)
+    raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
+    if raw_text:
+        cv_data["raw_text"] = raw_text
+
+    result = compute_candidate_score(
+        cv_data=cv_data,
+        job_title=synthetic_title,
+        job_requirements=synthetic_jd.strip(),
+    )
+
+    result["reasoning"] = (
+        f"Score qualité autonome — Domaine : {domain_str}. "
+        "Évaluation basée sur la richesse du parcours professionnel."
+    )
+    return result
