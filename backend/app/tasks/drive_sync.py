@@ -107,34 +107,35 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _quality_fallback(extracted: dict) -> dict:
+    """
+    Balanced autonomous scoring - avoids giving 1.0 to everything.
+    """
     position = (
         extracted.get("current_position")
         or extracted.get("title")
-        or "Acheteur Senior Logistique"
+        or "Professionnel"
     )
     domain_str = classify_domain(position)
 
-    skills = extracted.get("skills", [])[:30]
+    skills = extracted.get("skills", [])[:25]
     work_history = extracted.get("work_history", [])
     projects = extracted.get("projects", [])
 
     exp_titles = [exp.get("title", "") for exp in work_history if exp.get("title")]
     proj_names = [p.get("name", "") for p in projects if p.get("name")]
 
-    skills_str = ", ".join(skills) if skills else "achats, logistique, négociation"
-    exp_str = ", ".join(exp_titles[:12]) if exp_titles else ""
-    proj_str = ", ".join(proj_names[:6]) if proj_names else ""
+    skills_str = ", ".join(skills) if skills else ""
+    exp_str = ", ".join(exp_titles[:10]) if exp_titles else ""
+    proj_str = ", ".join(proj_names[:5]) if proj_names else ""
 
     synthetic_title = position
 
     synthetic_jd = f"""
     Nous recherchons un {synthetic_title} expérimenté.
 
-    Compétences : {skills_str}.
-    Expérience : {exp_str}.
-    Projets : {proj_str}.
-
-    Missions : Pilotage achats, sourcing international, Incoterms, SAGE X3, TCO, négociation, KPI, gestion multi-chantiers.
+    Compétences : {skills_str}
+    Expérience : {exp_str}
+    Projets : {proj_str}
     """
 
     cv_data = dict(extracted)
@@ -147,6 +148,11 @@ def _quality_fallback(extracted: dict) -> dict:
         job_title=synthetic_title,
         job_requirements=synthetic_jd.strip(),
     )
+
+    # Force more realistic scores in quality mode
+    dims = result.get("dimension_scores", {})
+    dims["keyword_score"] = min(dims.get("keyword_score", 0) * 0.85, 85)
+    dims["semantic_score"] = min(dims.get("semantic_score", 0) * 0.8, 75)
 
     result["reasoning"] = f"Score qualité autonome — {domain_str}"
     return result
