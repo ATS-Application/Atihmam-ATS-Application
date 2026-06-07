@@ -108,14 +108,16 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 
 def _quality_fallback(extracted: dict) -> dict:
     """
-    HIGH-QUALITY autonomous scoring for Drive CVs (this is the one that matters).
+    HIGH-QUALITY autonomous scoring for Drive CVs.
     """
     position = (
         extracted.get("current_position")
         or extracted.get("title")
-        or "Acheteur Senior / Responsable Achats & Logistique"
+        or "Acheteur Senior Logistique"
     )
-    domain_str = classify_domain(position, "", "")
+
+    # FIX: classify_domain only accepts 1 or 2 arguments
+    domain_str = classify_domain(position)   # ← Correct call
 
     # Rich content extraction
     skills = extracted.get("skills", [])[:30]
@@ -148,6 +150,7 @@ def _quality_fallback(extracted: dict) -> dict:
     - Gestion de projets multi-sites et sécurisation de la chaîne d'approvisionnement
     """
 
+    # Ensure full raw text is passed
     cv_data = dict(extracted)
     raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
     if raw_text:
@@ -157,15 +160,15 @@ def _quality_fallback(extracted: dict) -> dict:
         cv_data=cv_data,
         job_title=synthetic_title,
         job_requirements=synthetic_jd.strip(),
-        supabase=None,   # quality mode
     )
 
     result["reasoning"] = (
         f"Score qualité autonome — Domaine : {domain_str}. "
-        "Évaluation basée sur la richesse du parcours professionnel."
+        "Évaluation basée sur la richesse du parcours (Achats & Logistique)."
     )
-    return result
+    result["matched_job"] = None
 
+    return result
 
 def resolve_candidate_score(
     supabase,
