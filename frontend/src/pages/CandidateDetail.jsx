@@ -382,11 +382,35 @@ export default function CandidateDetail() {
     return jobs.find((j) => j.id === candidate.job_id) ?? null;
   }, [jobs, candidate]);
 
+  // ── Derived data ────────────────────────────────────────────────────────────
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
   const dims = useMemo(() => {
-    const raw = candidate?.dimension_scores ?? aiData?.dimension_scores ?? null;
-    return safeParse(raw);
+    let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
+
+    if (typeof raw === "string") {
+      try { raw = JSON.parse(raw); } catch { raw = {}; }
+    }
+    if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
+
+    const merged = {
+      keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
+      semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
+      experience_score: candidate?.experience_score ?? aiData?.experience_score ?? raw.experience_score,
+      project_complexity_score: candidate?.project_complexity_score ?? raw.project_complexity_score,
+      education_score: candidate?.education_score ?? raw.education_score,
+      certification_score: candidate?.certification_score ?? raw.certification_score,
+      leadership_score: candidate?.leadership_score ?? raw.leadership_score,
+      ...raw,
+    };
+
+    // Normalize to 0-100 scale
+    return Object.fromEntries(
+      Object.entries(merged).map(([key, value]) => [
+        key,
+        value > 1 ? value : (value ?? 0) * 100
+      ])
+    );
   }, [candidate, aiData]);
 
   const matched = useMemo(
@@ -421,7 +445,7 @@ export default function CandidateDetail() {
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
 
-  const hasData = Object.keys(dims).length > 0;
+  const hasData = Object.keys(dims).length > 3;
   const isPending = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
   const isFailed = processingStatus === "failed";
