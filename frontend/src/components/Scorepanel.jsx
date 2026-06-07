@@ -335,12 +335,12 @@ export default function ScorePanel({ candidate }) {
     // Safer normalization: detect scale automatically
     return Object.fromEntries(
       Object.entries(merged).map(([key, value]) => {
-        const num = parseFloat(value) || 0;
-        // If value is already between 0-100, keep it. If 0-1, convert.
-        return [key, num > 5 ? num : num * 100];
+        let num = parseFloat(value) || 0;
+        if (num > 100) num = 100;
+        if (num <= 1.0) num = num * 100;     
+        return [key, round(num)];           
       })
-    );
-  }, [candidate, aiData]);
+    ); [candidate, aiData]);
 
   const matched = useMemo(() => {
     const raw = candidate?.matched_keywords ?? aiData?.matched_keywords;
