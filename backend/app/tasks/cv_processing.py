@@ -1,7 +1,7 @@
 # app/tasks/cv_processing.py
 
 """
-Pipeline de traitement des CVs (VERSION MVP - SANS CELERY)
+Pipeline de traitement des CVs 
 
 Ce fichier est le cœur du traitement des CVs dans l'ATS.
 Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.db.supabase_client import get_supabase_admin
-from app.services.ai_service import extract_cv_info, analyze_cv_depth
+from app.services.ai_service import extract_cv_info
 from app.services.cv_parser import extract_text_from_bytes
 from app.services.scoring_service import (
     _build_cv_text,
@@ -35,7 +35,6 @@ from app.services.scoring_service import (
     compute_cv_quality_score,
     classify_domain,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -144,45 +143,53 @@ def fetch_active_jobs(supabase):
 # HELPERS INTERNES
 # ============================================================================
 
-def _build_fallback_score_result(cv_info: dict, depth_report: dict) -> dict:
+def _make_quality_score_result(cv_info: dict) -> dict:
     """
-    Fallback score for candidates with no active job posting.
-    Uses compute_cv_quality_score from scoring_service v2.0.
+    Wraps compute_cv_quality_score into the standard score_result shape.
+    Used by both process_cv (fallback) and _build_fallback_score_result.
+    Stores all dimension keys expected by ScorePanel.jsx.
     """
-    quality = compute_cv_quality_score(_build_cv_text(cv_info))
-    depth_score = float(depth_report.get("overall_depth_score") or 0)
+    cv_text = _build_cv_text(cv_info)
+    quality = compute_cv_quality_score(cv_text)
 
-    # Blend CV quality with depth analysis
-    blended = round((quality["quality_score"] * 0.6 + depth_score * 40.0) / 100, 4)
+    exp_score  = round(min(float(cv_info.get("experience_years") or 0) / 10.0, 1.0), 3)
+    lang_score = round(quality["language_quality"] / 100.0, 3)
+    comp_score = round(quality["complexity"] / 100.0, 3)
 
     return {
         "score":            round(quality["quality_score"], 2),
-        "confidence":       0.6,
+        "confidence":       0.5,
         "domain":           classify_domain(cv_info.get("current_position") or ""),
         "hierarchy_level":  "collaborateur",
-        "reasoning":        depth_report.get("summary", "Analyse qualité CV autonome"),
+        "reasoning":        quality["overall_assessment"],
         "matched_keywords": [],
         "missing_keywords": [],
         "dimension_scores": {
-            "keyword_score":            0.0,
-            "semantic_score":           0.0,
-            "experience_score":         min(float(cv_info.get("experience_years") or 0) / 10.0, 1.0),
-            "education_score":          quality["details"]["language"].get("structure_score", 0.5),
-            "certification_score":      0.0,
-            "leadership_score":         0.0,
-            "project_complexity_score": depth_score / 100.0 if depth_score > 1 else depth_score,
-            "language_score":           quality["language_quality"] / 100.0,
+            # canonical v2.0 keys
+            "experience":     exp_score,
+            "education":      0.0,
+            "certifications": 0.0,
+            "semantic":       0.0,
+            "keywords":       0.0,
+            "leadership":     0.0,
+            "language":       lang_score,
+            "complexity":     comp_score,
+            # frontend aliases (ScorePanel.jsx)
+            "keyword_score":             0.0,
+            "semantic_score":            0.0,
+            "experience_score":          exp_score,
+            "project_complexity_score":  comp_score,
+            "education_score":           0.0,
+            "certification_score":       0.0,
+            "leadership_score":          0.0,
+            "language_score":            lang_score,
         },
     }
 
 
 def _build_score_payload(score_result: dict) -> dict:
     """
-    Extrait les champs de scoring à persister.
-
-    FIX : l'ancienne version de process_cv omettait score_reasoning,
-    matched_keywords et missing_keywords — ces colonnes restaient NULL
-    ce qui empêchait l'affichage des mots-clés et du raisonnement IA.
+    Extrait les champs de scoring à persister en base.
     """
     return {
         "score":            score_result.get("score", 0),
@@ -202,7 +209,7 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
     supabase = get_supabase_admin()
 
     try:
-        logger.info(f"🚀 Traitement CV : {candidate_id}")
+        logger.info("🚀 Traitement CV : %s", candidate_id)
 
         candidate = fetch_candidate(supabase, candidate_id)
         if not candidate:
@@ -215,7 +222,7 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 
         # Téléchargement PDF
         pdf_bytes = supabase.storage.from_("cvs").download(storage_path)
-        raw_text = extract_text_safe(pdf_bytes)
+        raw_text  = extract_text_safe(pdf_bytes)
 
         # Extraction IA
         cv_info = extract_cv_info(raw_text)
@@ -230,7 +237,6 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                     cv_data=cv_info,
                     job_title=job.get("title", ""),
                     job_requirements=job.get("requirements", ""),
-                    supabase=supabase,
                 )
         else:
             jobs = fetch_active_jobs(supabase)
@@ -238,39 +244,31 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                 best_result, best_job_id = compute_best_job_match(supabase, cv_info, jobs)
                 if best_result:
                     score_result = best_result
-                    job_id = best_job_id
+                    job_id       = best_job_id
 
-      
+        # Fallback: no job linked and no active jobs
         if not score_result:
-            cv_text = _build_cv_text(cv_info)
-            score_result = compute_cv_quality_score(cv_text)
-            # Wrap to match expected shape
-            score_result = {
-                "score":            score_result["quality_score"],
-                "confidence":       0.5,
-                "domain":           classify_domain(cv_info.get("current_position") or ""),
-                "hierarchy_level":  "collaborateur",
-                "reasoning":        score_result["overall_assessment"],
-                "matched_keywords": [],
-                "missing_keywords": [],
-                "dimension_scores": {
-                    "language_score":   score_result["language_quality"] / 100.0,
-                    "complexity_score": score_result["complexity"] / 100.0,
-                },
-            }
+            logger.info("No active jobs — computing standalone CV quality score for %s", candidate_id)
+            score_result = _make_quality_score_result(cv_info)
 
+        # Sauvegarde
+        payload = build_candidate_payload(
+            raw_text=raw_text,
+            cv_info=cv_info,
+            score_result=score_result,
+            job_id=job_id,
+        )
         update_candidate(supabase, candidate_id, payload)
 
-        logger.info(f"✅ CV {candidate_id} traité → Score : {score_result.get('score', 0)}")
-
+        logger.info("✅ CV %s traité → Score : %s", candidate_id, score_result.get("score", 0))
         return {"success": True, "score": score_result.get("score", 0)}
 
     except Exception as e:
-        logger.exception(f"Échec CV {candidate_id}")
+        logger.exception("Échec CV %s", candidate_id)
         update_candidate(supabase, candidate_id, {
             "processing_status": "failed",
-            "processing_error": str(e)[:500],
-            "updated_at": utc_now(),
+            "processing_error":  str(e)[:500],
+            "updated_at":        utc_now(),
         })
         return {"success": False, "error": str(e)}
 
@@ -294,7 +292,6 @@ def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
                 cv_data=cv_info,
                 job_title=job.get("title", ""),
                 job_requirements=job.get("requirements", ""),
-                supabase=supabase,
             )
             s = result.get("score", 0)
             if s > best_score:
@@ -327,8 +324,8 @@ def build_candidate_payload(
 
         "current_position": ensure_string(
             cv_info.get("current_position")
-            or cv_info.get("title")        # some extractors emit "title"
-            or cv_info.get("job_title")    # defensive alias
+            or cv_info.get("title")
+            or cv_info.get("job_title")
             or cv_info.get("headline")
         ),
 
@@ -341,7 +338,6 @@ def build_candidate_payload(
 
         "experience_years": cv_info.get("experience_years", 0),
 
-        # Scoring complet (aligned with process_cv)
         **_build_score_payload(score_result),
 
         "processing_status": "completed",
