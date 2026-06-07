@@ -193,16 +193,22 @@ def _make_quality_score_result(cv_info: dict, raw_text: str) -> dict:
 
 
 def _build_score_payload(score_result: dict) -> dict:
-    """
-    Extrait les champs de scoring à persister en base.
-    """
+    dims = score_result.get("dimension_scores", {})
     return {
-        "score":            score_result.get("score", 0),
-        "dimension_scores": score_result.get("dimension_scores", {}),
+        "score": score_result.get("score", 0),
+        "dimension_scores": dims,
         "score_confidence": score_result.get("confidence", 0),
-        "score_reasoning":  score_result.get("reasoning", ""),
+        "score_reasoning": score_result.get("reasoning", ""),
         "matched_keywords": score_result.get("matched_keywords", []),
         "missing_keywords": score_result.get("missing_keywords", []),
+        # Extra safety columns
+        "keyword_score": dims.get("keyword_score"),
+        "experience_score": dims.get("experience_score"),
+        "semantic_score": dims.get("semantic_score"),
+        "project_complexity_score": dims.get("project_complexity_score"),
+        "education_score": dims.get("education_score"),
+        "certification_score": dims.get("certification_score"),
+        "leadership_score": dims.get("leadership_score"),
     }
 
 
