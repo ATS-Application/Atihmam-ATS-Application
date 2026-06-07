@@ -108,17 +108,16 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 
 def _quality_fallback(extracted: dict) -> dict:
     """
-    HIGH-QUALITY autonomous scoring for Drive CVs.
-    Optimized for strong professional profiles (Acheteur Senior, etc.).
+    HIGH-QUALITY autonomous scoring for Drive CVs (this is the one that matters).
     """
     position = (
         extracted.get("current_position")
         or extracted.get("title")
-        or "Acheteur Senior Logistique"
+        or "Acheteur Senior / Responsable Achats & Logistique"
     )
-    domain_str = classify_domain(position)
+    domain_str = classify_domain(position, "", "")
 
-    # Extract rich content from CV
+    # Rich content extraction
     skills = extracted.get("skills", [])[:30]
     work_history = extracted.get("work_history", [])
     projects = extracted.get("projects", [])
@@ -132,28 +131,23 @@ def _quality_fallback(extracted: dict) -> dict:
 
     synthetic_title = position
 
-    # Very rich synthetic JD
     synthetic_jd = f"""
-    Nous recherchons un {synthetic_title} expérimenté avec une solide expertise en achats et logistique internationale.
+    Nous recherchons un {synthetic_title} expérimenté en Achats et Logistique Internationale.
 
-    Compétences clés attendues :
-    {skills_str}
+    Compétences attendues : {skills_str}.
 
-    Expérience professionnelle :
-    {exp_str}
+    Expériences professionnelles : {exp_str}.
 
-    Projets & Réalisations :
-    {proj_str}
+    Projets et réalisations : {proj_str}.
 
-    Missions principales :
+    Missions clés :
     - Pilotage stratégique des achats et optimisation des coûts (TCO)
-    - Sourcing international, gestion des transitaires et procédures douanières
+    - Sourcing international, gestion des transitaires, procédures douanières, Incoterms
     - Négociation contractuelle et management de panels fournisseurs
-    - Suivi des KPI, reporting budgétaire et utilisation d'ERP (SAGE X3, etc.)
+    - Suivi KPI, reporting budgétaire, utilisation SAGE X3 / ERP
     - Gestion de projets multi-sites et sécurisation de la chaîne d'approvisionnement
     """
 
-    # Ensure full raw text is available (critical)
     cv_data = dict(extracted)
     raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
     if raw_text:
@@ -163,14 +157,13 @@ def _quality_fallback(extracted: dict) -> dict:
         cv_data=cv_data,
         job_title=synthetic_title,
         job_requirements=synthetic_jd.strip(),
+        supabase=None,   # quality mode
     )
 
     result["reasoning"] = (
-        f"Score qualité autonome — Domaine détecté : {domain_str}. "
-        "Évaluation basée sur la richesse du parcours (12+ ans Achats & Logistique)."
+        f"Score qualité autonome — Domaine : {domain_str}. "
+        "Évaluation basée sur la richesse du parcours professionnel."
     )
-    result["matched_job"] = None
-
     return result
 
 
@@ -180,15 +173,8 @@ def resolve_candidate_score(
     job_id: str | None,
 ) -> tuple[dict, str | None]:
     """
-    Scoring strategy (mirrors process_cv exactly):
-      1. Explicit job_id  → score against that job
-      2. No job_id        → find best match among active jobs
-      3. No active jobs   → synthetic JD quality score (all 8 dimensions)
-
-    Returns (score_result, resolved_job_id).
+    Improved scoring strategy.
     """
-    resolved_job_id = job_id
-
     if job_id:
         job = fetch_job(supabase, job_id)
         if job:
@@ -196,22 +182,23 @@ def resolve_candidate_score(
                 cv_data=extracted,
                 job_title=job.get("title", ""),
                 job_requirements=job.get("requirements", ""),
-            )
-            return score_result, resolved_job_id
-    else:
-        jobs = fetch_active_jobs(supabase)
-        if jobs:
-            score_result, resolved_job_id = compute_best_job_match(
                 supabase=supabase,
-                cv_info=extracted,
-                jobs=jobs,
             )
-            if score_result:
-                return score_result, resolved_job_id
+            return score_result, job_id
 
-    # Fallback: no job linked and no active jobs
-    logger.info("No active jobs — computing synthetic quality score")
-    return _quality_fallback(extracted), resolved_job_id
+    # Try best job match
+    jobs = fetch_active_jobs(supabase)
+    if jobs:
+        score_result, resolved_job_id = compute_best_job_match(
+            supabase=supabase, cv_info=extracted, jobs=jobs
+        )
+        if score_result:
+            return score_result, resolved_job_id
+
+    # Final fallback — RICH synthetic scoring
+    logger.info("No active jobs — using rich quality fallback")
+    fallback = _quality_fallback(extracted)
+    return fallback, None
 
 
 # --------------------------------------------------------------------------- #
