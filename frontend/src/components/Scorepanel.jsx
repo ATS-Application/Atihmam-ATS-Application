@@ -70,17 +70,17 @@ const DIMENSIONS = [
     description: "Progression académique et niveau d'études",
   },
   {
-  key: "certification_score",
-  label: "Certifications",
-  icon: CheckCircle2,     // already imported
-  accent: "#f59e0b",
-  track: "#fffbeb",
-  description: "Certifications professionnelles détectées (AWS, Scrum, Oracle…)",
+    key: "certification_score",
+    label: "Certifications",
+    icon: CheckCircle2,
+    accent: "#f59e0b",
+    track: "#fffbeb",
+    description: "Certifications professionnelles détectées (AWS, Scrum, Oracle…)",
   },
   {
     key: "leadership_score",
     label: "Leadership",
-    icon: TrendingUp,       // already imported, or swap for another
+    icon: TrendingUp,
     accent: "#6366f1",
     track: "#eef2ff",
     description: "Capacités d'encadrement et de management détectées",
@@ -98,6 +98,9 @@ const CLUSTER_ICONS = {
   mobile: "📱",
   java: "☕",
   security: "🔒",
+  word: "📝",
+  excel: "📈",
+  powerpoint: "📊",
 };
 
 const FEEDBACK_BUTTONS = [
@@ -218,7 +221,8 @@ function ScoreRing({ score }) {
 
 function DimensionRow({ dimension, score }) {
   const { label, icon: Icon, accent, track, description } = dimension;
-  const pct = clamp((score ?? 0) * 100);
+  // score is already normalized to 0–100 by the dims useMemo
+  const pct = clamp(score ?? 0);
   const [showTip, setShowTip] = useState(false);
 
   return (
@@ -312,12 +316,18 @@ export default function ScorePanel({ candidate }) {
   }, [candidate?.id]);
 
   // ── Derived data ────────────────────────────────────────────────────────────
-   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
-   const dims = useMemo(() => {
+
+  const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
+
+  const dims = useMemo(() => {
     let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
 
     if (typeof raw === "string") {
-      try { raw = JSON.parse(raw); } catch { raw = {}; }
+      try {
+        raw = JSON.parse(raw);
+      } catch {
+        raw = {};
+      }
     }
     if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
 
@@ -332,25 +342,26 @@ export default function ScorePanel({ candidate }) {
       ...raw,
     };
 
-    // Safer normalization: detect scale automatically
+    // Smart normalization: detect scale automatically (decimal 0–1 vs integer 0–100)
     return Object.fromEntries(
       Object.entries(merged).map(([key, value]) => {
         let num = parseFloat(value) || 0;
         if (num > 100) num = 100;
-        if (num <= 1.0) num = num * 100;     
-        return [key, round(num)];           
+        if (num <= 1.0) num = num * 100;
+        return [key, Math.round(num)]; // fixed: was `round(num)` in v2
       })
-    ); [candidate, aiData]);
+    );
+  }, [candidate, aiData]); // fixed: closing was misplaced in v2
 
-  const matched = useMemo(() => {
-    const raw = candidate?.matched_keywords ?? aiData?.matched_keywords;
-    return safeParseArray(raw);
-  }, [candidate, aiData]);
+  const matched = useMemo(
+    () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
+    [candidate, aiData]
+  );
 
-  const missing = useMemo(() => {
-    const raw = candidate?.missing_keywords ?? aiData?.missing_keywords;
-    return safeParseArray(raw);
-  }, [candidate, aiData]);
+  const missing = useMemo(
+    () => safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords),
+    [candidate, aiData]
+  );
 
   const coveredClusters = useMemo(() => {
     const explicit = safeParseArray(candidate?.covered_clusters ?? aiData?.covered_clusters);
@@ -370,7 +381,7 @@ export default function ScorePanel({ candidate }) {
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
 
-  const hasData = Object.keys(dims).length > 3;   // better than > 0
+  const hasData = Object.keys(dims).length > 3;
   const isPending = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
   const isFailed = processingStatus === "failed";
