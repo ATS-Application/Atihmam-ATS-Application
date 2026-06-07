@@ -218,7 +218,7 @@ function ScoreRing({ score }) {
 
 function DimensionRow({ dimension, score }) {
   const { label, icon: Icon, accent, track, description } = dimension;
-  const pct = clamp(score);
+  const pct = clamp((score ?? 0) * 100);
   const [showTip, setShowTip] = useState(false);
 
   return (
@@ -313,18 +313,16 @@ export default function ScorePanel({ candidate }) {
 
   // ── Derived data ────────────────────────────────────────────────────────────
 
-  const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
+   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
-  const dims = useMemo(() => {
+   const dims = useMemo(() => {
     let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
   
     if (typeof raw === "string") {
       try { raw = JSON.parse(raw); } catch { raw = {}; }
     }
-  
     if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
   
-    // Merge top-level columns as fallback (safety net)
     const merged = {
       keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
       semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
@@ -333,11 +331,16 @@ export default function ScorePanel({ candidate }) {
       education_score: candidate?.education_score ?? raw.education_score,
       certification_score: candidate?.certification_score ?? raw.certification_score,
       leadership_score: candidate?.leadership_score ?? raw.leadership_score,
-      language_score: raw.language_score,
-      ...raw,                    // dimension_scores has priority
+      ...raw,
     };
   
-    return merged;
+    // Normalize all values to 0-100 scale
+    return Object.fromEntries(
+      Object.entries(merged).map(([key, value]) => [
+        key,
+        value > 1 ? value : (value ?? 0) * 100   // if already >1, keep it; else convert
+      ])
+    );
   }, [candidate, aiData]);
 
   const matched = useMemo(() => {
