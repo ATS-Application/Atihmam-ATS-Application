@@ -371,7 +371,7 @@ export default function ScorePanel({ candidate }) {
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
 
-  const hasData = Object.keys(dims).length > 2;   // better than > 0
+  const hasData = Object.keys(dims).length > 3;   // better than > 0
   const isPending = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
   const isFailed = processingStatus === "failed";
