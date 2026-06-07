@@ -193,7 +193,12 @@ def _make_quality_score_result(cv_info: dict, raw_text: str) -> dict:
 
 
 def _build_score_payload(score_result: dict) -> dict:
+    """
+    Build safe payload - only insert columns that exist in the DB.
+    dimension_scores (jsonb) contains everything.
+    """
     dims = score_result.get("dimension_scores", {})
+
     return {
         "score": score_result.get("score", 0),
         "dimension_scores": dims,
@@ -201,14 +206,15 @@ def _build_score_payload(score_result: dict) -> dict:
         "score_reasoning": score_result.get("reasoning", ""),
         "matched_keywords": score_result.get("matched_keywords", []),
         "missing_keywords": score_result.get("missing_keywords", []),
-        # Extra safety columns
+
+        # Only insert columns that currently exist or were just added
         "keyword_score": dims.get("keyword_score"),
         "experience_score": dims.get("experience_score"),
         "semantic_score": dims.get("semantic_score"),
-        "project_complexity_score": dims.get("project_complexity_score"),
-        "education_score": dims.get("education_score"),
-        "certification_score": dims.get("certification_score"),
-        "leadership_score": dims.get("leadership_score"),
+        "project_complexity_score": dims.get("project_complexity_score"),   # new
+        "education_score": dims.get("education_score"),                     # new
+        "certification_score": dims.get("certification_score"),             # new
+        "leadership_score": dims.get("leadership_score"),                   # new
     }
 
 
