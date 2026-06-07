@@ -1,7 +1,7 @@
 # app/tasks/cv_processing.py
 
 """
-Pipeline de traitement des CVs 
+Pipeline de traitement des CVs (VERSION MVP - SANS CELERY)
 
 Ce fichier est le cœur du traitement des CVs dans l'ATS.
 Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
@@ -11,7 +11,7 @@ Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
     3. L'IA analyse le texte et en extrait les infos structurées
        (nom, email, compétences, expériences, formations...)
     4. On calcule un score de correspondance avec les postes actifs
-       → Si aucun poste actif : on score la qualité du CV directement
+       → Si aucun poste actif : on score la qualité du CV via JD synthétique
     5. On sauvegarde tout dans la base de données
 
 ⚠️ Version simplifiée : pas de Celery, pas de Redis.
@@ -32,8 +32,9 @@ from app.services.cv_parser import extract_text_from_bytes
 from app.services.scoring_service import (
     _build_cv_text,
     compute_candidate_score,
-    compute_cv_quality_score,
     classify_domain,
+    Domain,
+    DOMAIN_SKILLS,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,46 +146,39 @@ def fetch_active_jobs(supabase):
 
 def _make_quality_score_result(cv_info: dict) -> dict:
     """
-    Wraps compute_cv_quality_score into the standard score_result shape.
-    Used by both process_cv (fallback) and _build_fallback_score_result.
-    Stores all dimension keys expected by ScorePanel.jsx.
+    Scores a CV without a real job posting by synthesizing a generic job
+    description from the CV's own domain and detected skills.
+    All 8 dimensions are computed; results reflect CV quality, not job fit.
     """
-    cv_text = _build_cv_text(cv_info)
-    quality = compute_cv_quality_score(cv_text)
+    position   = cv_info.get("current_position") or ""
+    domain_str = classify_domain(position)
 
-    exp_score  = round(min(float(cv_info.get("experience_years") or 0) / 10.0, 1.0), 3)
-    lang_score = round(quality["language_quality"] / 100.0, 3)
-    comp_score = round(quality["complexity"] / 100.0, 3)
+    try:
+        domain_enum   = Domain(domain_str)
+        domain_skills = DOMAIN_SKILLS.get(domain_enum, [])
+    except ValueError:
+        domain_skills = []
 
-    return {
-        "score":            round(quality["quality_score"], 2),
-        "confidence":       0.5,
-        "domain":           classify_domain(cv_info.get("current_position") or ""),
-        "hierarchy_level":  "collaborateur",
-        "reasoning":        quality["overall_assessment"],
-        "matched_keywords": [],
-        "missing_keywords": [],
-        "dimension_scores": {
-            # canonical v2.0 keys
-            "experience":     exp_score,
-            "education":      0.0,
-            "certifications": 0.0,
-            "semantic":       0.0,
-            "keywords":       0.0,
-            "leadership":     0.0,
-            "language":       lang_score,
-            "complexity":     comp_score,
-            # frontend aliases (ScorePanel.jsx)
-            "keyword_score":             0.0,
-            "semantic_score":            0.0,
-            "experience_score":          exp_score,
-            "project_complexity_score":  comp_score,
-            "education_score":           0.0,
-            "certification_score":       0.0,
-            "leadership_score":          0.0,
-            "language_score":            lang_score,
-        },
-    }
+    skills_str      = ", ".join(domain_skills[:15]) if domain_skills else "expérience professionnelle"
+    synthetic_title = position or f"Professionnel {domain_str}"
+    synthetic_jd    = (
+        f"Profil recherché : {synthetic_title}. "
+        f"Compétences attendues : {skills_str}. "
+        f"Expérience significative dans le domaine {domain_str} requise."
+    )
+
+    result = compute_candidate_score(
+        cv_data=cv_info,
+        job_title=synthetic_title,
+        job_requirements=synthetic_jd,
+    )
+
+    result["reasoning"] = (
+        f"Score qualité autonome — domaine détecté : {domain_str}. "
+        "Aucun poste actif associé."
+    )
+    result["matched_job"] = None
+    return result
 
 
 def _build_score_payload(score_result: dict) -> dict:
@@ -246,9 +240,11 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                     score_result = best_result
                     job_id       = best_job_id
 
-        # Fallback: no job linked and no active jobs
+        # Fallback: no job linked and no active jobs → synthetic JD quality score
         if not score_result:
-            logger.info("No active jobs — computing standalone CV quality score for %s", candidate_id)
+            logger.info(
+                "No active jobs — computing synthetic quality score for %s", candidate_id
+            )
             score_result = _make_quality_score_result(cv_info)
 
         # Sauvegarde
@@ -260,7 +256,9 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         )
         update_candidate(supabase, candidate_id, payload)
 
-        logger.info("✅ CV %s traité → Score : %s", candidate_id, score_result.get("score", 0))
+        logger.info(
+            "✅ CV %s traité → Score : %s", candidate_id, score_result.get("score", 0)
+        )
         return {"success": True, "score": score_result.get("score", 0)}
 
     except Exception as e:
@@ -299,7 +297,9 @@ def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
                 best_result = result
                 best_job_id = job.get("id")
         except Exception as exc:
-            logger.error("Erreur de scoring pour le poste %s : %s", job.get("id"), exc)
+            logger.error(
+                "Erreur de scoring pour le poste %s : %s", job.get("id"), exc
+            )
 
     return best_result, best_job_id
 
@@ -311,7 +311,7 @@ def build_candidate_payload(
     job_id      : str | None = None,
 ) -> dict:
     """
-    Construit le dictionnaire complet à insérer en base pour un nouveau candidat.
+    Construit le dictionnaire complet à insérer/mettre à jour en base.
     Utilisé par drive_sync.py lors de la synchronisation Google Drive.
     """
     payload = {
