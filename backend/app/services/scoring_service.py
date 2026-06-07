@@ -1574,42 +1574,71 @@ def compute_candidate_score(
 # ADDITIONAL COMPATIBILITY LAYER
 # =============================================================================
 
-def compute_cv_quality_score(cv_text: str) -> dict[str, Any]:
-    """
-    Compatibility function for compute_cv_quality_score expected by candidates.py.
-    Returns a quality assessment (can be enhanced later with AI depth analysis).
-    """
-    # Simple fallback using the language quality + complexity scorers
-    try:
-        # Use existing functions from this module
-        lang_score, lang_details = compute_language_quality_score(cv_text)
-        comp_score, comp_details = compute_complexity_score(
-            cv_text, 
-            domain=Domain.CONSULTING,  # default
-            hierarchy_level=HierarchyLevel.COLLABORATEUR
-        )
-        
-        quality_score = round((lang_score * 0.6 + comp_score * 0.4) * 100, 2)
-        
-        return {
-            "quality_score": quality_score,
-            "language_quality": round(lang_score * 100, 2),
-            "complexity": round(comp_score * 100, 2),
-            "overall_assessment": "Good" if quality_score >= 70 else "Average" if quality_score >= 50 else "Needs Improvement",
-            "details": {
-                "language": lang_details,
-                "complexity": comp_details
-            }
-        }
-    except Exception as e:
-        print(f"[scoring_service] compute_cv_quality_score fallback error: {e}")
-        return {
-            "quality_score": 50.0,
-            "language_quality": 50.0,
-            "complexity": 50.0,
-            "overall_assessment": "Assessment unavailable",
-            "details": {"error": str(e)}
-        }
+def compute_cv_quality_score(
+    cv_data: dict[str, Any],
+    supabase: Any = None,
+) -> dict[str, Any]:
+    """Improved standalone CV quality score."""
+    cv_text = _build_cv_text(cv_data)
+
+    ai_data = {}
+    raw_ai = cv_data.get("ai_extracted_data")
+    if isinstance(raw_ai, str):
+        try:
+            ai_data = json.loads(raw_ai)
+        except Exception:
+            pass
+    elif isinstance(raw_ai, dict):
+        ai_data = raw_ai
+
+    domain = classify_domain(cv_text, "", "")
+    level = detect_professional_level(cv_text)
+    profile = _DOMAIN_PROFILES.get(domain, _FALLBACK_PROFILE)  # assume this exists
+
+    work_history = safe_dict_list(cv_data.get("work_history") or ai_data.get("work_history"))
+    candidate_years = float(cv_data.get("experience_years") or ai_data.get("experience_years") or infer_experience_years(work_history) or 0)
+
+    # More realistic dimension scores
+    edu_score = _education_score(cv_text, domain, "", level)
+    exp_score = min(_clamp(candidate_years * 8), 95)          # not 100
+    lang_score = _language_score(cv_text)
+    lead_score = min(_leadership_score(cv_text, profile.leadership_terms), 85)
+
+    cert_score = _certification_score(cv_text) if domain in TECH_DOMAINS else min(_clamp(len(ai_data.get("certifications", [])) * 25), 80)
+    cmpx_score = min(_complexity_score(cv_text, profile.indicators), 90)
+
+    # Keyword & Semantic are 0 in quality mode, but we give a small base
+    kw_score = 45.0
+    sem_score = 50.0
+
+    dimensions = {
+        "keyword_score": kw_score,
+        "semantic_score": sem_score,
+        "experience_score": exp_score,
+        "certification_score": cert_score,
+        "education_score": edu_score,
+        "leadership_score": lead_score,
+        "project_complexity_score": cmpx_score,
+        "language_score": lang_score,
+    }
+
+    base_weights = _load_weights(supabase)
+    weights = _resolve_weights(base_weights, profile.weight_overrides)
+    weights = _get_weights_for_level(weights, level)
+
+    final_score, warnings = _apply_dimension_guardrails(dimensions, weights, level)
+
+    return {
+        "score": final_score,
+        "confidence": 0.70,
+        "domain": domain.value,
+        "professional_level": level.value,
+        "reasoning": f"Qualité CV autonome — {domain.value} — {level.value}",
+        "matched_keywords": [],
+        "missing_keywords": [],
+        "dimension_scores": dimensions,
+        "warnings": warnings,
+    }
 
 
 # =============================================================================
