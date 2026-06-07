@@ -1,7 +1,7 @@
 # app/tasks/cv_processing.py
 
 """
-Pipeline de traitement des CVs (VERSION MVP - SANS CELERY)
+Pipeline de traitement des CVs 
 
 Ce fichier est le cœur du traitement des CVs dans l'ATS.
 Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
