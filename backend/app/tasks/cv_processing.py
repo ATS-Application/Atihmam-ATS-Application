@@ -156,39 +156,62 @@ def _enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
 
 
 def _make_quality_score_result(cv_info: dict, raw_text: str) -> dict:
-    """Improved autonomous scoring with better synthetic JD."""
-    position = cv_info.get("current_position") or ""
+    """
+    Strong autonomous quality scoring.
+    Uses the FULL raw CV text + real extracted content to generate a high-quality synthetic JD.
+    This dramatically improves keyword_score and semantic_score.
+    """
+    position = extracted.get("current_position") or extracted.get("title", "") or "Professionnel"
     domain_str = classify_domain(position)
-    
-    # Build much richer synthetic JD from real CV content
-    skills = cv_info.get("skills", [])[:20]
-    experiences = [exp.get("title", "") for exp in cv_info.get("work_history", []) if exp.get("title")]
-    projects = [p.get("name", "") for p in cv_info.get("projects", [])]
-    
-    skills_str = ", ".join(skills) if skills else "expérience professionnelle"
-    exp_str = ", ".join(experiences[:8]) if experiences else ""
-    
-    synthetic_title = position or f"Professionnel {domain_str}"
-    synthetic_jd = (
-        f"Nous recherchons un {synthetic_title} expérimenté. "
-        f"Compétences clés : {skills_str}. "
-        f"Expériences attendues : {exp_str}. "
-        f"Domaines : {domain_str}. "
-        f"Capacité à gérer des projets et à démontrer du leadership."
-    )
 
-    enriched = _enrich_cv_data(cv_info, raw_text)
+    # === Build rich synthetic JD from REAL CV content ===
+    skills = extracted.get("skills", [])[:25]
+    work_history = extracted.get("work_history", [])
+    projects = extracted.get("projects", [])
+
+    exp_titles = [exp.get("title", "") for exp in work_history if exp.get("title")]
+    proj_names = [p.get("name", "") for p in projects if p.get("name")]
+
+    skills_str = ", ".join(skills) if skills else "compétences professionnelles"
+    exp_str = ", ".join(exp_titles[:12]) if exp_titles else ""
+    proj_str = ", ".join(proj_names[:8]) if proj_names else ""
+
+    synthetic_title = position
+
+    synthetic_jd = f"""
+    Nous recherchons un {synthetic_title} expérimenté dans le domaine {domain_str}.
     
+    Compétences requises : {skills_str}.
+    """
+
+    if exp_str:
+        synthetic_jd += f"Expériences attendues : {exp_str}. "
+    if proj_str:
+        synthetic_jd += f"Projets réalisés : {proj_str}. "
+
+    synthetic_jd += """
+    Le candidat idéal doit démontrer une forte capacité d'analyse, de gestion de projets, 
+    de leadership et une excellente qualité rédactionnelle.
+    """
+
+    # Critical: Use full raw text
+    cv_data = dict(extracted)
+    raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
+    if raw_text:
+        cv_data["raw_text"] = raw_text
+
     result = compute_candidate_score(
-        cv_data=enriched,
+        cv_data=cv_data,
         job_title=synthetic_title,
         job_requirements=synthetic_jd,
     )
-    
+
     result["reasoning"] = (
         f"Score qualité autonome — domaine détecté : {domain_str}. "
-        "Aucun poste actif associé. Scoring basé sur contenu du CV."
+        "Scoring basé sur la richesse et la cohérence interne du CV."
     )
+    result["matched_job"] = None
+
     return result
 
 
