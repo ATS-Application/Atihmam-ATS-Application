@@ -109,47 +109,45 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 def _quality_fallback(extracted: dict) -> dict:
     """
     Improved autonomous quality scoring for CVs without an associated job.
-    Builds a much richer synthetic job description using real content from the CV
-    (skills, experiences, projects, etc.) so that keyword, semantic, complexity,
-    and leadership dimensions get meaningful scores.
+    Builds a rich synthetic job description using actual CV content.
     """
-    position = extracted.get("current_position") or ""
+    position = extracted.get("current_position") or extracted.get("title", "")
     domain_str = classify_domain(position)
 
-    # Extract real content for richer synthetic JD
+    # Extract real content for better matching
     skills = extracted.get("skills", [])[:20]
     work_history = extracted.get("work_history", [])
     projects = extracted.get("projects", [])
+
     experiences_titles = [exp.get("title", "") for exp in work_history if exp.get("title")]
     project_names = [p.get("name", "") for p in projects if p.get("name")]
 
     skills_str = ", ".join(skills) if skills else "expérience professionnelle"
-    exp_str = ", ".join(experiences_titles[:10]) if experiences_titles else ""
-    proj_str = ", ".join(project_names[:6]) if project_names else ""
+    exp_str = ", ".join(experiences_titles[:8]) if experiences_titles else ""
+    proj_str = ", ".join(project_names[:5]) if project_names else ""
 
     synthetic_title = position or f"Professionnel {domain_str}"
 
-    # Much richer synthetic job description
+    # Rich synthetic job description
     synthetic_jd = (
-        f"Nous recherchons un {synthetic_title} expérimenté et polyvalent. "
-        f"Compétences attendues : {skills_str}. "
+        f"Nous recherchons un {synthetic_title} expérimenté. "
+        f"Compétences attendues : {skills_str}."
     )
 
     if exp_str:
-        synthetic_jd += f"Expériences pertinentes : {exp_str}. "
+        synthetic_jd += f" Expériences pertinentes : {exp_str}."
     if proj_str:
-        synthetic_jd += f"Projets réalisés : {proj_str}. "
+        synthetic_jd += f" Projets réalisés : {proj_str}."
 
     synthetic_jd += (
-        f"Domaines d'expertise : {domain_str}. "
-        f"Capacité à gérer des projets complexes, à faire preuve de leadership "
-        f"et à démontrer une forte qualité rédactionnelle."
+        f" Forte capacité à gérer des projets complexes, à faire preuve "
+        f"de leadership et à communiquer efficacement."
     )
 
-    # Enrich cv_data with raw_text if available (critical for good scoring)
+    # Ensure raw_text is available for scoring
     cv_data = dict(extracted)
-    if "raw_text" not in cv_data and extracted.get("full_text"):
-        cv_data["raw_text"] = extracted.get("full_text")
+    if "raw_text" not in cv_data:
+        cv_data["raw_text"] = extracted.get("full_text") or ""
 
     result = compute_candidate_score(
         cv_data=cv_data,
