@@ -1,17 +1,7 @@
-# backend/app/tasks/drive_sync.py
+# app/tasks/drive_sync.py
 
 """
-Drive Sync Pipeline (MVP VERSION - NO CELERY)
-
-Replaces:
-- Celery tasks
-- Redis queue
-- Worker services
-
-With:
-- direct execution
-- FastAPI BackgroundTasks support
-- safe synchronous processing
+Drive Sync Pipeline 
 
 Pipeline:
 1. Scan Google Drive folder
@@ -41,7 +31,11 @@ from app.services.drive_service import (
     list_new_pdf_files_since,
     list_pdf_files,
 )
-from app.services.scoring_service import compute_candidate_score, compute_cv_quality_score
+from app.services.scoring_service import (
+    compute_candidate_score,
+    compute_cv_quality_score,
+    _build_cv_text,
+)
 from app.tasks.cv_processing import (
     build_candidate_payload,
     compute_best_job_match,
@@ -50,6 +44,7 @@ from app.tasks.cv_processing import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------- #
 # HELPERS
@@ -111,6 +106,28 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 # SCORING
 # --------------------------------------------------------------------------- #
 
+def _quality_fallback(extracted: dict) -> dict:
+    """
+    Wraps compute_cv_quality_score (which takes plain text) into the
+    score_result shape expected by build_candidate_payload.
+    """
+    cv_text = _build_cv_text(extracted)
+    quality = compute_cv_quality_score(cv_text)
+    return {
+        "score":            quality["quality_score"],
+        "confidence":       0.5,
+        "domain":           "consulting",
+        "hierarchy_level":  "collaborateur",
+        "reasoning":        quality["overall_assessment"],
+        "matched_keywords": [],
+        "missing_keywords": [],
+        "dimension_scores": {
+            "language_score":   round(quality["language_quality"] / 100, 3),
+            "complexity_score": round(quality["complexity"] / 100, 3),
+        },
+    }
+
+
 def resolve_candidate_score(
     supabase,
     extracted: dict,
@@ -120,11 +137,10 @@ def resolve_candidate_score(
     Scoring strategy (mirrors process_cv exactly):
       1. Explicit job_id  → score against that job
       2. No job_id        → find best match among active jobs
-      3. No active jobs   → compute_cv_quality_score (standalone quality score)
+      3. No active jobs   → standalone CV quality score
 
     Returns (score_result, resolved_job_id).
     """
-    score_result   = None
     resolved_job_id = job_id
 
     if job_id:
@@ -134,8 +150,8 @@ def resolve_candidate_score(
                 cv_data=extracted,
                 job_title=job.get("title", ""),
                 job_requirements=job.get("requirements", ""),
-                supabase=supabase,
             )
+            return score_result, resolved_job_id
     else:
         jobs = fetch_active_jobs(supabase)
         if jobs:
@@ -144,14 +160,12 @@ def resolve_candidate_score(
                 cv_info=extracted,
                 jobs=jobs,
             )
+            if score_result:
+                return score_result, resolved_job_id
 
-    if score_result:
-        return score_result, resolved_job_id
-
-    # Fallback: no job linked and no active jobs → standalone CV quality score
+    # Fallback: no job linked and no active jobs
     logger.info("No active jobs found — computing standalone CV quality score")
-    fallback = compute_cv_quality_score(extracted, supabase=supabase)
-    return fallback, resolved_job_id
+    return _quality_fallback(extracted), resolved_job_id
 
 
 # --------------------------------------------------------------------------- #
@@ -180,8 +194,8 @@ def process_drive_file(drive_file_id: str, job_id: str | None = None) -> dict:
         if not raw_text.strip():
             logger.warning("Empty text extracted from file: %s", drive_file_id)
             return {
-                "status": "failed",
-                "reason": "empty_text",
+                "status":        "failed",
+                "reason":        "empty_text",
                 "drive_file_id": drive_file_id,
             }
 
@@ -244,8 +258,8 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
         if row.get("drive_file_id")
     }
 
-    results  = []
-    queued   = 0
+    results = []
+    queued  = 0
 
     for file_data in files:
         file_id = file_data["id"]
