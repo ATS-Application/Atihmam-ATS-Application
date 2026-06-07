@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any
 
 from app.config import get_settings
 from app.db.supabase_client import get_supabase_admin
@@ -33,8 +32,9 @@ from app.services.drive_service import (
 )
 from app.services.scoring_service import (
     compute_candidate_score,
-    compute_cv_quality_score,
     _build_cv_text,
+    compute_cv_quality_score,
+    classify_domain,
 )
 from app.tasks.cv_processing import (
     build_candidate_payload,
@@ -89,14 +89,14 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
     try:
         response = supabase.table("candidates").insert(payload).execute()
         return {
-            "status": "processed",
+            "status":       "processed",
             "candidate_id": response.data[0]["id"],
         }
     except Exception as exc:
         if "uq_candidates_drive_file_id" in str(exc):
             return {
-                "status": "skipped",
-                "reason": "duplicate",
+                "status":        "skipped",
+                "reason":        "duplicate",
                 "drive_file_id": drive_file_id,
             }
         raise
@@ -108,22 +108,43 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 
 def _quality_fallback(extracted: dict) -> dict:
     """
-    Wraps compute_cv_quality_score (which takes plain text) into the
-    score_result shape expected by build_candidate_payload.
+    Wraps compute_cv_quality_score (plain text input) into the score_result
+    shape expected by build_candidate_payload. Stores all dimension keys
+    required by ScorePanel.jsx so nothing renders as zero unexpectedly.
     """
-    cv_text = _build_cv_text(extracted)
-    quality = compute_cv_quality_score(cv_text)
+    cv_text    = _build_cv_text(extracted)
+    quality    = compute_cv_quality_score(cv_text)
+    lang_score = round(quality["language_quality"] / 100.0, 3)
+    comp_score = round(quality["complexity"] / 100.0, 3)
+    exp_score  = round(min(float(extracted.get("experience_years") or 0) / 10.0, 1.0), 3)
+
     return {
-        "score":            quality["quality_score"],
+        "score":            round(quality["quality_score"], 2),
         "confidence":       0.5,
-        "domain":           "consulting",
+        "domain":           classify_domain(extracted.get("current_position") or ""),
         "hierarchy_level":  "collaborateur",
         "reasoning":        quality["overall_assessment"],
         "matched_keywords": [],
         "missing_keywords": [],
         "dimension_scores": {
-            "language_score":   round(quality["language_quality"] / 100, 3),
-            "complexity_score": round(quality["complexity"] / 100, 3),
+            # canonical v2.0 keys
+            "experience":     exp_score,
+            "education":      0.0,
+            "certifications": 0.0,
+            "semantic":       0.0,
+            "keywords":       0.0,
+            "leadership":     0.0,
+            "language":       lang_score,
+            "complexity":     comp_score,
+            # frontend aliases (ScorePanel.jsx)
+            "keyword_score":            0.0,
+            "semantic_score":           0.0,
+            "experience_score":         exp_score,
+            "project_complexity_score": comp_score,
+            "education_score":          0.0,
+            "certification_score":      0.0,
+            "leadership_score":         0.0,
+            "language_score":           lang_score,
         },
     }
 
