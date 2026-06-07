@@ -301,10 +301,8 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 
         # Fallback: no job linked and no active jobs → synthetic JD quality score
         if not score_result:
-            logger.info(
-                "No active jobs — computing synthetic quality score for %s", candidate_id
-            )
-            score_result = _make_quality_score_result(cv_info, raw_text)
+            logger.info("Aucun job actif → calcul du score de qualité autonome (rich)")
+            score_result = _quality_fallback(cv_info)   # reuse the same function
 
         # Sauvegarde
         payload = build_candidate_payload(
