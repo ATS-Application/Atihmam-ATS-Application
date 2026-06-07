@@ -1,7 +1,7 @@
 # app/tasks/cv_processing.py
 
 """
-Pipeline de traitement des CVs 
+Pipeline de traitement des CVs (VERSION MVP - SANS CELERY)
 
 Ce fichier est le cœur du traitement des CVs dans l'ATS.
 Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
@@ -11,7 +11,7 @@ Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
     3. L'IA analyse le texte et en extrait les infos structurées
        (nom, email, compétences, expériences, formations...)
     4. On calcule un score de correspondance avec les postes actifs
-       → Si aucun poste actif : on score la qualité du CV via JD synthétique
+       → Si aucun poste actif : on score via JD synthétique (tous les domaines)
     5. On sauvegarde tout dans la base de données
 
 ⚠️ Version simplifiée : pas de Celery, pas de Redis.
@@ -30,7 +30,6 @@ from app.db.supabase_client import get_supabase_admin
 from app.services.ai_service import extract_cv_info
 from app.services.cv_parser import extract_text_from_bytes
 from app.services.scoring_service import (
-    _build_cv_text,
     compute_candidate_score,
     classify_domain,
     Domain,
@@ -144,11 +143,24 @@ def fetch_active_jobs(supabase):
 # HELPERS INTERNES
 # ============================================================================
 
-def _make_quality_score_result(cv_info: dict) -> dict:
+def _enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
+    """
+    Injects raw_text into cv_data so compute_candidate_score uses the full
+    CV body for scoring instead of reconstructing from fragments.
+    This is the critical fix for keywords/semantic/education/certifications
+    all returning 0 — those scorers need the complete CV text.
+    """
+    enriched = dict(cv_info)
+    enriched["raw_text"] = raw_text
+    return enriched
+
+
+def _make_quality_score_result(cv_info: dict, raw_text: str) -> dict:
     """
     Scores a CV without a real job posting by synthesizing a generic job
     description from the CV's own domain and detected skills.
     All 8 dimensions are computed; results reflect CV quality, not job fit.
+    Uses raw_text so the full CV body is scored.
     """
     position   = cv_info.get("current_position") or ""
     domain_str = classify_domain(position)
@@ -167,8 +179,11 @@ def _make_quality_score_result(cv_info: dict) -> dict:
         f"Expérience significative dans le domaine {domain_str} requise."
     )
 
+    # Enrich cv_info with raw_text so scoring uses the full CV body
+    enriched = _enrich_cv_data(cv_info, raw_text)
+
     result = compute_candidate_score(
-        cv_data=cv_info,
+        cv_data=enriched,
         job_title=synthetic_title,
         job_requirements=synthetic_jd,
     )
@@ -221,6 +236,9 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         # Extraction IA
         cv_info = extract_cv_info(raw_text)
 
+        # Enrich with raw_text so scorer has the full CV body
+        enriched_cv = _enrich_cv_data(cv_info, raw_text)
+
         # === SCORING ===
         score_result = None
 
@@ -228,14 +246,16 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             job = fetch_job(supabase, job_id)
             if job:
                 score_result = compute_candidate_score(
-                    cv_data=cv_info,
+                    cv_data=enriched_cv,
                     job_title=job.get("title", ""),
                     job_requirements=job.get("requirements", ""),
                 )
         else:
             jobs = fetch_active_jobs(supabase)
             if jobs:
-                best_result, best_job_id = compute_best_job_match(supabase, cv_info, jobs)
+                best_result, best_job_id = compute_best_job_match(
+                    supabase, enriched_cv, jobs
+                )
                 if best_result:
                     score_result = best_result
                     job_id       = best_job_id
@@ -245,7 +265,7 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             logger.info(
                 "No active jobs — computing synthetic quality score for %s", candidate_id
             )
-            score_result = _make_quality_score_result(cv_info)
+            score_result = _make_quality_score_result(cv_info, raw_text)
 
         # Sauvegarde
         payload = build_candidate_payload(
@@ -275,9 +295,10 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 # FONCTIONS UTILISÉES PAR drive_sync.py
 # ============================================================================
 
-def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
+def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
     """
     Trouve le poste qui correspond le mieux à un CV parmi une liste de postes.
+    cv_data must already contain raw_text (use _enrich_cv_data before calling).
     Retourne (meilleur_score_result, meilleur_job_id).
     """
     best_score  = -1
@@ -287,7 +308,7 @@ def compute_best_job_match(supabase, cv_info: dict, jobs: list) -> tuple:
     for job in jobs:
         try:
             result = compute_candidate_score(
-                cv_data=cv_info,
+                cv_data=cv_data,
                 job_title=job.get("title", ""),
                 job_requirements=job.get("requirements", ""),
             )
