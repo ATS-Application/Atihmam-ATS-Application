@@ -107,14 +107,12 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _quality_fallback(extracted: dict) -> dict:
-    """Rich autonomous scoring - This is the key function."""
     position = (
         extracted.get("current_position")
         or extracted.get("title")
         or "Acheteur Senior Logistique"
     )
-
-    domain_str = classify_domain(position)   # Correct call
+    domain_str = classify_domain(position)
 
     skills = extracted.get("skills", [])[:30]
     work_history = extracted.get("work_history", [])
@@ -130,16 +128,13 @@ def _quality_fallback(extracted: dict) -> dict:
     synthetic_title = position
 
     synthetic_jd = f"""
-    Nous recherchons un {synthetic_title} expérimenté en Achats et Logistique Internationale.
+    Nous recherchons un {synthetic_title} expérimenté.
 
-    Compétences attendues : {skills_str}.
-
-    Expériences : {exp_str}.
-
+    Compétences : {skills_str}.
+    Expérience : {exp_str}.
     Projets : {proj_str}.
 
-    Missions : Pilotage achats, sourcing international, Incoterms, SAGE X3, optimisation TCO, 
-    négociation fournisseurs, gestion multi-chantiers, suivi KPI.
+    Missions : Pilotage achats, sourcing international, Incoterms, SAGE X3, TCO, négociation, KPI, gestion multi-chantiers.
     """
 
     cv_data = dict(extracted)
@@ -153,31 +148,40 @@ def _quality_fallback(extracted: dict) -> dict:
         job_requirements=synthetic_jd.strip(),
     )
 
-    result["reasoning"] = f"Score qualité autonome — {domain_str} — CV riche en Achats/Logistique"
+    result["reasoning"] = f"Score qualité autonome — {domain_str}"
     return result
 
 
 def resolve_candidate_score(
-    supabase, extracted: dict, job_id: str | None
+    supabase,
+    extracted: dict,
+    job_id: str | None,
 ) -> tuple[dict, str | None]:
+    """
+    Improved scoring with rich fallback.
+    """
     if job_id:
         job = fetch_job(supabase, job_id)
         if job:
-            return compute_candidate_score(
+            score_result = compute_candidate_score(
                 cv_data=extracted,
                 job_title=job.get("title", ""),
                 job_requirements=job.get("requirements", ""),
-            ), job_id
+                supabase=supabase,
+            )
+            return score_result, job_id
 
+    # Try best matching job
     jobs = fetch_active_jobs(supabase)
     if jobs:
-        best, best_id = compute_best_job_match(supabase, extracted, jobs)
-        if best:
-            return best, best_id
+        best_result, best_id = compute_best_job_match(supabase, extracted, jobs)
+        if best_result:
+            return best_result, best_id
 
-    # Rich fallback
-    logger.info("Using rich quality fallback")
-    return _quality_fallback(extracted), None
+    # RICH FALLBACK — this is the important part
+    logger.info("No active job → using rich quality fallback")
+    fallback = _quality_fallback(extracted)
+    return fallback, None
 
 # --------------------------------------------------------------------------- #
 # MAIN PROCESSOR
