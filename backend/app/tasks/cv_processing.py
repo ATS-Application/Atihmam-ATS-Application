@@ -31,18 +31,9 @@ from app.services.ai_service import extract_cv_info, analyze_cv_depth
 from app.services.cv_parser import extract_text_from_bytes
 from app.services.scoring_service import (
     _build_cv_text,
-    _education_score,
-    _certification_score,
-    _leadership_score,
-    _complexity_score,
-    _language_score,
     compute_candidate_score,
     compute_cv_quality_score,
-    infer_experience_years,
-    safe_dict_list,
-    _clamp,
     classify_domain,
-    detect_professional_level,
 )
 
 
@@ -155,35 +146,32 @@ def fetch_active_jobs(supabase):
 
 def _build_fallback_score_result(cv_info: dict, depth_report: dict) -> dict:
     """
-    Construit un score_result complet pour le CAS 3 (aucun poste actif).
-
-    FIX : _education_score() requiert domain + level ; l'ancienne version
-    passait uniquement cv_text ce qui levait un TypeError silencieusement
-    catchée par le bloc except global, résultant en processing_status='failed'.
+    Fallback score for candidates with no active job posting.
+    Uses compute_cv_quality_score from scoring_service v2.0.
     """
-    cv_text   = _build_cv_text(cv_info)
-    exp_years = float(cv_info.get("experience_years") or 0)
-    domain    = classify_domain(cv_text, "", "")
-    level     = detect_professional_level(cv_text)
+    quality = compute_cv_quality_score(_build_cv_text(cv_info))
     depth_score = float(depth_report.get("overall_depth_score") or 0)
 
+    # Blend CV quality with depth analysis
+    blended = round((quality["quality_score"] * 0.6 + depth_score * 40.0) / 100, 4)
+
     return {
-        "score":            depth_score,
+        "score":            round(quality["quality_score"], 2),
         "confidence":       0.6,
-        "domain":           domain.value,
-        "professional_level": level.value,
+        "domain":           classify_domain(cv_info.get("current_position") or ""),
+        "hierarchy_level":  "collaborateur",
         "reasoning":        depth_report.get("summary", "Analyse qualité CV autonome"),
         "matched_keywords": [],
         "missing_keywords": [],
         "dimension_scores": {
             "keyword_score":            0.0,
             "semantic_score":           0.0,
-            "experience_score":         _clamp(exp_years * 10),
-            "certification_score":      _certification_score(cv_text),
-            "education_score":          _education_score(cv_text, domain, "", level),
-            "leadership_score":         _leadership_score(cv_text),
-            "project_complexity_score": depth_score,
-            "language_score":           _language_score(cv_text),
+            "experience_score":         min(float(cv_info.get("experience_years") or 0) / 10.0, 1.0),
+            "education_score":          quality["details"]["language"].get("structure_score", 0.5),
+            "certification_score":      0.0,
+            "leadership_score":         0.0,
+            "project_complexity_score": depth_score / 100.0 if depth_score > 1 else depth_score,
+            "language_score":           quality["language_quality"] / 100.0,
         },
     }
 
@@ -252,17 +240,24 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
                     score_result = best_result
                     job_id = best_job_id
 
-        # Fallback : Score qualité autonome
+      
         if not score_result:
-            score_result = compute_cv_quality_score(cv_info, supabase=supabase)
-
-        # Sauvegarde
-        payload = build_candidate_payload(
-            raw_text=raw_text,
-            cv_info=cv_info,
-            score_result=score_result,
-            job_id=job_id
-        )
+            cv_text = _build_cv_text(cv_info)
+            score_result = compute_cv_quality_score(cv_text)
+            # Wrap to match expected shape
+            score_result = {
+                "score":            score_result["quality_score"],
+                "confidence":       0.5,
+                "domain":           classify_domain(cv_info.get("current_position") or ""),
+                "hierarchy_level":  "collaborateur",
+                "reasoning":        score_result["overall_assessment"],
+                "matched_keywords": [],
+                "missing_keywords": [],
+                "dimension_scores": {
+                    "language_score":   score_result["language_quality"] / 100.0,
+                    "complexity_score": score_result["complexity"] / 100.0,
+                },
+            }
 
         update_candidate(supabase, candidate_id, payload)
 
