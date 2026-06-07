@@ -316,24 +316,29 @@ export default function ScorePanel({ candidate }) {
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
   const dims = useMemo(() => {
-    // Priority: top-level field → nested in ai_extracted_data → nowhere
-    const raw =
-      candidate?.dimension_scores ??
-      aiData?.dimension_scores ??
-      null;
-
-    if (!raw) return {};
-
-    // Supabase JSONB → already an object
-    if (typeof raw === "object" && !Array.isArray(raw)) return raw;
-
-    // Supabase text column → JSON string
+    let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
+  
     if (typeof raw === "string") {
-      try { return JSON.parse(raw); } catch { return {}; }
+      try { raw = JSON.parse(raw); } catch { raw = {}; }
     }
-
-  return {};
-}, [candidate, aiData]);
+  
+    if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
+  
+    // Merge top-level columns as fallback (safety net)
+    const merged = {
+      keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
+      semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
+      experience_score: candidate?.experience_score ?? aiData?.experience_score ?? raw.experience_score,
+      project_complexity_score: candidate?.project_complexity_score ?? raw.project_complexity_score,
+      education_score: candidate?.education_score ?? raw.education_score,
+      certification_score: candidate?.certification_score ?? raw.certification_score,
+      leadership_score: candidate?.leadership_score ?? raw.leadership_score,
+      language_score: raw.language_score,
+      ...raw,                    // dimension_scores has priority
+    };
+  
+    return merged;
+  }, [candidate, aiData]);
 
   const matched = useMemo(() => {
     const raw = candidate?.matched_keywords ?? aiData?.matched_keywords;
@@ -363,7 +368,7 @@ export default function ScorePanel({ candidate }) {
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
 
-  const hasData = Object.keys(dims).length > 0;
+  const hasData = Object.keys(dims).length > 2;   // better than > 0
   const isPending = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
   const isFailed = processingStatus === "failed";
