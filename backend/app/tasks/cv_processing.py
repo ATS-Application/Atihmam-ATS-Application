@@ -156,43 +156,39 @@ def _enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
 
 
 def _make_quality_score_result(cv_info: dict, raw_text: str) -> dict:
-    """
-    Scores a CV without a real job posting by synthesizing a generic job
-    description from the CV's own domain and detected skills.
-    All 8 dimensions are computed; results reflect CV quality, not job fit.
-    Uses raw_text so the full CV body is scored.
-    """
-    position   = cv_info.get("current_position") or ""
+    """Improved autonomous scoring with better synthetic JD."""
+    position = cv_info.get("current_position") or ""
     domain_str = classify_domain(position)
-
-    try:
-        domain_enum   = Domain(domain_str)
-        domain_skills = DOMAIN_SKILLS.get(domain_enum, [])
-    except ValueError:
-        domain_skills = []
-
-    skills_str      = ", ".join(domain_skills[:15]) if domain_skills else "expérience professionnelle"
+    
+    # Build much richer synthetic JD from real CV content
+    skills = cv_info.get("skills", [])[:20]
+    experiences = [exp.get("title", "") for exp in cv_info.get("work_history", []) if exp.get("title")]
+    projects = [p.get("name", "") for p in cv_info.get("projects", [])]
+    
+    skills_str = ", ".join(skills) if skills else "expérience professionnelle"
+    exp_str = ", ".join(experiences[:8]) if experiences else ""
+    
     synthetic_title = position or f"Professionnel {domain_str}"
-    synthetic_jd    = (
-        f"Profil recherché : {synthetic_title}. "
-        f"Compétences attendues : {skills_str}. "
-        f"Expérience significative dans le domaine {domain_str} requise."
+    synthetic_jd = (
+        f"Nous recherchons un {synthetic_title} expérimenté. "
+        f"Compétences clés : {skills_str}. "
+        f"Expériences attendues : {exp_str}. "
+        f"Domaines : {domain_str}. "
+        f"Capacité à gérer des projets et à démontrer du leadership."
     )
 
-    # Enrich cv_info with raw_text so scoring uses the full CV body
     enriched = _enrich_cv_data(cv_info, raw_text)
-
+    
     result = compute_candidate_score(
         cv_data=enriched,
         job_title=synthetic_title,
         job_requirements=synthetic_jd,
     )
-
+    
     result["reasoning"] = (
         f"Score qualité autonome — domaine détecté : {domain_str}. "
-        "Aucun poste actif associé."
+        "Aucun poste actif associé. Scoring basé sur contenu du CV."
     )
-    result["matched_job"] = None
     return result
 
 
