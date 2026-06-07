@@ -312,7 +312,7 @@ export default function ScorePanel({ candidate }) {
   }, [candidate?.id]);
 
   // ── Derived data ────────────────────────────────────────────────────────────
-
+   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
    const dims = useMemo(() => {
     let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
 
