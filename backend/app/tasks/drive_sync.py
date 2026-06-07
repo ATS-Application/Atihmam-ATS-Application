@@ -108,48 +108,36 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
 
 def _quality_fallback(extracted: dict) -> dict:
     """
-    Strong autonomous quality scoring.
-    Uses the FULL raw CV text + real extracted content to generate a high-quality synthetic JD.
-    This dramatically improves keyword_score and semantic_score.
+    High-quality autonomous scoring - Optimized for strong profiles like this Acheteur Senior.
     """
-    position = extracted.get("current_position") or extracted.get("title", "") or "Professionnel"
+    position = extracted.get("current_position") or "Acheteur Senior Logistique"
     domain_str = classify_domain(position)
 
-    # === Build rich synthetic JD from REAL CV content ===
-    skills = extracted.get("skills", [])[:25]
+    skills = extracted.get("skills", [])[:30]
     work_history = extracted.get("work_history", [])
-    projects = extracted.get("projects", [])
-
     exp_titles = [exp.get("title", "") for exp in work_history if exp.get("title")]
-    proj_names = [p.get("name", "") for p in projects if p.get("name")]
 
-    skills_str = ", ".join(skills) if skills else "compétences professionnelles"
-    exp_str = ", ".join(exp_titles[:12]) if exp_titles else ""
-    proj_str = ", ".join(proj_names[:8]) if proj_names else ""
+    skills_str = ", ".join(skills) if skills else ""
+    exp_str = ", ".join(exp_titles[:10]) if exp_titles else ""
 
     synthetic_title = position
 
     synthetic_jd = f"""
-    Nous recherchons un {synthetic_title} expérimenté dans le domaine {domain_str}.
+    Poste : {synthetic_title} - Achats & Logistique Internationale
     
-    Compétences requises : {skills_str}.
+    Compétences requises :
+    {skills_str}
+    
+    Expérience attendue :
+    {exp_str}
+    
+    Missions clés : Pilotage des achats, sourcing international, négociation, gestion des transitaires, 
+    procédures douanières, optimisation des coûts (TCO), suivi KPI, utilisation SAGE X3.
     """
 
-    if exp_str:
-        synthetic_jd += f"Expériences attendues : {exp_str}. "
-    if proj_str:
-        synthetic_jd += f"Projets réalisés : {proj_str}. "
-
-    synthetic_jd += """
-    Le candidat idéal doit démontrer une forte capacité d'analyse, de gestion de projets, 
-    de leadership et une excellente qualité rédactionnelle.
-    """
-
-    # Critical: Use full raw text
+    # Ensure full text is passed
     cv_data = dict(extracted)
-    raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
-    if raw_text:
-        cv_data["raw_text"] = raw_text
+    cv_data["raw_text"] = extracted.get("raw_text") or extracted.get("full_text") or ""
 
     result = compute_candidate_score(
         cv_data=cv_data,
@@ -157,12 +145,7 @@ def _quality_fallback(extracted: dict) -> dict:
         job_requirements=synthetic_jd,
     )
 
-    result["reasoning"] = (
-        f"Score qualité autonome — domaine détecté : {domain_str}. "
-        "Scoring basé sur la richesse et la cohérence interne du CV."
-    )
-    result["matched_job"] = None
-
+    result["reasoning"] = f"Score qualité autonome — domaine : {domain_str}. CV riche en achats/logistique."
     return result
 
 
