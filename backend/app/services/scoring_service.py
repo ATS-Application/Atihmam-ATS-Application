@@ -403,7 +403,7 @@ class DeficiencyPenalty:
 PENALTY_SYSTEM: List[DeficiencyPenalty] = [
     DeficiencyPenalty("experience",     0.15, 0.40, "exponential", "Expérience critique insuffisante pour le poste"),
     DeficiencyPenalty("education",      0.10, 0.25, "step",        "Niveau d'éducation en dessous du seuil requis"),
-    DeficiencyPenalty("certifications", 0.05, 0.15, "linear",      "Certifications obligatoires absentes"),
+    DeficiencyPenalty("certifications", 0.15, 0.10, "exponential", "Certifications obligatoires absentes"),
     DeficiencyPenalty("leadership",     0.10, 0.20, "linear",      "Leadership requis mais non démontré"),
     DeficiencyPenalty("language",       0.10, 0.10, "linear",      "Qualité linguistique insuffisante"),
 ]
