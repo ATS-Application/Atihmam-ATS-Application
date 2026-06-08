@@ -403,7 +403,7 @@ class DeficiencyPenalty:
 PENALTY_SYSTEM: List[DeficiencyPenalty] = [
     DeficiencyPenalty("experience",     0.15, 0.40, "exponential", "Expérience critique insuffisante pour le poste"),
     DeficiencyPenalty("education",      0.10, 0.25, "step",        "Niveau d'éducation en dessous du seuil requis"),
-    DeficiencyPenalty("certifications", 0.15, 0.10, "exponential", "Certifications obligatoires absentes"),
+    DeficiencyPenalty("certifications", 0.05, 0.15, "linear",      "Certifications obligatoires absentes"),
     DeficiencyPenalty("leadership",     0.10, 0.20, "linear",      "Leadership requis mais non démontré"),
     DeficiencyPenalty("language",       0.10, 0.10, "linear",      "Qualité linguistique insuffisante"),
 ]
@@ -886,6 +886,7 @@ def score_candidate(
     required_keywords: Optional[List[str]] = None,
     past_titles: Optional[List[str]] = None,
     target_languages: Optional[List[str]] = None,
+    cv_years_hint: float = 0,
 ) -> CandidateScore:
     if required_keywords is None:
         required_keywords = []
@@ -907,7 +908,11 @@ def score_candidate(
         r'(\d+)\s*(?:\+)?\s*(?:ans?|années?|years?)(?:\s+d[\'\"](?:expérience|experience))?',
         cv_lower,
     )
-    cv_years = max([int(y) for y in years_pattern]) if years_pattern else 0.0
+    cv_years_from_text = max([int(y) for y in years_pattern]) if years_pattern else 0.0
+    # Use structured hint (from ai_extracted experience_years) when regex finds nothing.
+    # This covers cases where raw_text was not stored and only a reconstructed text
+    # fragment (job titles only) is available.
+    cv_years = max(cv_years_from_text, cv_years_hint)
 
     exp_score,  exp_details  = compute_experience_score(cv_years, required_years_experience, hierarchy_level)
     edu_score,  edu_details  = compute_education_score(detected_education, hierarchy_level)
@@ -1119,22 +1124,48 @@ _SEM_CAP    = 75.0
 
 
 def _build_cv_text(cv_data: dict) -> str:
-    """Build a single text blob from a structured CV dict."""
+    """
+    Build a single text blob from a structured CV dict.
+    Used as fallback when raw_text / full_text are absent (e.g. API re-score
+    where cv_raw_text was not loaded). Includes skills, education, and languages
+    so that keyword/semantic/certification scorers have something to work with.
+    """
     if not isinstance(cv_data, dict):
         return str(cv_data)
     parts = []
     if cv_data.get("summary"):
         parts.append(cv_data["summary"])
+    if cv_data.get("current_position") or cv_data.get("title"):
+        parts.append(cv_data.get("current_position") or cv_data.get("title", ""))
     if cv_data.get("full_name"):
         parts.append(cv_data["full_name"])
+    # Skills — most keyword-dense field
+    skills = cv_data.get("skills", [])
+    if skills:
+        parts.append(" ".join(str(s) for s in skills))
+    # Work history — title + description
     for exp in cv_data.get("work_history", []):
         parts.append(exp.get("title", ""))
         parts.append(exp.get("description", ""))
+        parts.append(exp.get("company", ""))
+    # Education — degree names matter for education scorer
+    for edu in cv_data.get("education", []):
+        if isinstance(edu, dict):
+            parts.append(edu.get("degree", ""))
+            parts.append(edu.get("institution", ""))
+            parts.append(edu.get("field", ""))
+        else:
+            parts.append(str(edu))
+    # Projects
     for proj in cv_data.get("projects", []):
         parts.append(proj.get("name", ""))
         parts.append(proj.get("description", ""))
+    # Certifications
     for cert in cv_data.get("certifications", []):
         parts.append(str(cert))
+    # Languages
+    for lang in cv_data.get("languages", []):
+        parts.append(str(lang))
     return " ".join(filter(None, parts))
 
 
@@ -1154,6 +1185,14 @@ def compute_candidate_score(
     else:
         cv_text = str(cv_data)
 
+    # Extract experience_years from structured data for the hint
+    _exp_years_hint = 0.0
+    if isinstance(cv_data, dict) and cv_data.get("experience_years"):
+        try:
+            _exp_years_hint = float(cv_data["experience_years"])
+        except (ValueError, TypeError):
+            pass
+
     score_obj = score_candidate(
         candidate_id="COMPAT-" + str(hash(cv_text[:100])),
         cv_text=cv_text,
@@ -1170,6 +1209,7 @@ def compute_candidate_score(
             for exp in (cv_data.get("work_history", []) if isinstance(cv_data, dict) else [])
             if exp.get("title")
         ],
+        cv_years_hint=_exp_years_hint,
     )
 
     sd = score_to_dict(score_obj)
