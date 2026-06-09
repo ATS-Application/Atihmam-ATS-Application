@@ -2,3 +2,15 @@
 token.json
 oauth_credentials.json
 oauth_credentials.json.json
+
+# Python
+__pycache__/
+*.pyc
+
+# HuggingFace
+.hf-cache/
+backend/.hf-cache/
+
+# Virtual environments
+.venv/
+venv/
