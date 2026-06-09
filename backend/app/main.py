@@ -37,6 +37,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         docs_url="/docs" if getattr(settings, "app_env", "development") == "development" else None,
         redoc_url=None,
+        redirect_slashes=False,
     )
 
     origins = getattr(settings, "allowed_origins", []) or []
