@@ -28,12 +28,18 @@ export function useLogin() {
         data?.token ||
         data?.accessToken;
 
+      const user = data?.user; // 🔥 ADD THIS
+
+      console.log("LOGIN RESPONSE:", data);
+      console.log("TOKEN:", token);
+      console.log("USER:", user);
+
       if (!token) {
         toast.error("Token d'authentification introuvable");
         return;
       }
 
-      setAuth(token, null);
+      setAuth(token, user); // 🔥 FIX HERE
 
       toast.success("Connexion réussie");
 
