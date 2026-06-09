@@ -68,7 +68,7 @@ async def login(payload: UserLogin):
         supabase.table("profiles")
         .select("full_name, role")
         .eq("id", user.id)
-        .single()
+        .maybe_single()
         .execute()
     )
     profile = profile_resp.data or {}
