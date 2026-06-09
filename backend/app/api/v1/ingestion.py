@@ -39,6 +39,7 @@ from app.tasks.drive_sync import sync_drive_folder
 router = APIRouter(
     prefix="/ingestion",
     tags=["CV Ingestion"],
+    redirect_slashes=False,
 )
 
 # =========================================================

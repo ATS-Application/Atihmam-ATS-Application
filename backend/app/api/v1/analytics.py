@@ -31,7 +31,7 @@ from app.services.intelligent_scoring_service import (
 )
 from app.services.keyword_matching_service import KeywordMatchingService
 
-router = APIRouter(prefix="/analytics", tags=["Analytics"])
+router = APIRouter(prefix="/analytics", tags=["Analytics"], redirect_slashes=False)
 
 _MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 0.5  # seconds; doubles each attempt

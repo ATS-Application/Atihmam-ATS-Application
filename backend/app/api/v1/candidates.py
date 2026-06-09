@@ -47,7 +47,7 @@ from app.tasks.cv_processing import fetch_job, _quality_fallback
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/candidates", tags=["Candidates"])
+router = APIRouter(prefix="/candidates", tags=["Candidates"], redirect_slashes=False)
 
 
 # ============================================================================

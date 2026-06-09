@@ -17,7 +17,7 @@ from app.core.security import get_current_user
 from app.db.supabase_client import get_supabase_admin
 from app.services.scoring_service import update_weights_from_feedback
 
-router = APIRouter(prefix="/feedback", tags=["Feedback"])
+router = APIRouter(prefix="/feedback", tags=["Feedback"], redirect_slashes=False)
 
 
 def _get_candidate_or_404(candidate_id: str, supabase):

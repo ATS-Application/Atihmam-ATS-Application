@@ -27,6 +27,7 @@ from app.utils.sanitize import safe_screening_questions
 router = APIRouter(
     prefix="/jobs",
     tags=["Jobs"],
+    redirect_slashes=False
 )
 
 
