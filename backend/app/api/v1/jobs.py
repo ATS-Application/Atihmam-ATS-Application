@@ -36,7 +36,7 @@ router = APIRouter(
 # =========================================================
 
 @router.get(
-    "/",
+    "",
     response_model=list[JobResponse],
 )
 async def list_jobs(
@@ -107,7 +107,7 @@ async def get_job(
 # =========================================================
 
 @router.post(
-    "/",
+    "",
     response_model=JobResponse,
     status_code=status.HTTP_201_CREATED,
 )

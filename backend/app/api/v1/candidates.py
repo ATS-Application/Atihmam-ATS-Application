@@ -148,7 +148,7 @@ def build_cv_data(candidate: dict) -> dict:
 # LIST & RETRIEVE
 # ============================================================================
 
-@router.get("/", response_model=list[CandidateResponse])
+@router.get("", response_model=list[CandidateResponse])
 async def list_candidates(
     job_id: UUID | None = Query(None),
     status_filter: str | None = Query(default=None, alias="status"),
@@ -177,7 +177,7 @@ async def get_candidate(
 # CREATE & UPDATE
 # ============================================================================
 
-@router.post("/", response_model=CandidateResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=CandidateResponse, status_code=status.HTTP_201_CREATED)
 async def create_candidate(
     payload: CandidateCreate,
     user: dict = Depends(get_current_user),
