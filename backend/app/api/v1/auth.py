@@ -1,9 +1,14 @@
 # backend/app/api/v1/auth.py
 from app.config import get_settings
-# from backend.app.tasks.celery import get_settings
-from fastapi import APIRouter, HTTPException, status
-from app.models.user import UserLogin, UserRegister, TokenResponse, PasswordResetRequest, PasswordResetConfirm
-from app.core.security import create_access_token
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.models.user import (
+    UserLogin,
+    UserRegister,
+    TokenResponse,
+    PasswordResetRequest,
+    PasswordResetConfirm,
+)
+from app.core.security import create_access_token, get_current_user
 from app.db.supabase_client import get_supabase, get_supabase_admin
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -27,6 +32,7 @@ async def register(payload: UserRegister):
 
     supabase.table("profiles").insert({
         "id": user.id,
+        "email": user.email,
         "full_name": payload.full_name,
         "role": "recruiter",
     }).execute()
@@ -56,7 +62,23 @@ async def login(payload: UserLogin):
             detail="Authentication failed",
         )
 
-    access_token = create_access_token({"sub": user.id, "email": user.email})
+    # Fetch profile to embed full_name + role in JWT claims.
+    # This allows the client to decode user info without a /me round-trip on login.
+    profile_resp = (
+        supabase.table("profiles")
+        .select("full_name, role")
+        .eq("id", user.id)
+        .single()
+        .execute()
+    )
+    profile = profile_resp.data or {}
+
+    access_token = create_access_token({
+        "sub": user.id,
+        "email": user.email,
+        "full_name": profile.get("full_name", ""),
+        "role": profile.get("role", "recruiter"),
+    })
     return TokenResponse(access_token=access_token)
 
 
@@ -64,6 +86,7 @@ async def login(payload: UserLogin):
 async def forgot_password(payload: PasswordResetRequest):
     supabase = get_supabase()
     settings = get_settings()
+
     try:
         supabase.auth.reset_password_for_email(
             payload.email,
@@ -71,34 +94,32 @@ async def forgot_password(payload: PasswordResetRequest):
         )
         return {"message": "If this email is registered, a reset link has been sent."}
     except Exception as e:
-        # This will print the actual Supabase error (e.g., "invalid email", "rate limit exceeded")
-        # to your backend logs.
-        print(f"DEBUG ERROR: {e}") 
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=str(e) # This will now show the real error in your browser console
-        )
+        print(f"[forgot_password] ERROR: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.post("/reset-password", status_code=status.HTTP_200_OK)
 async def reset_password(payload: PasswordResetConfirm):
     supabase_admin = get_supabase_admin()
+
     try:
-        # Decode user id from the access token
         user = get_supabase().auth.get_user(payload.access_token)
         if not user or not user.user:
             raise ValueError("Invalid token")
         supabase_admin.auth.admin.update_user_by_id(
             user.user.id,
-            {"password": payload.new_password}
+            {"password": payload.new_password},
         )
     except Exception:
         raise HTTPException(status_code=400, detail="Lien invalide ou expiré.")
+
     return {"message": "Password updated successfully."}
 
 
 @router.get("/me")
-async def get_me():
-    # Implemented via Depends(get_current_user) in protected routes.
-    # This stub exists for Swagger visibility.
-    pass
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """
+    Returns the profile of the currently authenticated user.
+    Used by the frontend to re-hydrate user state after page reload.
+    """
+    return current_user

@@ -1,13 +1,14 @@
 # backend/app/core/security.py
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from jose import JWTError, jwt
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from app.config import get_settings
-from app.db.supabase_client import get_supabase
-# Import the explicit exception class thrown by the Supabase client
+from jose import JWTError, jwt
 from postgrest.exceptions import APIError
+
+from app.config import get_settings
+from app.db.supabase_client import get_supabase, get_supabase_admin
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -15,10 +16,9 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 def create_access_token(data: dict[str, Any]) -> str:
     settings = get_settings()
     payload = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(
+    payload["exp"] = datetime.now(timezone.utc) + timedelta(
         minutes=settings.access_token_expire_minutes
     )
-    payload.update({"exp": expire})
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
@@ -36,7 +36,7 @@ def decode_access_token(token: str) -> dict[str, Any]:
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict[str, Any]:
     payload = decode_access_token(token)
-    user_id: str = payload.get("sub")
+    user_id: str | None = payload.get("sub")
 
     if not user_id:
         raise HTTPException(
@@ -45,50 +45,72 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict[str, Any
         )
 
     supabase = get_supabase()
-    
+
     try:
-        # This will throw an APIError if 0 rows are found due to .single()
-        response = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+        response = (
+            supabase.table("profiles")
+            .select("id, email, full_name, role")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
         return response.data
-        
+
     except APIError as e:
-        # Check if it's the specific "0 rows found" PostgREST error
-        if e.code == "PGRST116":
-            
-            # --- OPTION A: Auto-create the missing profile (Highly Recommended for local testing) ---
-            try:
-                # We fetch the email from auth.users to keep fields accurate
-                auth_user = supabase.auth.admin.get_user_by_id(user_id)
-                email = auth_user.user.email if auth_user and auth_user.user else "user@example.com"
-                
-                new_profile = supabase.table("profiles").insert({
-                    "id": user_id,
-                    "full_name": email.split("@")[0].capitalize(),
-                    "role": "admin"  # Automatically makes your local session an admin
-                }).execute()
-                
-                return new_profile.data[0]
-            except Exception:
-                # --- OPTION B: Fallback clean error if auto-insert fails ---
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authenticated user lacks a profile record in the database.",
-                )
-        else:
-            # Re-raise the exception if it's a completely different database issue
+        if e.code != "PGRST116":
+            # Not a "0 rows" error — something else went wrong at the DB level
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Database error: {e.message}"
+                detail=f"Database error: {e.message}",
             )
+
+    # PGRST116: profile row is missing for a valid auth user.
+    # Auto-create it using the admin client (anon client cannot call auth.admin).
+    supabase_admin = get_supabase_admin()
+    try:
+        auth_response = supabase_admin.auth.admin.get_user_by_id(user_id)
+        email = (
+            auth_response.user.email
+            if auth_response and auth_response.user
+            else payload.get("email", "unknown@example.com")
+        )
+        insert_resp = (
+            supabase.table("profiles")
+            .insert({
+                "id": user_id,
+                "email": email,
+                "full_name": email.split("@")[0].capitalize(),
+                # Safe default — never auto-elevate to admin
+                "role": "recruiter",
+            })
+            .execute()
+        )
+        return insert_resp.data[0]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated user has no profile record.",
+        ) from exc
 
 
 def require_role(*roles: str):
-    """Usage: Depends(require_role("admin", "recruiter"))"""
-    async def _check(user: dict = Depends(get_current_user)):
+    """
+    Role-based access control dependency.
+
+    Usage:
+        @router.get("/admin-only")
+        async def admin_route(user: dict = Depends(require_role("admin"))):
+            ...
+
+        @router.get("/staff")
+        async def staff_route(user: dict = Depends(require_role("admin", "recruiter"))):
+            ...
+    """
+    async def _check(user: dict = Depends(get_current_user)) -> dict:
         if user.get("role") not in roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Required role: {roles}",
+                detail=f"Access requires one of roles: {roles}",
             )
         return user
     return _check
