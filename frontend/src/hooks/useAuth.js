@@ -13,44 +13,25 @@ import { useAuthStore } from "../store/authStore";
 
 export function useLogin() {
   const navigate = useNavigate();
-  const setAuth = useAuthStore((state) => state.setAuth);
+  const login = useAuthStore((state) => state.login); // ← login, not setAuth
 
   return useMutation({
-    mutationFn: ({ email, password }) =>
-      authApi.login({
-        email,
-        password,
-      }),
+    mutationFn: ({ email, password }) => authApi.login({ email, password }),
 
     onSuccess: (data) => {
-      const token =
-        data?.access_token ||
-        data?.token ||
-        data?.accessToken;
-
-      const user = data?.user; // 🔥 ADD THIS
-
-      console.log("LOGIN RESPONSE:", data);
-      console.log("TOKEN:", token);
-      console.log("USER:", user);
-
-      if (!token) {
+      if (!data?.access_token) {
         toast.error("Token d'authentification introuvable");
         return;
       }
 
-      setAuth(token, user); // 🔥 FIX HERE
+      login(data); // ← decodes JWT internally, sets both token + user
 
       toast.success("Connexion réussie");
-
       navigate("/dashboard");
     },
 
     onError: (error) => {
-      toast.error(
-        error?.message ||
-          "Identifiants incorrects"
-      );
+      toast.error(error?.message || "Identifiants incorrects");
     },
   });
 }
