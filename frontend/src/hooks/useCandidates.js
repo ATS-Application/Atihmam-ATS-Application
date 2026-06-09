@@ -32,6 +32,7 @@ export function useCandidates(filters = {}) {
 }
 
 export function useCandidate(id) {
+  const isHydrated = useAuthStore((state) => state._hydrated);
   return useQuery({
     queryKey: ["candidate", id],
 
@@ -40,8 +41,8 @@ export function useCandidate(id) {
       return res.data;
     },
 
-    enabled: !!id,
-    staleTime: 1000 * 15,
+    enabled: !!id && isHydrated,
+    staleTime: 1000 * 30,
     refetchOnWindowFocus: false,
     retry: 1,
   });
@@ -56,7 +57,7 @@ export function useCandidateWithPolling(id, { pollUntilScored = false } = {}) {
       return res.data;
     },
 
-    enabled: !!id,
+    enabled: !!id && isHydrated,
 
     refetchInterval: (query) => {
       if (!pollUntilScored) return false;

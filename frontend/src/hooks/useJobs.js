@@ -4,9 +4,11 @@ import toast from "react-hot-toast";
 import { getJobs, createJob, updateJob, deleteJob } from "../api/jobsApi";
 
 export function useJobs() {
+  const isHydrated = useAuthStore((state) => state._hydrated);
   return useQuery({
     queryKey: ["jobs"],
     queryFn: () => getJobs().then((r) => r.data),
+    enabled: isHydrated,
   });
 }
 

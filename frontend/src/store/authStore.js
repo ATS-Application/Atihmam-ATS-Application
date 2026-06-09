@@ -3,6 +3,8 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { jwtDecode } from "jwt-decode";
 
+
+
 const decodeUser = (token) => {
   try {
     const { sub, email, full_name, role } = jwtDecode(token);
@@ -17,6 +19,7 @@ export const useAuthStore = create(
     (set, get) => ({
       token: null,
       user: null,
+      _hydrated: false,
 
       // Called after successful /auth/login response
       // Decodes JWT immediately — no extra round-trip needed
@@ -50,7 +53,10 @@ export const useAuthStore = create(
       // Only persist the token — user is derived from it
       partialize: (state) => ({ token: state.token }),
       onRehydrateStorage: () => (state) => {
-        if (!state?.token) return;
+        if (!state?.token) {
+          useAuthStore.setState({ _hydrated: true }); // Still mark as hydrated to avoid infinite loading states
+          return;
+        }
 
         // Optimistic decode: populate user synchronously from the persisted
         // token so there's no flash of unauthenticated UI on reload
@@ -63,6 +69,7 @@ export const useAuthStore = create(
           // Token is malformed — clear it immediately
           state.token = null;
         }
+        useAuthStore.setState({ _hydrated: true });// Mark as hydrated even if there's no token to avoid infinite loading states
       },
     }
   )
