@@ -71,7 +71,7 @@ async def login(payload: UserLogin):
         .maybe_single()
         .execute()
     )
-    profile = profile_resp.data or {}
+    profile = profile_resp.data if profile_resp else {}
 
     access_token = create_access_token({
         "sub": user.id,
