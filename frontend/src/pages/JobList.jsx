@@ -410,7 +410,8 @@ function ScreeningSummary({ sq }) {
 export default function JobList() {
   const navigate = useNavigate();
 
-  const { data: jobs = [], isLoading }          = useJobs();
+  const { data: jobs = [], isLoading, status, error }          = useJobs();
+  console.log("useJobs →", { status, jobsCount: jobs.length, error });
   const { mutate: createJob, isPending: isCreating } = useCreateJob({ onSuccess: () => setShowCreate(false) });
   const { mutate: updateJob, isPending: isUpdating } = useUpdateJob({ onSuccess: () => setEditingId(null) });
   const { mutate: deleteJob }                   = useDeleteJob();
