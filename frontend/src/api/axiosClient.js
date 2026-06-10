@@ -9,14 +9,14 @@ const axiosClient = axios.create({
 
 // Normalize trailing slashes before auth header is attached —
 // prevents the 307 redirect that strips Authorization on redirect.
-axiosClient.interceptors.request.use((config) => {
-  const url = config.url ?? "";
-  const [path, query] = url.split("?");
-  if (path && !path.endsWith("/")) {
-    config.url = query ? `${path}/?${query}` : `${path}/`;
-  }
-  return config;
-});
+// axiosClient.interceptors.request.use((config) => {
+//   const url = config.url ?? "";
+//   const [path, query] = url.split("?");
+//   if (path && !path.endsWith("/")) {
+//     config.url = query ? `${path}/?${query}` : `${path}/`;
+//   }
+//   return config;
+// });
 
 // Attach JWT on every request
 axiosClient.interceptors.request.use((config) => {
