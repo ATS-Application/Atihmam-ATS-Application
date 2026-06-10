@@ -6,10 +6,12 @@ import { getJobs, createJob, updateJob, deleteJob } from "../api/jobsApi";
 
 export function useJobs() {
   const isHydrated = useAuthStore((state) => state._hydrated);
+  const token = useAuthStore((state) => state.token);
+  console.log("useJobs enabled check →", { isHydrated, hasToken: !!token });
   return useQuery({
     queryKey: ["jobs"],
     queryFn: getJobs,   // ← just pass getJobs directly, no .then()
-    enabled: isHydrated,
+    enabled: isHydrated && !!token,
   });
 }
 
