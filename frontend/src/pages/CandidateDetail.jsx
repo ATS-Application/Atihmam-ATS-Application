@@ -365,9 +365,28 @@ export default function CandidateDetail() {
 
   // ── Data fetching ───────────────────────────────────────────────────────────
 
-  const { data: candidate, isLoading } = useCandidateWithPolling(id, {
+  const { data: candidate, isLoading, isFetching, fetchStatus } = useCandidateWithPolling(id, {
     pollUntilScored: true,
   });
+
+  const isHydrated = useAuthStore((state) => state._hydrated);
+
+  // ✅ Show loading if: auth not ready, or query is running
+  if (!isHydrated || isLoading || (fetchStatus === "idle" && !candidate)) {
+    return (
+      <div className="flex h-full items-center justify-center p-10">
+        <p className="animate-pulse text-sm text-gray-400">Chargement du candidat...</p>
+      </div>
+    );
+  }
+
+  if (!candidate) {
+    return (
+      <div className="flex h-full items-center justify-center p-10">
+        <p className="text-sm text-gray-400">Candidat introuvable</p>
+      </div>
+    );
+  }
 
   const { data: jobs = [] } = useJobs();
 

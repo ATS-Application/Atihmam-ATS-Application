@@ -61,18 +61,14 @@ export function useCandidateWithPolling(id, { pollUntilScored = false } = {}) {
 
     enabled: !!id && isHydrated,
 
+    // ✅ Keep showing loading state until hydration is done
+    placeholderData: undefined,
+
     refetchInterval: (query) => {
       if (!pollUntilScored) return false;
-
       const candidate = query.state.data;
-
-      // No data yet — poll to get the initial state.
       if (!candidate) return 3000;
-
-      // processing_status is the authoritative signal.
-      // Stop once we've left a pending state (completed, failed, done, or null).
       if (PENDING_STATUSES.has(candidate.processing_status)) return 3000;
-
       return false;
     },
 
