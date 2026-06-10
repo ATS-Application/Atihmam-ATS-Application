@@ -3,7 +3,7 @@ import axios from "axios";
 import { useAuthStore } from "../store/authStore";
 
 const axiosClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'https://atihmam-ats-application.onrender.com/api/v1',
+  baseURL: (import.meta.env.VITE_API_BASE_URL || 'https://atihmam-ats-application.onrender.com/api/v1').replace(/\/+$/, ''), // Remove trailing slashes if any
   headers: { "Content-Type": "application/json" },
 });
 
