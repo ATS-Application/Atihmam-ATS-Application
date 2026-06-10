@@ -36,7 +36,7 @@ export const useAuthStore = create(
         try {
           // Lazy import avoids circular dependency (axiosClient → authStore → axiosClient)
           const { default: axiosClient } = await import("../api/axiosClient");
-          const res = await axiosClient.get("/auth/me/");
+          const res = await axiosClient.get("/auth/me");
           set({ user: res.data });
         } catch {
           logout();
