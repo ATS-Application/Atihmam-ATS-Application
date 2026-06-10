@@ -127,6 +127,7 @@ async def create_job(
     )
 
     data["created_by"] = user["id"]
+    data["is_active"] = True
 
     response = (
         supabase
