@@ -1,8 +1,10 @@
 // frontend/src/api/jobsApi.js
 import axiosClient from "./axiosClient";
 
-export const getJobs    = ()         => axiosClient.get("/jobs");
-export const getJob     = (id)       => axiosClient.get(`/jobs/${id}`);
-export const createJob  = (data)     => axiosClient.post("/jobs", data);
-export const updateJob  = (id, data) => axiosClient.patch(`/jobs/${id}`, data);
-export const deleteJob  = (id)       => axiosClient.delete(`/jobs/${id}`);
+const unwrap = (promise) => promise.then((res) => res.data);
+
+export const getJobs    = ()         => unwrap(axiosClient.get("/jobs"));
+export const getJob     = (id)       => unwrap(axiosClient.get(`/jobs/${id}`));
+export const createJob  = (data)     => unwrap(axiosClient.post("/jobs", data));
+export const updateJob  = (id, data) => unwrap(axiosClient.patch(`/jobs/${id}`, data));
+export const deleteJob  = (id)       => unwrap(axiosClient.delete(`/jobs/${id}`));

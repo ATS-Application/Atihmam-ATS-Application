@@ -8,7 +8,7 @@ export function useJobs() {
   const isHydrated = useAuthStore((state) => state._hydrated);
   return useQuery({
     queryKey: ["jobs"],
-    queryFn: () => getJobs().then((r) => r.data),
+    queryFn: getJobs,   // ← just pass getJobs directly, no .then()
     enabled: isHydrated,
   });
 }
