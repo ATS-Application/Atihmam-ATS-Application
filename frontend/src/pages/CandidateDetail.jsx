@@ -359,20 +359,73 @@ export default function CandidateDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
 
+  // ── ALL hooks at the top — no exceptions ──────────────────────────────────
   const [showTransition, setShowTransition] = useState(false);
   const [feedbackSent, setFeedbackSent] = useState(null);
   const [loadingFeedback, setLoadingFeedback] = useState(false);
   const { openCV, isOpeningCV } = useOpenCV();
 
-  // ── Data fetching ───────────────────────────────────────────────────────────
-
-  const { data: candidate, isLoading, isFetching, fetchStatus } = useCandidateWithPolling(id, {
+  const { data: candidate, isLoading, fetchStatus } = useCandidateWithPolling(id, {
     pollUntilScored: true,
   });
 
-  // const isHydrated = useAuthStore((state) => state._hydrated);
+  const { data: jobs = [] } = useJobs();  // ← moved up
 
-  // ✅ Show loading if: auth not ready, or query is running
+  useEffect(() => {                        // ← moved up
+    setFeedbackSent(null);
+    setLoadingFeedback(false);
+  }, [candidate?.id]);
+
+  const linkedJob = useMemo(() => {        // ← moved up
+    if (!candidate?.job_id) return null;
+    return jobs.find((j) => j.id === candidate.job_id) ?? null;
+  }, [jobs, candidate]);
+
+  const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
+
+  const dims = useMemo(() => {
+    let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
+    if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { raw = {}; } }
+    if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
+    const merged = {
+      keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
+      semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
+      experience_score: candidate?.experience_score ?? aiData?.experience_score ?? raw.experience_score,
+      project_complexity_score: candidate?.project_complexity_score ?? raw.project_complexity_score,
+      education_score: candidate?.education_score ?? raw.education_score,
+      certification_score: candidate?.certification_score ?? raw.certification_score,
+      leadership_score: candidate?.leadership_score ?? raw.leadership_score,
+      ...raw,
+    };
+    return Object.fromEntries(
+      Object.entries(merged).map(([key, value]) => [key, value > 1 ? value : (value ?? 0) * 100])
+    );
+  }, [candidate, aiData]);
+
+  const matched = useMemo(
+    () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
+    [candidate, aiData]
+  );
+  const missing = useMemo(
+    () => safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords),
+    [candidate, aiData]
+  );
+  const coveredClusters = useMemo(() => {
+    const explicit = safeParseArray(candidate?.covered_clusters ?? aiData?.covered_clusters);
+    if (explicit.length > 0) return explicit;
+    const skills = safeParseArray(candidate?.skills ?? aiData?.skills);
+    return Object.keys(CLUSTER_ICONS).filter((cluster) =>
+      skills.some((s) => String(s).toLowerCase().includes(cluster))
+    );
+  }, [candidate, aiData]);
+
+  const aiDataWithoutSummary = useMemo(() => {
+    if (!candidate?.ai_extracted_data) return null;
+    const { summary, ...rest } = candidate.ai_extracted_data;
+    return Object.keys(rest).length > 0 ? rest : null;
+  }, [candidate]);
+
+  // ── Early returns come AFTER all hooks ────────────────────────────────────
   if (isLoading || (fetchStatus === "idle" && !candidate)) {
     return (
       <div className="flex h-full items-center justify-center p-10">
@@ -389,92 +442,20 @@ export default function CandidateDetail() {
     );
   }
 
-  const { data: jobs = [] } = useJobs();
-
-  // Reset feedback when candidate changes
-  useEffect(() => {
-    setFeedbackSent(null);
-    setLoadingFeedback(false);
-  }, [candidate?.id]);
-
-  const linkedJob = useMemo(() => {
-    if (!candidate?.job_id) return null;
-    return jobs.find((j) => j.id === candidate.job_id) ?? null;
-  }, [jobs, candidate]);
-
-  // ── Derived data ────────────────────────────────────────────────────────────
-  const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
-
-  const dims = useMemo(() => {
-    let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
-
-    if (typeof raw === "string") {
-      try { raw = JSON.parse(raw); } catch { raw = {}; }
-    }
-    if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
-
-    const merged = {
-      keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
-      semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
-      experience_score: candidate?.experience_score ?? aiData?.experience_score ?? raw.experience_score,
-      project_complexity_score: candidate?.project_complexity_score ?? raw.project_complexity_score,
-      education_score: candidate?.education_score ?? raw.education_score,
-      certification_score: candidate?.certification_score ?? raw.certification_score,
-      leadership_score: candidate?.leadership_score ?? raw.leadership_score,
-      ...raw,
-    };
-
-    // Normalize to 0-100 scale
-    return Object.fromEntries(
-      Object.entries(merged).map(([key, value]) => [
-        key,
-        value > 1 ? value : (value ?? 0) * 100
-      ])
-    );
-  }, [candidate, aiData]);
-
-  const matched = useMemo(
-    () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
-    [candidate, aiData]
-  );
-
-  const missing = useMemo(
-    () => safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords),
-    [candidate, aiData]
-  );
-
-  const coveredClusters = useMemo(() => {
-    const explicit = safeParseArray(candidate?.covered_clusters ?? aiData?.covered_clusters);
-    if (explicit.length > 0) return explicit;
-    const skills = safeParseArray(candidate?.skills ?? aiData?.skills);
-    return Object.keys(CLUSTER_ICONS).filter((cluster) =>
-      skills.some((s) => String(s).toLowerCase().includes(cluster))
-    );
-  }, [candidate, aiData]);
-
-  const aiDataWithoutSummary = useMemo(() => {
-    if (!candidate?.ai_extracted_data) return null;
-    const { summary, ...rest } = candidate.ai_extracted_data;
-    return Object.keys(rest).length > 0 ? rest : null;
-  }, [candidate]);
-
+  // ── Derived non-hook values (safe after early returns) ────────────────────
   const score = candidate?.score ?? aiData?.score ?? null;
-  const confidence = normalizeConfidence(
-    candidate?.score_confidence ?? aiData?.score_confidence
-  );
+  const confidence = normalizeConfidence(candidate?.score_confidence ?? aiData?.score_confidence);
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
-
   const hasData = Object.keys(dims).length > 3;
   const isPending = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
   const isFailed = processingStatus === "failed";
   const isPartial = !hasData && score !== null && !isPending && !isProcessing && !isFailed;
+  const experienceLabel = candidate?.experience_years != null
+    ? `${candidate.experience_years} an${candidate.experience_years > 1 ? "s" : ""}`
+    : null;
 
-  const experienceLabel =
-    candidate?.experience_years != null
-      ? `${candidate.experience_years} an${candidate.experience_years > 1 ? "s" : ""}`
-      : null;
 
   // ── Actions ─────────────────────────────────────────────────────────────────
 
