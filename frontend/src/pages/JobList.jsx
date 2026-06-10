@@ -6,9 +6,6 @@ import { useNavigate } from "react-router-dom";
 import { useJobs, useCreateJob, useUpdateJob, useDeleteJob } from "../hooks/useJobs";
 import { useCandidates } from "../hooks/useCandidates";
 
-// ─── Industry taxonomy (30 sectors) ──────────────────────────────────────────
-// Single source of truth — Dashboard.jsx imports from here.
-
 export const JOB_DOMAINS = [
   { value: "achats_supply_chain",        label: "Achats & Supply Chain"                        },
   { value: "administration_secretariat", label: "Administration & Secrétariat"                 },
@@ -56,6 +53,37 @@ const EMPTY_SCREENING = {
   required_certifications: [],
   custom_questions: [],
 };
+
+// ─── Confirm Modal ────────────────────────────────────────────────────────────
+
+function ConfirmModal({ title, message, onConfirm, onCancel }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div
+        className="absolute inset-0 bg-black/30 backdrop-blur-sm"
+        onClick={onCancel}
+      />
+      <div className="relative bg-white rounded-xl border border-gray-200 shadow-xl p-6 w-full max-w-sm mx-4">
+        <h3 className="text-sm font-semibold text-gray-900">{title}</h3>
+        <p className="text-xs text-gray-500 mt-1.5 leading-relaxed">{message}</p>
+        <div className="flex items-center justify-end gap-2 mt-5">
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 rounded-lg border border-gray-200 bg-white text-xs font-medium text-gray-600 hover:bg-gray-50 transition-colors"
+          >
+            Annuler
+          </button>
+          <button
+            onClick={onConfirm}
+            className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-medium transition-colors"
+          >
+            Supprimer
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ─── Screening Builder ────────────────────────────────────────────────────────
 
@@ -119,7 +147,6 @@ function ScreeningBuilder({ value, onChange }) {
       {open && (
         <div className="p-4 space-y-5 bg-white border-t border-gray-100">
 
-          {/* Degree */}
           <div>
             <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
               Niveau de diplôme minimum
@@ -135,7 +162,6 @@ function ScreeningBuilder({ value, onChange }) {
             </select>
           </div>
 
-          {/* Experience */}
           <div>
             <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
               Années d'expérience minimum
@@ -153,10 +179,9 @@ function ScreeningBuilder({ value, onChange }) {
             </div>
           </div>
 
-          {/* Certifications */}
           <div>
             <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
-              Certifications requises
+              Diplôme ou Certifications requises
             </label>
             <div className="flex gap-2 mb-2">
               <input
@@ -164,7 +189,7 @@ function ScreeningBuilder({ value, onChange }) {
                 value={certInput}
                 onChange={(e) => setCertInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addCert())}
-                placeholder="ex. AWS Certified, PMP…"
+                placeholder="ex. PMP, TOEIC 900, Bac+5 Informatique…"
                 className="flex-1 h-9 px-3 rounded-lg border border-gray-200 bg-white text-xs outline-none focus:border-gray-400 placeholder:text-gray-300"
               />
               <button
@@ -196,7 +221,6 @@ function ScreeningBuilder({ value, onChange }) {
             )}
           </div>
 
-          {/* Custom questions */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
@@ -286,7 +310,6 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
         <p className="text-xs text-gray-400 mt-0.5">Renseignez les détails du poste</p>
       </div>
 
-      {/* Title */}
       <div>
         <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
           Titre du poste
@@ -296,12 +319,11 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-          placeholder="ex. Développeur Frontend React…"
+          placeholder="ex. Responsable d'Achats & Supply Chain"
           className="w-full h-9 px-3 rounded-lg border border-gray-200 bg-white text-sm outline-none focus:border-gray-400 focus:ring-2 focus:ring-gray-100 placeholder:text-gray-300 transition-colors"
         />
       </div>
 
-      {/* Domain */}
       <div>
         <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
           Secteur d'activité
@@ -322,7 +344,6 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
         </p>
       </div>
 
-      {/* Description */}
       <div>
         <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
           Description
@@ -336,7 +357,6 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
         />
       </div>
 
-      {/* Requirements */}
       <div>
         <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
           Exigences
@@ -345,7 +365,7 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
           rows={3}
           value={requirements}
           onChange={(e) => setRequirements(e.target.value)}
-          placeholder="React, Node.js, PostgreSQL…"
+          placeholder="Listez les exigences du poste…"
           className="w-full px-3 py-2.5 rounded-lg border border-gray-200 bg-white text-sm resize-none outline-none focus:border-gray-400 focus:ring-2 focus:ring-gray-100 placeholder:text-gray-300 transition-colors"
         />
         <p className="text-xs text-gray-400 mt-1">Utilisé pour le scoring IA des candidats.</p>
@@ -373,7 +393,7 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
   );
 }
 
-// ─── Screening summary ────────────────────────────────────────────────────────
+// ─── Screening Summary ────────────────────────────────────────────────────────
 
 function ScreeningSummary({ sq }) {
   if (!sq) return null;
@@ -381,10 +401,10 @@ function ScreeningSummary({ sq }) {
 
   if (sq.min_degree && sq.min_degree !== "none") {
     const d = DEGREE_OPTIONS.find((o) => o.value === sq.min_degree);
-    chips.push({ key: "deg",  label: d?.label });
+    chips.push({ key: "deg", label: d?.label });
   }
   if (sq.min_experience_years > 0) {
-    chips.push({ key: "exp",  label: `${sq.min_experience_years} an${sq.min_experience_years > 1 ? "s" : ""} exp.` });
+    chips.push({ key: "exp", label: `${sq.min_experience_years} an${sq.min_experience_years > 1 ? "s" : ""} exp.` });
   }
   (sq.required_certifications ?? []).forEach((c, i) => {
     chips.push({ key: `cert-${i}`, label: c });
@@ -410,15 +430,17 @@ function ScreeningSummary({ sq }) {
 export default function JobList() {
   const navigate = useNavigate();
 
-  const { data: jobs = [], isLoading, status, error }          = useJobs();
+  const { data: jobs = [], isLoading, status, error } = useJobs();
   console.log("useJobs →", { status, jobsCount: jobs.length, error });
+
   const { mutate: createJob, isPending: isCreating } = useCreateJob({ onSuccess: () => setShowCreate(false) });
   const { mutate: updateJob, isPending: isUpdating } = useUpdateJob({ onSuccess: () => setEditingId(null) });
-  const { mutate: deleteJob }                   = useDeleteJob();
-  const { data: candidates = [] }               = useCandidates();
+  const { mutate: deleteJob }                        = useDeleteJob();
+  const { data: candidates = [] }                    = useCandidates();
 
-  const [showCreate, setShowCreate] = useState(false);
-  const [editingId, setEditingId]   = useState(null);
+  const [showCreate,    setShowCreate]    = useState(false);
+  const [editingId,     setEditingId]     = useState(null);
+  const [deleteTarget,  setDeleteTarget]  = useState(null); // { id, title }
 
   function candidateCount(jobId) {
     return candidates.filter((c) => c.job_id === jobId).length;
@@ -431,7 +453,9 @@ export default function JobList() {
       <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-6">
         <div>
           <h1 className="text-xl font-semibold text-gray-900">Postes</h1>
-          <p className="text-sm text-gray-400 mt-0.5">{jobs.length} poste{jobs.length !== 1 ? "s" : ""} actif{jobs.length !== 1 ? "s" : ""}</p>
+          <p className="text-sm text-gray-400 mt-0.5">
+            {jobs.length} poste{jobs.length !== 1 ? "s" : ""} actif{jobs.length !== 1 ? "s" : ""}
+          </p>
         </div>
         <button
           onClick={() => { setEditingId(null); setShowCreate(true); }}
@@ -527,7 +551,7 @@ export default function JobList() {
                       <Pencil size={13} />
                     </button>
                     <button
-                      onClick={() => { if (confirm("Supprimer ce poste ?")) deleteJob(job.id); }}
+                      onClick={() => setDeleteTarget({ id: job.id, title: job.title })}
                       className="p-1.5 rounded text-gray-300 hover:text-red-500 hover:bg-red-50 transition-colors"
                     >
                       <Trash2 size={13} />
@@ -550,7 +574,6 @@ export default function JobList() {
                   </div>
                 )}
 
-                {/* Screening chips */}
                 <ScreeningSummary sq={job.screening_questions} />
 
                 {/* Footer */}
@@ -569,6 +592,19 @@ export default function JobList() {
             )
           )}
         </div>
+      )}
+
+      {/* Delete confirm modal */}
+      {deleteTarget && (
+        <ConfirmModal
+          title="Supprimer ce poste ?"
+          message={`Le poste "${deleteTarget.title}" sera supprimé définitivement. Cette action est irréversible.`}
+          onConfirm={() => {
+            deleteJob(deleteTarget.id);
+            setDeleteTarget(null);
+          }}
+          onCancel={() => setDeleteTarget(null)}
+        />
       )}
     </div>
   );
