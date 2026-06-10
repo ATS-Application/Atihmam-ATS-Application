@@ -411,8 +411,8 @@ export default function JobList() {
   const navigate = useNavigate();
 
   const { data: jobs = [], isLoading }          = useJobs();
-  const { mutate: createJob, isPending: isCreating } = useCreateJob();
-  const { mutate: updateJob, isPending: isUpdating } = useUpdateJob();
+  const { mutate: createJob, isPending: isCreating } = useCreateJob({ onSuccess: () => setShowCreate(false) });
+  const { mutate: updateJob, isPending: isUpdating } = useUpdateJob({ onSuccess: () => setEditingId(null) });
   const { mutate: deleteJob }                   = useDeleteJob();
   const { data: candidates = [] }               = useCandidates();
 
@@ -447,7 +447,7 @@ export default function JobList() {
           <JobForm
             isPending={isCreating}
             onCancel={() => setShowCreate(false)}
-            onSubmit={(data) => createJob(data, { onSuccess: () => setShowCreate(false) })}
+            onSubmit={(data) => createJob(data)}
           />
         </div>
       )}
@@ -481,7 +481,7 @@ export default function JobList() {
                 initial={job}
                 isPending={isUpdating}
                 onCancel={() => setEditingId(null)}
-                onSubmit={(data) => updateJob({ id: job.id, ...data }, { onSuccess: () => setEditingId(null) })}
+                onSubmit={(data) => updateJob({ id: job.id, ...data })}
               />
             ) : (
               <div

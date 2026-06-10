@@ -13,25 +13,28 @@ export function useJobs() {
   });
 }
 
-export function useCreateJob() {
+
+export function useCreateJob({ onSuccess } = {}) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (data) => createJob(data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["jobs"] });
       toast.success("Poste créé");
+      onSuccess?.();                          // call page-level callback here
     },
     onError: () => toast.error("Erreur lors de la création"),
   });
 }
 
-export function useUpdateJob() {
+export function useUpdateJob({ onSuccess } = {}) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, ...data }) => updateJob(id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["jobs"] });
       toast.success("Poste mis à jour");
+      onSuccess?.();
     },
   });
 }
