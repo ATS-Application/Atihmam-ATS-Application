@@ -360,7 +360,7 @@ async def delete_candidate(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.delete("/", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_all_candidates(user: dict = Depends(get_current_user)):
     supabase = get_supabase()
     supabase.table("candidates").delete().neq(
