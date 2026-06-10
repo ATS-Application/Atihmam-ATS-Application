@@ -33,16 +33,13 @@ export function useCandidates(filters = {}) {
 }
 
 export function useCandidate(id) {
-  const isHydrated = useAuthStore((state) => state._hydrated);
   return useQuery({
     queryKey: ["candidate", id],
-
     queryFn: async () => {
       const res = await getCandidate(id);
       return res.data;
     },
-
-    enabled: !!id && isHydrated,
+    enabled: !!id,         // ← remove isHydrated guard
     staleTime: 1000 * 30,
     refetchOnWindowFocus: false,
     retry: 1,
@@ -50,20 +47,13 @@ export function useCandidate(id) {
 }
 
 export function useCandidateWithPolling(id, { pollUntilScored = false } = {}) {
-  const isHydrated = useAuthStore((state) => state._hydrated);
   return useQuery({
     queryKey: ["candidate", id],
-
     queryFn: async () => {
       const res = await getCandidate(id);
       return res.data;
     },
-
-    enabled: !!id && isHydrated,
-
-    // ✅ Keep showing loading state until hydration is done
-    placeholderData: undefined,
-
+    enabled: !!id,         // ← remove isHydrated guard
     refetchInterval: (query) => {
       if (!pollUntilScored) return false;
       const candidate = query.state.data;
@@ -71,7 +61,6 @@ export function useCandidateWithPolling(id, { pollUntilScored = false } = {}) {
       if (PENDING_STATUSES.has(candidate.processing_status)) return 3000;
       return false;
     },
-
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     retry: 1,

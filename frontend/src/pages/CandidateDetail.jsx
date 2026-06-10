@@ -370,10 +370,10 @@ export default function CandidateDetail() {
     pollUntilScored: true,
   });
 
-  const isHydrated = useAuthStore((state) => state._hydrated);
+  // const isHydrated = useAuthStore((state) => state._hydrated);
 
   // ✅ Show loading if: auth not ready, or query is running
-  if (!isHydrated || isLoading || (fetchStatus === "idle" && !candidate)) {
+  if (isLoading || (fetchStatus === "idle" && !candidate)) {
     return (
       <div className="flex h-full items-center justify-center p-10">
         <p className="animate-pulse text-sm text-gray-400">Chargement du candidat...</p>
