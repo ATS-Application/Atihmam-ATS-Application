@@ -1,74 +1,52 @@
-// src/store/authStore.js
-import { create } from "zustand";
-import { persist } from "zustand/middleware";
-import { jwtDecode } from "jwt-decode";
+﻿// src/hooks/useJobs.js
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import toast from "react-hot-toast";
+import { useAuthStore } from "../store/authStore";
+import { getJobs, createJob, updateJob, deleteJob } from "../api/jobsApi";
 
-const decodeUser = (token) => {
-  try {
-    const { sub, email, full_name, role } = jwtDecode(token);
-    return { id: sub, email, full_name, role };
-  } catch {
-    return null;
-  }
-};
+export function useJobs() {
+  const isHydrated = useAuthStore((state) => state._hydrated);
+  const token = useAuthStore((state) => state.token);
+  console.log("useJobs enabled check →", { isHydrated, hasToken: !!token });
+  return useQuery({
+    queryKey: ["jobs"],
+    queryFn: getJobs,
+    enabled: isHydrated && !!token,
+  });
+}
 
-export const useAuthStore = create(
-  persist(
-    (set, get) => ({
-      token: null,
-      user: null,
-      _hydrated: false,
+export function useCreateJob({ onSuccess } = {}) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data) => createJob(data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success("Poste créé");
+      onSuccess?.();
+    },
+    onError: () => toast.error("Erreur lors de la création"),
+  });
+}
 
-      login: ({ access_token }) => {
-        const user = decodeUser(access_token);
-        set({ token: access_token, user });
-      },
+export function useUpdateJob({ onSuccess } = {}) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }) => updateJob(id, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success("Poste mis à jour");
+      onSuccess?.();
+    },
+  });
+}
 
-      fetchUser: async () => {
-        const { token, logout } = get();
-        if (!token) return;
-        try {
-          const { default: axiosClient } = await import("../api/axiosClient");
-          const res = await axiosClient.get("/auth/me");
-          set({ user: res.data });
-        } catch {
-          logout();
-        }
-      },
-
-      setAuth: (token, user) => set({ token, user }),
-
-      logout: () => set({ token: null, user: null, _hydrated: false }),
-    }),
-    {
-      name: "ats-auth",
-      partialize: (state) => ({ token: state.token }),
-
-      onRehydrateStorage: () => (state, error) => {
-        // Cas d'erreur ou storage vide : on hydrate quand même
-        if (error || !state?.token) {
-          useAuthStore.setState({ _hydrated: true });
-          return;
-        }
-
-        const user = decodeUser(state.token);
-        if (user) {
-          useAuthStore.setState({ user, _hydrated: true });
-          setTimeout(() => useAuthStore.getState().fetchUser(), 0);
-        } else {
-          useAuthStore.setState({ token: null, user: null, _hydrated: true });
-        }
-      },
-    }
-  )
-);
-
-// ✅ Garantie de fallback : si onRehydrateStorage ne tire pas
-//    (ex: environnement SSR, storage inaccessible), on force _hydrated après 500ms
-setTimeout(() => {
-  if (!useAuthStore.getState()._hydrated) {
-    const token = useAuthStore.getState().token;
-    const user = token ? decodeUser(token) : null;
-    useAuthStore.setState({ user: user ?? null, _hydrated: true });
-  }
-}, 500);
+export function useDeleteJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id) => deleteJob(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success("Poste supprimé");
+    },
+  });
+}

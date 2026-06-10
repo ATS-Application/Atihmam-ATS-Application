@@ -1,7 +1,8 @@
-// src/store/authStore.js
+﻿// src/store/authStore.js
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { jwtDecode } from "jwt-decode";
+import axiosClient from "../api/axiosClient"; // ← import statique direct
 
 const decodeUser = (token) => {
   try {
@@ -43,15 +44,14 @@ export const useAuthStore = create(
     {
       name: "ats-auth",
       partialize: (state) => ({ token: state.token }),
-      onRehydrateStorage: () => (state) => {
-        if (!state?.token) {
+
+      onRehydrateStorage: () => (state, error) => {
+        if (error || !state?.token) {
           useAuthStore.setState({ _hydrated: true });
           return;
         }
-
         const user = decodeUser(state.token);
         if (user) {
-          // ✅ useAuthStore.setState — not state.x = y
           useAuthStore.setState({ user, _hydrated: true });
           setTimeout(() => useAuthStore.getState().fetchUser(), 0);
         } else {
@@ -61,3 +61,11 @@ export const useAuthStore = create(
     }
   )
 );
+
+setTimeout(() => {
+  if (!useAuthStore.getState()._hydrated) {
+    const token = useAuthStore.getState().token;
+    const user = token ? decodeUser(token) : null;
+    useAuthStore.setState({ user: user ?? null, _hydrated: true });
+  }
+}, 500);
