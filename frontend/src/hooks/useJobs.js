@@ -1,6 +1,7 @@
 // frontend/src/hooks/useJobs.js
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
+import { useAuthStore } from "../store/authStore";
 import { getJobs, createJob, updateJob, deleteJob } from "../api/jobsApi";
 
 export function useJobs() {
