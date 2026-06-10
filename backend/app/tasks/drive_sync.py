@@ -1,19 +1,22 @@
 """
-Drive Sync Pipeline — v2.1
+Drive Sync Pipeline — v2.2
 
 Pipeline:
 1. Scan Google Drive folder
 2. Detect new PDFs
 3. Download file
 4. Upload to Supabase storage
-5. Extract text
+5. Extract text (isolated subprocess)
 6. AI parsing
 7. Score candidate  (job match → best active job → synthetic quality fallback)
 8. Insert into DB
 
-Changelog v2.1:
+Changelog v2.2:
+- Fixed: dangling logger.info / raw_text references leaked into resolve_candidate_score
+- Fixed: safe_extract_text was defined after its only call-site; moved to top of module
+- Fixed: process_drive_file now uses safe_extract_text instead of the bare extract_text_from_bytes
 - Supabase client created once per sync, passed into process_drive_file
-- dimension_scores damping in _quality_fallback no longer mutates in-place
+- dimension_scores damping in _quality_fallback does not mutate in-place
 - insert_candidate duplicate check uses Postgres error code 23505 as primary signal
 - Removed unused DOMAIN_SKILLS import
 """
@@ -23,23 +26,20 @@ from __future__ import annotations
 import logging
 import os
 import re
+import subprocess
+import sys
 import textwrap
 
 from app.config import get_settings
 from app.db.supabase_client import get_supabase_admin
 from app.services.ai_service import extract_cv_info
-from app.services.cv_parser import extract_text_from_bytes
 from app.services.drive_service import (
     download_file_bytes,
     get_file_metadata,
     list_new_pdf_files_since,
     list_pdf_files,
 )
-from app.services.scoring_service import (
-    compute_candidate_score,
-    classify_domain,
-    Domain,
-)
+from app.services.scoring_service import classify_domain, compute_candidate_score
 from app.tasks.cv_processing import (
     build_candidate_payload,
     compute_best_job_match,
@@ -54,6 +54,37 @@ _KW_DAMPEN  = 0.85
 _KW_CAP     = 85.0
 _SEM_DAMPEN = 0.80
 _SEM_CAP    = 75.0
+
+
+# --------------------------------------------------------------------------- #
+# TEXT EXTRACTION  (defined first — used by process_drive_file below)
+# --------------------------------------------------------------------------- #
+
+def safe_extract_text(pdf_bytes: bytes, file_name: str) -> str:
+    """
+    Extract PDF text in an isolated subprocess so a native C crash
+    (SIGABRT/SIGSEGV from a malformed PDF) cannot kill the Celery worker.
+    """
+    script = (
+        "import sys; "
+        "from app.services.cv_parser import extract_text_from_bytes; "
+        "sys.stdout.write(extract_text_from_bytes(sys.stdin.buffer.read()))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            input=pdf_bytes,
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace")
+            raise RuntimeError(
+                f"PDF extraction failed (rc={result.returncode}): {stderr}"
+            )
+        return result.stdout.decode(errors="replace")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"PDF extraction timed out: {file_name}")
 
 
 # --------------------------------------------------------------------------- #
@@ -101,7 +132,7 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
         }
     except Exception as exc:
         exc_str = str(exc)
-        # Postgres unique-violation error code is authoritative; constraint name
+        # Postgres unique-violation (23505) is authoritative; constraint name
         # is a fallback for environments that surface it differently.
         if "23505" in exc_str or "uq_candidates_drive_file_id" in exc_str:
             return {
@@ -128,9 +159,9 @@ def _quality_fallback(extracted: dict) -> dict:
     )
     domain_str = classify_domain(position)
 
-    skills      = extracted.get("skills", [])[:25]
+    skills       = extracted.get("skills", [])[:25]
     work_history = extracted.get("work_history", [])
-    projects    = extracted.get("projects", [])
+    projects     = extracted.get("projects", [])
 
     exp_titles = [e.get("title", "") for e in work_history if e.get("title")]
     proj_names = [p.get("name",  "") for p in projects     if p.get("name")]
@@ -161,9 +192,11 @@ def _quality_fallback(extracted: dict) -> dict:
         "keyword_score":  min(original_dims.get("keyword_score",  0) * _KW_DAMPEN,  _KW_CAP),
         "semantic_score": min(original_dims.get("semantic_score", 0) * _SEM_DAMPEN, _SEM_CAP),
     }
-    result = {**result, "dimension_scores": dampened_dims}
-    result["reasoning"] = f"Score qualité autonome — {domain_str}"
-    return result
+    return {
+        **result,
+        "dimension_scores": dampened_dims,
+        "reasoning": f"Score qualité autonome — {domain_str}",
+    }
 
 
 def resolve_candidate_score(
@@ -194,7 +227,7 @@ def resolve_candidate_score(
         if best_result:
             return best_result, best_id
 
-    logger.info("No active job → using quality fallback")
+    # Tier 3: no job available — synthetic quality score
     return _quality_fallback(extracted), None
 
 
@@ -204,7 +237,7 @@ def resolve_candidate_score(
 
 def process_drive_file(
     drive_file_id: str,
-    supabase,                       # ← injected by caller; no new client per file
+    supabase,                       # injected by caller; no new client per file
     job_id: str | None = None,
 ) -> dict:
     try:
@@ -221,17 +254,24 @@ def process_drive_file(
         # 3. Upload to Supabase storage
         cv_url = upload_cv_to_storage(supabase, drive_file_id, file_name, pdf_bytes)
 
-        # 4. Extract raw text
-        raw_text = extract_text_from_bytes(pdf_bytes)
+        # 4. Extract raw text (isolated subprocess to guard against C-level crashes)
+        logger.info("Extracting text: %s (%d bytes)", file_name, len(pdf_bytes))
+        raw_text = safe_extract_text(pdf_bytes, file_name)
         if not raw_text.strip():
             logger.warning("Empty text extracted from file: %s", drive_file_id)
-            return {"status": "failed", "reason": "empty_text", "drive_file_id": drive_file_id}
+            return {
+                "status":        "failed",
+                "reason":        "empty_text",
+                "drive_file_id": drive_file_id,
+            }
 
         # 5. AI extraction
         extracted = extract_cv_info(raw_text)
 
         # 6. Scoring
-        score_result, resolved_job_id = resolve_candidate_score(supabase, extracted, job_id)
+        score_result, resolved_job_id = resolve_candidate_score(
+            supabase, extracted, job_id
+        )
         logger.info(
             "Scored file %s → %.1f (job_id=%s)",
             drive_file_id,
@@ -280,12 +320,11 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
         if row.get("drive_file_id")
     }
 
-    results = []
-    for file_data in files:
-        file_id = file_data["id"]
-        if file_id in processed_ids:
-            continue
-        results.append(process_drive_file(file_id, supabase, job_id))
+    results = [
+        process_drive_file(file_data["id"], supabase, job_id)
+        for file_data in files
+        if file_data["id"] not in processed_ids
+    ]
 
     errors = [r for r in results if r.get("status") == "error"]
     logger.info(
