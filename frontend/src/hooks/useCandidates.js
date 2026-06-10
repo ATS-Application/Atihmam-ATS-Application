@@ -50,6 +50,7 @@ export function useCandidate(id) {
 }
 
 export function useCandidateWithPolling(id, { pollUntilScored = false } = {}) {
+  const isHydrated = useAuthStore((state) => state._hydrated);
   return useQuery({
     queryKey: ["candidate", id],
 
