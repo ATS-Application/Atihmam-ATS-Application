@@ -114,7 +114,8 @@ def upload_cv_to_storage(
     file_name: str,
     pdf_bytes: bytes,
 ) -> str:
-    storage_path = f"cvs/drive/{drive_file_id}/{file_name}"
+    # Path inside the bucket — no bucket name prefix
+    storage_path = f"drive/{drive_file_id}/{file_name}"
     supabase.storage.from_("cvs").upload(
         storage_path,
         pdf_bytes,
