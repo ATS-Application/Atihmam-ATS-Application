@@ -11,7 +11,7 @@ export function useJobs() {
   return useQuery({
     queryKey: ["jobs"],
     queryFn: getJobs,
-    enabled: isHydrated === true && !! typeof token === "string" && token.length > 0, //  ensure store is hydrated and token exists
+    enabled: isHydrated && !!token,
   });
 }
 
