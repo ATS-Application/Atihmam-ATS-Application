@@ -27,6 +27,7 @@ import {
 
 import toast from "react-hot-toast";
 import axiosClient from "../api/axiosClient";
+import { useAuthStore } from "../store/authStore";
 import { useOpenCV } from "../hooks/useOpenCV";
 import { useCandidateWithPolling } from "../hooks/useCandidates";
 import { useJobs } from "../hooks/useJobs";
