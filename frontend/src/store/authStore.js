@@ -3,8 +3,6 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { jwtDecode } from "jwt-decode";
 
-
-
 const decodeUser = (token) => {
   try {
     const { sub, email, full_name, role } = jwtDecode(token);
@@ -21,20 +19,15 @@ export const useAuthStore = create(
       user: null,
       _hydrated: false,
 
-      // Called after successful /auth/login response
-      // Decodes JWT immediately — no extra round-trip needed
       login: ({ access_token }) => {
         const user = decodeUser(access_token);
         set({ token: access_token, user });
       },
 
-      // Called on page reload via onRehydrateStorage to verify
-      // the persisted token is still valid server-side
       fetchUser: async () => {
         const { token, logout } = get();
         if (!token) return;
         try {
-          // Lazy import avoids circular dependency (axiosClient → authStore → axiosClient)
           const { default: axiosClient } = await import("../api/axiosClient");
           const res = await axiosClient.get("/auth/me");
           set({ user: res.data });
@@ -43,33 +36,27 @@ export const useAuthStore = create(
         }
       },
 
-      // Kept for backward compatibility with any existing callsites
       setAuth: (token, user) => set({ token, user }),
 
-      logout: () => set({ token: null, user: null }),
+      logout: () => set({ token: null, user: null, _hydrated: false }),
     }),
     {
       name: "ats-auth",
-      // Only persist the token — user is derived from it
       partialize: (state) => ({ token: state.token }),
       onRehydrateStorage: () => (state) => {
         if (!state?.token) {
-          useAuthStore.setState({ _hydrated: true }); // Still mark as hydrated to avoid infinite loading states
+          useAuthStore.setState({ _hydrated: true });
           return;
         }
 
-        // Optimistic decode: populate user synchronously from the persisted
-        // token so there's no flash of unauthenticated UI on reload
         const user = decodeUser(state.token);
         if (user) {
-          state.user = user;
-          // Then verify server-side asynchronously; logout() if token is expired
-          setTimeout(() => state.fetchUser(), 0);
+          // ✅ useAuthStore.setState — not state.x = y
+          useAuthStore.setState({ user, _hydrated: true });
+          setTimeout(() => useAuthStore.getState().fetchUser(), 0);
         } else {
-          // Token is malformed — clear it immediately
-          state.token = null;
+          useAuthStore.setState({ token: null, user: null, _hydrated: true });
         }
-        useAuthStore.setState({ _hydrated: true });// Mark as hydrated even if there's no token to avoid infinite loading states
       },
     }
   )
