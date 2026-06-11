@@ -406,6 +406,7 @@ PENALTY_SYSTEM: List[DeficiencyPenalty] = [
     DeficiencyPenalty("certifications", 0.05, 0.15, "linear",      "Certifications obligatoires absentes"),
     DeficiencyPenalty("leadership",     0.10, 0.20, "linear",      "Leadership requis mais non démontré"),
     DeficiencyPenalty("language",       0.10, 0.10, "linear",      "Qualité linguistique insuffisante"),
+    DeficiencyPenalty("complexity",     0.20, 0.30, "exponential", "Maîtrise insuffisante des compétences du domaine")
 ]
 
 
@@ -555,13 +556,11 @@ def compute_experience_score(
 
     if required_years <= 0:
         ratio = min(cv_years / 5.0, 1.0) if cv_years > 0 else 0.0
-    elif cv_years >= required_years * 2:
-        ratio = 1.0
     elif cv_years >= required_years:
-        surplus = (cv_years - required_years) / required_years
-        ratio = 0.7 + 0.3 * min(surplus, 1.0)
+        ratio = 1.0          # Requis atteint = score plein, sans bonus pour l'excédent
     else:
         ratio = cv_years / required_years
+        
 
     if cv_years < profile.min_years_experience:
         ratio *= 0.5
