@@ -7,6 +7,26 @@ export default defineConfig({
     react(),
     tailwindcss()
   ],
+  resolve: {
+    alias: {
+      'supports-color': './src/stubs/supports-color.js',
+    }
+  },
+  build: {
+    rollupOptions: {
+      external: (id) =>
+        id.startsWith('node:') ||
+        id === 'fsevents' ||
+        id === 'fdir' ||
+        id === 'tinyglobby' ||
+        id === 'esbuild' ||
+        id === 'vite' ||
+        id === 'rollup',
+    },
+  },
+  optimizeDeps: {
+    exclude: ['rollup', 'fdir', 'tinyglobby', 'esbuild'],
+  },
   server: {
     allowedHosts: [
       'localhost',

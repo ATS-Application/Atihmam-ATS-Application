@@ -29,7 +29,7 @@ export const useAuthStore = create(
         const { token, logout } = get();
         if (!token) return;
         try {
-          const { default: axiosClient } = await import("../api/axiosClient");
+          // import axiosClient from "../api/axiosClient";
           const res = await axiosClient.get("/auth/me");
           set({ user: res.data });
         } catch {

@@ -18,7 +18,7 @@ import { useJobs } from "../hooks/useJobs";
 import StatusBadge from "../components/StatusBadge";
 import ScoreBadge from "../components/ScoreBadge";
 import UploadCVModal from "../components/UploadCVModal";
-import { searchForWorkspaceRoot } from "vite";
+// import { searchForWorkspaceRoot } from "vite";
 
 const STATUS_OPTIONS = [
   { value: "",           label: "Tous les statuts" },
