@@ -334,6 +334,11 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
     Retourne (meilleur_score_result, meilleur_job_id).
     """
     logger.info("compute_best_job_match: %d jobs to evaluate", len(jobs))
+
+    # Classify the candidate's domain once
+    candidate_position = cv_data.get("current_position", "")
+    candidate_domain   = classify_domain(candidate_position)
+
     best_score  = -1
     best_result = None
     best_job_id = None
@@ -346,13 +351,43 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
                 job_requirements=job.get("requirements", ""),
             )
             s = result.get("score", 0)
+
+            # Penalize cross-domain mismatches
+            job_domain = classify_domain(job.get("title", ""))
+            if job_domain != candidate_domain:
+                s *= 0.70   # 30% penalty for domain mismatch
+                logger.info(
+                    "  Domain mismatch: candidate=%s job=%s → penalized score=%.1f",
+                    candidate_domain, job_domain, s
+                )
+            else:
+                logger.info(
+                    "  Job '%s' [%s] → score=%.1f",
+                    job.get("title"), job_domain, s
+                )
+
             if s > best_score:
                 best_score  = s
                 best_result = result
                 best_job_id = job.get("id")
-        except Exception as exc:
-            logger.error("Erreur de scoring pour le poste %s : %s", job.get("id"), exc)
 
+        except Exception as exc:
+            logger.error("Erreur scoring poste %s : %s", job.get("id"), exc)
+
+    # If best match is still a domain mismatch after penalty, don't assign a job —
+    # use quality fallback instead so the candidate isn't wrongly categorized
+    if best_job_id:
+        best_job_domain = classify_domain(
+            next((j.get("title","") for j in jobs if j.get("id") == best_job_id), "")
+        )
+        if best_job_domain != candidate_domain and best_score < 50:
+            logger.info(
+                "Best match is cross-domain and low score (%.1f) → falling back to quality score",
+                best_score
+            )
+            return None, None   # caller will trigger _quality_fallback
+
+    logger.info("Best match: job_id=%s score=%.1f", best_job_id, best_score)
     return best_result, best_job_id
 
 
@@ -379,6 +414,7 @@ def build_candidate_payload(
             or cv_info.get("title")
             or cv_info.get("job_title")
             or cv_info.get("headline")
+            or ""
         ),
 
         "skills":         ensure_list(cv_info.get("skills")),
