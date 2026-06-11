@@ -34,12 +34,20 @@ class JobUpdate(BaseModel):
     is_active: Optional[bool] = None
     category: Optional[str] = None
     screening_questions: Optional[ScreeningQuestions] = None
+    
 
-
-class JobResponse(JobBase):
+class JobResponse(BaseModel):
     id: UUID
-    created_by: Optional[UUID] = None
+    title: str
+    description: str | None = None
+    requirements: str | None = None
+    is_active: bool
+    created_by: UUID | None = None
     created_at: datetime
+    category: str | None = None
+    domain: str | None = None
+    screening_questions: dict = {}
+    candidate_count: int = 0       
 
     class Config:
         from_attributes = True

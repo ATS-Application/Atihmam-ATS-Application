@@ -35,19 +35,14 @@ router = APIRouter(
 # LIST JOBS
 # =========================================================
 
-@router.get(
-    "",
-    response_model=list[JobResponse],
-)
-async def list_jobs(
-    user: dict = Depends(get_current_user),
-):
+@router.get("", response_model=list[JobResponse])
+async def list_jobs(user: dict = Depends(get_current_user)):
     supabase = get_supabase_admin()
 
     response = (
         supabase
         .table("jobs")
-        .select("*")
+        .select("*, candidates(count)")   # Supabase embeds FK count
         .eq("is_active", True)
         .order("created_at", desc=True)
         .execute()
@@ -55,8 +50,10 @@ async def list_jobs(
 
     jobs = response.data or []
 
-    # Ensure safe screening_questions structure
     for job in jobs:
+        # Supabase returns [{"count": N}] for embedded counts
+        count_embed = job.pop("candidates", [])
+        job["candidate_count"] = count_embed[0]["count"] if count_embed else 0
         job["screening_questions"] = safe_screening_questions(
             job.get("screening_questions")
         )

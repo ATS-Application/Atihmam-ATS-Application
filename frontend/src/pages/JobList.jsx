@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Plus, Pencil, Trash2, X, Check, ChevronDown, ChevronUp } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useJobs, useCreateJob, useUpdateJob, useDeleteJob } from "../hooks/useJobs";
-import { useCandidates } from "../hooks/useCandidates";
+// import { useCandidates } from "../hooks/useCandidates";
 
 export const JOB_DOMAINS = [
   { value: "achats_supply_chain",        label: "Achats & Supply Chain"                        },
@@ -40,6 +40,7 @@ export const JOB_DOMAINS = [
 
 const DEGREE_OPTIONS = [
   { value: "none",        label: "Aucun requis"       },
+  { value: "engineer",     label: "Bac+2/3 Ingénieur" },
   { value: "high_school", label: "Bac / High School"  },
   { value: "associate",   label: "Bac+2 / Associate"  },
   { value: "bachelor",    label: "Bac+3 / Bachelor"   },
@@ -436,15 +437,15 @@ export default function JobList() {
   const { mutate: createJob, isPending: isCreating } = useCreateJob({ onSuccess: () => setShowCreate(false) });
   const { mutate: updateJob, isPending: isUpdating } = useUpdateJob({ onSuccess: () => setEditingId(null) });
   const { mutate: deleteJob }                        = useDeleteJob();
-  const { data: candidates = [] }                    = useCandidates();
+  // const { data: candidates = [] }                    = useCandidates();
 
   const [showCreate,    setShowCreate]    = useState(false);
   const [editingId,     setEditingId]     = useState(null);
   const [deleteTarget,  setDeleteTarget]  = useState(null); // { id, title }
 
-  function candidateCount(jobId) {
-    return candidates.filter((c) => c.job_id === jobId).length;
-  }
+  // function candidateCount(jobId) {
+  //   return candidates.filter((c) => c.job_id === jobId).length;
+  // }
 
   return (
     <div className="p-6 lg:p-8 bg-gray-50 min-h-screen">
@@ -519,7 +520,7 @@ export default function JobList() {
                     <h3 className="text-sm font-semibold text-gray-900 truncate">{job.title}</h3>
                     <div className="flex items-center gap-2 mt-1.5 flex-wrap">
                       <span className="text-xs text-gray-400 tabular-nums">
-                        {candidateCount(job.id)} candidat{candidateCount(job.id) !== 1 ? "s" : ""}
+                        {job.candidate_count ?? 0} candidat{(job.candidate_count ?? 0) !== 1 ? "s" : ""}
                       </span>
                       {job.domain && (
                         <>
