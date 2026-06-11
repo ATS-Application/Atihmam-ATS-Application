@@ -333,6 +333,7 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
     cv_data must already contain raw_text (call _enrich_cv_data first).
     Retourne (meilleur_score_result, meilleur_job_id).
     """
+    logger.info("compute_best_job_match: %d jobs to evaluate", len(jobs))
     best_score  = -1
     best_result = None
     best_job_id = None

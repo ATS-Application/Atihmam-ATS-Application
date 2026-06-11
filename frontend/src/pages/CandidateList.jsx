@@ -277,7 +277,9 @@ export default function CandidateList() {
                     <td className="px-4 py-3">
                       <p className="text-sm text-gray-700">{c.current_position || "—"}</p>
                       {linkedJob && (
-                        <p className="text-xs text-gray-400 mt-0.5">{linkedJob.title}</p>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          → {linkedJob.title}
+                        </p>
                       )}
                     </td>
 
