@@ -152,15 +152,25 @@ def build_cv_data(candidate: dict) -> dict:
 async def list_candidates(
     job_id: UUID | None = Query(None),
     status_filter: str | None = Query(default=None, alias="status"),
+    min_score: float = Query(default=0),
     user: dict = Depends(get_current_user),
 ):
     supabase = get_supabase()
     query = supabase.table("candidates").select("*")
+
     if job_id:
         query = query.eq("job_id", str(job_id))
     if status_filter:
         query = query.eq("status", status_filter)
-    candidates = query.order("created_at", desc=True).execute().data or []
+    if min_score > 0:
+        query = query.gte("score", min_score)
+
+    candidates = (
+        query
+        .order("score", desc=True)   # ← score-first, not created_at
+        .execute()
+        .data or []
+    )
     return [sanitize_candidate(c) for c in candidates]
 
 

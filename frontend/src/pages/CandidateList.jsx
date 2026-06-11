@@ -11,11 +11,14 @@ import {
   useDriveSync,
 } from "../hooks/useCandidates";
 
+import { useSearchParams } from "react-router-dom";
+
 import { useJobs } from "../hooks/useJobs";
 
 import StatusBadge from "../components/StatusBadge";
 import ScoreBadge from "../components/ScoreBadge";
 import UploadCVModal from "../components/UploadCVModal";
+import { searchForWorkspaceRoot } from "vite";
 
 const STATUS_OPTIONS = [
   { value: "",           label: "Tous les statuts" },
@@ -32,13 +35,23 @@ export default function CandidateList() {
 
   const [search,          setSearch]          = useState("");
   const [statusFilter,    setStatusFilter]    = useState("");
-  const [jobFilter,       setJobFilter]       = useState("");
+  const [searchParams]                        = useSearchParams();
+  const [jobFilter,       setJobFilter]       = useState(searchParams.get("job") ?? ""); 
   const [showUpload,      setShowUpload]      = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
   const [candidateToDelete, setCandidateToDelete] = useState(null);
+  const [ minScore, setMinScore ] = useState(0);
 
-  const { data: candidates = [], isLoading }        = useCandidates(statusFilter ? { status: statusFilter } : {});
+  const { data: candidates = [], isLoading } = useCandidates(
+    Object.fromEntries(
+      Object.entries({
+        ...(statusFilter && { status: statusFilter }),
+        ...(jobFilter    && { job_id: jobFilter }),
+        ...(minScore    && { min_score: minScore }),
+      })
+    )
+  );
   const { data: jobs = [] }                         = useJobs();
   const { mutate: deleteCandidate }                 = useDeleteCandidate();
   const { mutate: deleteAllCandidates } = useDeleteAllCandidates();
@@ -89,7 +102,7 @@ export default function CandidateList() {
     setCandidateToDelete(null);
   };
 
-  const hasFilters = search || statusFilter || jobFilter;
+  const hasFilters = search || statusFilter || jobFilter || minScore > 0;
 
   return (
     <div className="p-6 lg:p-8 bg-gray-50 min-h-screen">
@@ -145,6 +158,19 @@ export default function CandidateList() {
           />
         </div>
 
+        <div className="flex items-center gap-2 h-9 px-3 rounded-lg border border-gray-200 bg-white">
+          <span className="text-xs text-gray-400">Score min</span>
+          <input
+            type="range" min={0} max={90} step={10}
+            value={minScore}
+            onChange={(e) => setMinScore(Number(e.target.value))}
+            className="w-24"
+          />
+          <span className="text-xs font-medium text-gray-700 w-8 tabular-nums">
+            {minScore > 0 ? `${minScore}%` : "—"}
+          </span>
+        </div>
+
         <div className="relative">
           <select
             value={statusFilter}
@@ -174,7 +200,7 @@ export default function CandidateList() {
 
         {hasFilters && (
           <button
-            onClick={() => { setSearch(""); setStatusFilter(""); setJobFilter(""); }}
+            onClick={() => { setSearch(""); setStatusFilter(""); setJobFilter(""); setMinScore(0); }}
             className="h-9 px-3 rounded-lg border border-gray-200 bg-white text-xs text-gray-400 hover:text-gray-700 hover:border-gray-300 transition-colors"
           >
             Effacer
@@ -211,7 +237,7 @@ export default function CandidateList() {
                   <p className="text-sm text-gray-400">Aucun candidat trouvé</p>
                   {hasFilters && (
                     <button
-                      onClick={() => { setSearch(""); setStatusFilter(""); setJobFilter(""); }}
+                      onClick={() => { setSearch(""); setStatusFilter(""); setJobFilter(""); setMinScore(0); }}
                       className="mt-2 text-xs text-gray-400 underline underline-offset-2 hover:text-gray-700"
                     >
                       Effacer les filtres
