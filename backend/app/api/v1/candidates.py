@@ -361,27 +361,25 @@ async def delete_candidate(
     supabase = get_supabase()
     cid = str(candidate_id)
 
-    # 1. Clean up status history to satisfy foreign key constraint
-    try:
-        supabase.table("candidate_status_history") \
-            .delete() \
-            .eq("candidate_id", cid) \
-            .execute()
-    except Exception as e:
-        logger.error("Failed to clean up status history for candidate %s: %s", cid, e)
-        # We continue anyway; if the delete fails, the next step will catch it 
-        # or we might want to raise an exception here depending on your needs.
-
-    # 2. Delete the actual candidate record
-    resp = (
-        supabase.table("candidates")
-        .delete()
-        .eq("id", cid)
+    # 1. Delete feedback records (new dependency identified from your schema)
+    supabase.table("candidate_feedback") \
+        .delete() \
+        .eq("candidate_id", cid) \
         .execute()
-    )
+
+    # 2. Delete status history records
+    supabase.table("candidate_status_history") \
+        .delete() \
+        .eq("candidate_id", cid) \
+        .execute()
+
+    # 3. Finally, delete the candidate record
+    resp = supabase.table("candidates") \
+        .delete() \
+        .eq("id", cid) \
+        .execute()
     
     if not resp.data:
-        # Check if the candidate actually existed
         raise HTTPException(status_code=404, detail="Candidate not found")
         
     return Response(status_code=status.HTTP_204_NO_CONTENT)
