@@ -6,6 +6,7 @@ import { useState, useCallback } from "react";
  * No signed URL generation needed — cv_file_url is already a public
  * Supabase Storage URL returned by get_public_url() at ingestion time.
  */
+
 export function useOpenCV() {
   const [isOpeningCV, setIsOpeningCV] = useState(false);
 
@@ -17,18 +18,15 @@ export function useOpenCV() {
 
     setIsOpeningCV(true);
     
-    // 1. Ensure the URL is absolute. 
-    // If the path starts with '/', remove it to avoid double-slash issues.
-    const path = cvFileUrl.startsWith('/') ? cvFileUrl.substring(1) : cvFileUrl;
-    
-    // 2. Use your corrected base URL
+    // Check if it's already an absolute URL (starts with http)
+    // If not, construct the full Supabase public URL
     const finalUrl = cvFileUrl.startsWith('http') 
-      ? cvFileUrl 
-      : `https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/${path}`;
+        ? cvFileUrl 
+        : `https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/${cvFileUrl.replace(/^\/+/, '')}`;
 
     try {
-      // 3. window.open with an absolute URL will now properly open in a new tab
-      // instead of trying to route internally.
+      // By using an absolute URL (https://...), the browser handles this 
+      // as an external resource and ignores React Router entirely.
       window.open(finalUrl, "_blank", "noopener,noreferrer");
     } catch (e) {
       console.error("Failed to open CV:", e);
