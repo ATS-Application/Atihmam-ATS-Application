@@ -518,14 +518,17 @@ export default function ScorePanel({ candidate }) {
       {/* ── CV button ───────────────────────────────────────────────────── */}
       {candidate?.cv_file_url && (
         <Card className="p-4">
-          <button
-            onClick={() => openCV(candidate.cv_file_url)}
-            disabled={isOpeningCV}
-            className="flex w-full items-center justify-center gap-2 rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-700 transition-all hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <ExternalLink size={16} />
-            {isOpeningCV ? "Ouverture…" : "Voir le CV"}
-          </button>
+         {candidate.cv_file_url && (
+            <a
+              href={candidate.cv_file_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-700 transition-all hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700"
+            >
+              <ExternalLink size={16} />
+              Voir le CV
+            </a>
+          )}
         </Card>
       )}
 
