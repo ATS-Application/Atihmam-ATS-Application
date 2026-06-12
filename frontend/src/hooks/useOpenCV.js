@@ -6,7 +6,6 @@ import { useState, useCallback } from "react";
  * No signed URL generation needed — cv_file_url is already a public
  * Supabase Storage URL returned by get_public_url() at ingestion time.
  */
-// src/hooks/useOpenCV.js
 export function useOpenCV() {
   const [isOpeningCV, setIsOpeningCV] = useState(false);
 
@@ -18,11 +17,12 @@ export function useOpenCV() {
 
     setIsOpeningCV(true);
     
-    // Ensure the URL is absolute before opening
     let finalUrl = cvFileUrl;
+    
+    // Check if it's already an absolute URL
     if (!finalUrl.startsWith('http')) {
-       // If it's a relative path, prepend your base URL or handle accordingly
-       finalUrl = `https://nflmcuktfosaketloomh.supabase.co.supabase.co/storage/v1/object/public/${cvFileUrl}`;
+       // Corrected path construction
+       finalUrl = `https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/${cvFileUrl}`;
     }
 
     try {
