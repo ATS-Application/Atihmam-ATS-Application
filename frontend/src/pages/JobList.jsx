@@ -446,12 +446,23 @@ function ScreeningSummary({ sq }) {
 export default function JobList() {
   const navigate = useNavigate();
 
-  const { data: jobs = [], isLoading, status, error } = useJobs();
-  console.log("useJobs →", { status, jobsCount: jobs.length, error });
+  const { data: rawJobs, isLoading, status, error } = useJobs();
+
+    // Normalise chaque job à la réception : protège contre les items undefined/null
+    // et les screening_questions partiels qui causent le TypeError sur .length
+    const jobs = Array.isArray(rawJobs)
+      ? rawJobs.filter(Boolean).map((job) => ({
+          ...job,
+          screening_questions: normalizeScreening(job.screening_questions),
+        }))
+      : [];
+
+    console.log("useJobs →", { status, jobsCount: jobs.length, error });
 
   const { mutate: createJob, isPending: isCreating } = useCreateJob({ onSuccess: () => setShowCreate(false) });
   const { mutate: updateJob, isPending: isUpdating } = useUpdateJob({ onSuccess: () => setEditingId(null) });
   const { mutate: deleteJob }                        = useDeleteJob();
+
 
   const [showCreate,   setShowCreate]   = useState(false);
   const [editingId,    setEditingId]    = useState(null);
