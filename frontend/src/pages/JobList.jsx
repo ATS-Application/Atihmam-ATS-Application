@@ -4,7 +4,6 @@ import { useState } from "react";
 import { Plus, Pencil, Trash2, X, Check, ChevronDown, ChevronUp } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useJobs, useCreateJob, useUpdateJob, useDeleteJob } from "../hooks/useJobs";
-// import { useCandidates } from "../hooks/useCandidates";
 
 export const JOB_DOMAINS = [
   { value: "achats_supply_chain",        label: "Achats & Supply Chain"                        },
@@ -40,7 +39,7 @@ export const JOB_DOMAINS = [
 
 const DEGREE_OPTIONS = [
   { value: "none",        label: "Aucun requis"       },
-  { value: "engineer",     label: "Bac+2/3 Ingénieur" },
+  { value: "engineer",    label: "Bac+2/3 Ingénieur"  },
   { value: "high_school", label: "Bac / High School"  },
   { value: "associate",   label: "Bac+2 / Associate"  },
   { value: "bachelor",    label: "Bac+3 / Bachelor"   },
@@ -54,6 +53,16 @@ const EMPTY_SCREENING = {
   required_certifications: [],
   custom_questions: [],
 };
+
+// Normalise un objet screening_questions potentiellement partiel/null
+function normalizeScreening(sq) {
+  return {
+    min_degree:               sq?.min_degree               ?? "none",
+    min_experience_years:     sq?.min_experience_years     ?? 0,
+    required_certifications:  Array.isArray(sq?.required_certifications)  ? sq.required_certifications  : [],
+    custom_questions:         Array.isArray(sq?.custom_questions)         ? sq.custom_questions         : [],
+  };
+}
 
 // ─── Confirm Modal ────────────────────────────────────────────────────────────
 
@@ -92,37 +101,40 @@ function ScreeningBuilder({ value, onChange }) {
   const [certInput, setCertInput] = useState("");
   const [open, setOpen]           = useState(false);
 
-  function update(patch) { onChange({ ...value, ...patch }); }
+  // Normalisation défensive : protège contre un objet partiel ou null venant du backend
+  const screening = normalizeScreening(value);
+
+  function update(patch) { onChange({ ...screening, ...patch }); }
 
   function addCert() {
     const t = certInput.trim();
     if (!t) return;
-    update({ required_certifications: [...value.required_certifications, t] });
+    update({ required_certifications: [...screening.required_certifications, t] });
     setCertInput("");
   }
 
   function removeCert(idx) {
-    update({ required_certifications: value.required_certifications.filter((_, i) => i !== idx) });
+    update({ required_certifications: screening.required_certifications.filter((_, i) => i !== idx) });
   }
 
   function addQuestion() {
-    update({ custom_questions: [...value.custom_questions, { id: crypto.randomUUID(), text: "", required: false }] });
+    update({ custom_questions: [...screening.custom_questions, { id: crypto.randomUUID(), text: "", required: false }] });
     if (!open) setOpen(true);
   }
 
   function updateQuestion(id, patch) {
-    update({ custom_questions: value.custom_questions.map((q) => q.id === id ? { ...q, ...patch } : q) });
+    update({ custom_questions: screening.custom_questions.map((q) => q.id === id ? { ...q, ...patch } : q) });
   }
 
   function removeQuestion(id) {
-    update({ custom_questions: value.custom_questions.filter((q) => q.id !== id) });
+    update({ custom_questions: screening.custom_questions.filter((q) => q.id !== id) });
   }
 
   const hasContent =
-    value.min_degree !== "none" ||
-    value.min_experience_years > 0 ||
-    value.required_certifications.length > 0 ||
-    value.custom_questions.length > 0;
+    screening.min_degree !== "none" ||
+    screening.min_experience_years > 0 ||
+    screening.required_certifications.length > 0 ||
+    screening.custom_questions.length > 0;
 
   return (
     <div className="rounded-lg border border-gray-200 overflow-hidden">
@@ -153,7 +165,7 @@ function ScreeningBuilder({ value, onChange }) {
               Niveau de diplôme minimum
             </label>
             <select
-              value={value.min_degree}
+              value={screening.min_degree}
               onChange={(e) => update({ min_degree: e.target.value })}
               className="w-full h-9 px-3 rounded-lg border border-gray-200 bg-white text-xs text-gray-700 outline-none focus:border-gray-400"
             >
@@ -170,12 +182,12 @@ function ScreeningBuilder({ value, onChange }) {
             <div className="flex items-center gap-3">
               <input
                 type="range" min={0} max={15} step={1}
-                value={value.min_experience_years}
+                value={screening.min_experience_years}
                 onChange={(e) => update({ min_experience_years: Number(e.target.value) })}
                 className="flex-1"
               />
               <span className="text-xs font-semibold text-gray-700 w-14 text-right tabular-nums shrink-0">
-                {value.min_experience_years === 0 ? "Aucun" : `${value.min_experience_years} an${value.min_experience_years > 1 ? "s" : ""}`}
+                {screening.min_experience_years === 0 ? "Aucun" : `${screening.min_experience_years} an${screening.min_experience_years > 1 ? "s" : ""}`}
               </span>
             </div>
           </div>
@@ -201,9 +213,9 @@ function ScreeningBuilder({ value, onChange }) {
                 Ajouter
               </button>
             </div>
-            {value.required_certifications.length > 0 && (
+            {screening.required_certifications.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
-                {value.required_certifications.map((cert, idx) => (
+                {screening.required_certifications.map((cert, idx) => (
                   <span
                     key={idx}
                     className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-gray-200 text-gray-600 text-xs bg-gray-50"
@@ -235,11 +247,11 @@ function ScreeningBuilder({ value, onChange }) {
                 <Plus size={11} /> Ajouter
               </button>
             </div>
-            {value.custom_questions.length === 0 ? (
+            {screening.custom_questions.length === 0 ? (
               <p className="text-xs text-gray-400">Aucune question.</p>
             ) : (
               <div className="space-y-2">
-                {value.custom_questions.map((q, idx) => (
+                {screening.custom_questions.map((q, idx) => (
                   <div
                     key={q.id}
                     className="flex items-start gap-2 p-3 rounded-lg border border-gray-100 bg-gray-50"
@@ -288,7 +300,10 @@ function JobForm({ initial = {}, onSubmit, onCancel, isPending }) {
   const [description,  setDescription]  = useState(initial.description  ?? "");
   const [requirements, setRequirements] = useState(initial.requirements ?? "");
   const [domain,       setDomain]       = useState(initial.domain       ?? "");
-  const [screening,    setScreening]    = useState(initial.screening_questions ?? EMPTY_SCREENING);
+
+  // FIX : normalisation défensive au lieu de `?? EMPTY_SCREENING`
+  // car un objet partiel (ex. { min_degree: "none" }) passe le ?? et provoque le crash
+  const [screening, setScreening] = useState(() => normalizeScreening(initial.screening_questions));
 
   function handleSubmit() {
     const trimmed = {
@@ -437,15 +452,10 @@ export default function JobList() {
   const { mutate: createJob, isPending: isCreating } = useCreateJob({ onSuccess: () => setShowCreate(false) });
   const { mutate: updateJob, isPending: isUpdating } = useUpdateJob({ onSuccess: () => setEditingId(null) });
   const { mutate: deleteJob }                        = useDeleteJob();
-  // const { data: candidates = [] }                    = useCandidates();
 
-  const [showCreate,    setShowCreate]    = useState(false);
-  const [editingId,     setEditingId]     = useState(null);
-  const [deleteTarget,  setDeleteTarget]  = useState(null); // { id, title }
-
-  // function candidateCount(jobId) {
-  //   return candidates.filter((c) => c.job_id === jobId).length;
-  // }
+  const [showCreate,   setShowCreate]   = useState(false);
+  const [editingId,    setEditingId]    = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   return (
     <div className="p-6 lg:p-8 bg-gray-50 min-h-screen">
