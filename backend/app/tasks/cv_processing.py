@@ -249,27 +249,19 @@ def _build_score_payload(score_result: dict) -> dict:
 
 
 def _enrich_ai_data(cv_info: dict, score_result: dict) -> dict:
-    """
-    Merge scoring metadata into the CV extraction dict before storing as
-    ai_extracted_data. This is what makes ScorePanel source A work:
-    aiData.dimension_scores will be populated.
-
-    raw_text / full_text are stripped — they're already in cv_raw_text column
-    and would bloat ai_extracted_data unnecessarily.
-    """
     dims = score_result.get("dimension_scores", {})
+    full_details = score_result.get("full_details", {})
     enriched = {
         **cv_info,
-        # Scoring fields merged into the blob for frontend fallback chains
         "dimension_scores": dims,
         "matched_keywords": score_result.get("matched_keywords", []),
         "missing_keywords": score_result.get("missing_keywords", []),
         "score_reasoning":  score_result.get("reasoning", ""),
         "hierarchy_level":  score_result.get("hierarchy_level"),
         "domain":           score_result.get("domain"),
-        "full_details":     score_result.get("full_details", {}),
+        "detected_education": full_details.get("detected_education", "none"),  # ← added
+        "full_details":     full_details,
     }
-    # Keep ai_extracted_data lean — raw text lives in cv_raw_text column
     enriched.pop("raw_text",  None)
     enriched.pop("full_text", None)
     return enriched
@@ -455,6 +447,10 @@ def build_candidate_payload(
             or cv_info.get("headline")
             or ""
         ),
+        
+        "hierarchy_level": score_result.get("hierarchy_level"),
+        "education_level": score_result.get("full_details", {}).get("detected_education", "none"),
+        "domain":          score_result.get("domain"),
 
         "skills":         ensure_list(cv_info.get("skills")),
         "education":      ensure_list(cv_info.get("education")),
