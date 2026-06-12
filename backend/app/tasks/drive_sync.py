@@ -271,11 +271,15 @@ def process_drive_file(
             }
 
         # 5. AI extraction
-        extracted = enrich_cv_data(extracted, raw_text)
+        extracted = extract_cv_info(raw_text)
+
+        # Enrich with raw_text so keyword/semantic/education/cert scorers see
+        # the full CV body, not the sparse _build_cv_text reconstruction.
+        enriched = enrich_cv_data(extracted, raw_text)
 
         # 6. Scoring
         score_result, resolved_job_id = resolve_candidate_score(
-            supabase, extracted, job_id
+            supabase, enriched, job_id
         )
         logger.info(
             "Scored file %s → %.1f (job_id=%s)",
@@ -288,6 +292,7 @@ def process_drive_file(
         payload = build_candidate_payload(
             raw_text=raw_text,
             cv_info=extracted,
+            enriched_cv=enriched,
             score_result=score_result,
             job_id=resolved_job_id,
         )
