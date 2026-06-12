@@ -4,14 +4,6 @@ import { useState, useCallback } from "react";
 const BUCKET_BASE_URL =
   "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/";
 
-/**
- * Open a candidate CV in a new browser tab.
- *
- * Supports:
- * - Full public URLs
- * - Relative storage paths
- * - Paths that accidentally include "public/"
- */
 export function useOpenCV() {
   const [isOpeningCV, setIsOpeningCV] = useState(false);
 
@@ -27,7 +19,6 @@ export function useOpenCV() {
       let finalUrl;
 
       if (cvFileUrl.startsWith("http")) {
-        // Already a complete URL
         finalUrl = cvFileUrl;
       } else {
         const cleanPath = cvFileUrl
@@ -35,16 +26,8 @@ export function useOpenCV() {
           .replace(/^cvs\//, "")
           .replace(/^public\//, "");
 
-finalUrl = `${BUCKET_BASE_URL}${cleanPath}`;
-
-        const normalizedPath = cleanPath.startsWith("public/")
-          ? cleanPath.replace(/^public\//, "")
-          : cleanPath;
-
-        finalUrl = `${BASE_STORAGE_URL}${normalizedPath}`;
+        finalUrl = `${BUCKET_BASE_URL}${cleanPath}`;
       }
-
-      console.log("Opening CV:", finalUrl);
 
       window.open(finalUrl, "_blank", "noopener,noreferrer");
     } catch (error) {
@@ -55,8 +38,5 @@ finalUrl = `${BUCKET_BASE_URL}${cleanPath}`;
     }
   }, []);
 
-  return {
-    openCV,
-    isOpeningCV,
-  };
+  return { openCV, isOpeningCV };
 }
