@@ -2,7 +2,7 @@
 import { useState, useCallback } from "react";
 
 const BASE_STORAGE_URL =
-  "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/";
+  "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/manual/";
 
 /**
  * Open a candidate CV in a new browser tab.
