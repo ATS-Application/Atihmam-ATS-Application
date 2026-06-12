@@ -22,7 +22,7 @@ export function useOpenCV() {
     let finalUrl = cvFileUrl;
     if (!finalUrl.startsWith('http')) {
        // If it's a relative path, prepend your base URL or handle accordingly
-       finalUrl = `https://your-supabase-project-url.supabase.co/storage/v1/object/public/${cvFileUrl}`;
+       finalUrl = `https://nflmcuktfosaketloomh.supabase.co.supabase.co/storage/v1/object/public/${cvFileUrl}`;
     }
 
     try {
