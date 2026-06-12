@@ -2,7 +2,7 @@
 import { useState, useCallback } from "react";
 
 const BUCKET_BASE_URL =
-  "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/manual/";
+  "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/";
 
 /**
  * Open a candidate CV in a new browser tab.
@@ -30,7 +30,12 @@ export function useOpenCV() {
         // Already a complete URL
         finalUrl = cvFileUrl;
       } else {
-        const cleanPath = cvFileUrl.replace(/^\/+/, "");
+        const cleanPath = cvFileUrl
+          .replace(/^\/+/, "")
+          .replace(/^cvs\//, "")
+          .replace(/^public\//, "");
+
+finalUrl = `${BUCKET_BASE_URL}${cleanPath}`;
 
         const normalizedPath = cleanPath.startsWith("public/")
           ? cleanPath.replace(/^public\//, "")
