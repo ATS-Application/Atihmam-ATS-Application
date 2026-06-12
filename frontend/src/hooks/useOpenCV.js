@@ -21,6 +21,7 @@ export function useOpenCV() {
     } finally {
       setIsOpeningCV(false);
     }
+    console.log("CV URL:", candidate.cv_file_url);
   }, []);
 
   return { openCV, isOpeningCV };
