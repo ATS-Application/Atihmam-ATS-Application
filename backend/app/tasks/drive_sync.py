@@ -45,6 +45,7 @@ from app.tasks.cv_processing import (
     compute_best_job_match,
     fetch_active_jobs,
     fetch_job,
+    _enrich_cv_data
 )
 
 logger = logging.getLogger(__name__)
@@ -270,7 +271,7 @@ def process_drive_file(
             }
 
         # 5. AI extraction
-        extracted = extract_cv_info(raw_text)
+        extracted = _enrich_cv_data(extracted, raw_text)
 
         # 6. Scoring
         score_result, resolved_job_id = resolve_candidate_score(
