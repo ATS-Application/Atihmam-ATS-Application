@@ -13,7 +13,7 @@ from app.services.scoring_service import (
     update_weights_from_feedback,
 )
 
-router = APIRouter(prefix="/feedback", tags=["Feedback"], redirect_slashes=False)
+router = APIRouter(prefix="/feedback", tags=["Feedback"])
 
 _MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 0.5
