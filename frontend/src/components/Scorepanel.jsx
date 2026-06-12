@@ -27,77 +27,90 @@ import { useOpenCV } from "../hooks/useOpenCV";
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
 //
-// Keys here MUST match the "frontend aliases" block in
-// scoring_service.compute_candidate_score()'s `dimension_scores` dict:
-//   keyword_score, semantic_score, experience_score,
-//   project_complexity_score, education_score,
-//   certification_score, leadership_score, language_score
+// Keys here use the "frontend alias" names that compute_candidate_score()
+// writes into dimension_scores alongside the canonical keys.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DIMENSIONS = [
   {
     key: "keyword_score",
-    label: "Match mots-clés",
+    canonical: "keywords",
+    label: "Mots-clés",
     icon: Target,
     accent: "#f97316",
     track: "#fff7ed",
-    description: "Correspondance des mots-clés requis par la fiche de poste",
+    description:
+      "Ratio des mots-clés requis (ou compétences du domaine) détectés dans le CV.",
   },
   {
     key: "semantic_score",
-    label: "Compétences",
+    canonical: "semantic",
+    label: "Correspondance métier",
     icon: Zap,
     accent: "#8b5cf6",
     track: "#f5f3ff",
-    description: "Recouvrement sémantique (Jaccard + compétences du domaine) avec la fiche de poste",
+    description:
+      "Similarité lexicale entre le CV et la fiche de poste (Jaccard) + couverture des compétences du domaine détecté.",
   },
   {
     key: "experience_score",
+    canonical: "experience",
     label: "Expérience",
     icon: Briefcase,
     accent: "#3b82f6",
     track: "#eff6ff",
-    description: "Années d'expérience détectées vs. requises pour le niveau hiérarchique",
+    description:
+      "Années d'expérience détectées rapportées aux années requises et au niveau hiérarchique du poste.",
   },
   {
     key: "project_complexity_score",
-    label: "Complexité / Projets",
+    canonical: "complexity",
+    label: "Maîtrise du domaine",
     icon: FolderOpen,
     accent: "#10b981",
     track: "#ecfdf5",
-    description: "Diversité des domaines couverts et maîtrise des compétences du domaine principal",
+    description:
+      "Couverture des compétences clés du domaine détecté et diversité des domaines maîtrisés, pondérée par le niveau hiérarchique.",
   },
   {
     key: "education_score",
+    canonical: "education",
     label: "Formation",
     icon: TrendingUp,
     accent: "#ec4899",
     track: "#fdf2f8",
-    description: "Niveau d'études détecté vs. niveau requis pour le poste",
+    description:
+      "Niveau d'études détecté (CAP → Doctorat) comparé au minimum requis pour le niveau hiérarchique du poste.",
   },
   {
     key: "certification_score",
+    canonical: "certifications",
     label: "Certifications",
     icon: CheckCircle2,
     accent: "#f59e0b",
     track: "#fffbeb",
-    description: "Certifications professionnelles reconnues détectées dans le CV",
+    description:
+      "Certifications reconnues détectées (OHADA, IFRS, PMP, AWS…), pondérées par leur pertinence pour le domaine et le niveau.",
   },
   {
     key: "leadership_score",
+    canonical: "leadership",
     label: "Leadership",
     icon: TrendingUp,
     accent: "#6366f1",
     track: "#eef2ff",
-    description: "Verbes d'action de management et historique de postes à responsabilité",
+    description:
+      "Verbes d'action managériaux (dirigé, piloté, encadré…) et niveaux hiérarchiques des postes précédents.",
   },
   {
     key: "language_score",
-    label: "Qualité linguistique",
+    canonical: "language",
+    label: "Qualité rédactionnelle",
     icon: Brain,
     accent: "#0ea5e9",
     track: "#f0f9ff",
-    description: "Richesse lexicale, structure et longueur du CV",
+    description:
+      "Richesse lexicale, détection de langue (FR/EN), couverture des sections standards du CV et longueur du document.",
   },
 ];
 
@@ -141,11 +154,7 @@ const FEEDBACK_BUTTONS = [
 function safeParse(value) {
   if (!value) return {};
   if (typeof value === "string") {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(value); } catch { return {}; }
   }
   return typeof value === "object" && !Array.isArray(value) ? value : {};
 }
@@ -156,19 +165,11 @@ function safeParseArray(value) {
     try {
       const parsed = JSON.parse(value);
       return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
+    } catch { return []; }
   }
   return [];
 }
 
-/**
- * Normalize a confidence/score value to a 0–100 integer.
- * compute_candidate_score() returns "confidence" already as a 0-100 float
- * (round(final_score * 100, 2)), but be defensive in case an older record
- * stored a 0-1 decimal.
- */
 function normalizeConfidence(value) {
   if (value == null) return null;
   const n = parseFloat(value);
@@ -181,22 +182,16 @@ function clamp(n) {
 }
 
 /**
- * Each DIMENSIONS[].key maps 1:1 onto a key inside dimension_scores
- * (the frontend-alias block of compute_candidate_score). Those values
- * are already 0-100 floats (dims["xxx"] from score_to_dict * ... no —
- * they come straight from CandidateScore.score_* which are 0-1, scaled
- * by *100 happens only for "score"/"confidence" at the top level).
- *
- * NOTE: score_to_dict()'s "dimensions" block (and therefore
- * dimension_scores' canonical + alias keys) are 0-1 floats, NOT 0-100.
- * So every dimension value here still needs *100 scaling.
+ * Normalize a raw dimension value to a 0–100 integer.
+ * scoring_service stores all dimension scores as 0–1 floats.
+ * They may arrive as numbers or numeric strings.
  */
 function normalizeDimensionValue(value) {
-  let num = parseFloat(value);
+  if (value == null) return 0;
+  const num = parseFloat(value);
   if (isNaN(num)) return 0;
-  if (num > 100) num = 100;
-  if (num <= 1.0) num = num * 100;
-  return Math.round(num);
+  if (num > 1) return Math.min(Math.round(num), 100); // already 0-100
+  return Math.round(num * 100);                        // 0-1 → 0-100
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,7 +211,6 @@ function ScoreRing({ score }) {
   const radius = 46;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (pct / 100) * circumference;
-
   const color = pct >= 80 ? "#10b981" : pct >= 60 ? "#f59e0b" : "#ef4444";
   const label = pct >= 80 ? "Excellent" : pct >= 60 ? "Correct" : "Faible";
 
@@ -225,9 +219,7 @@ function ScoreRing({ score }) {
       <svg width="120" height="120">
         <circle cx="60" cy="60" r={radius} fill="none" stroke="#f1f5f9" strokeWidth="10" />
         <circle
-          cx="60"
-          cy="60"
-          r={radius}
+          cx="60" cy="60" r={radius}
           fill="none"
           stroke={color}
           strokeWidth="10"
@@ -343,42 +335,49 @@ export default function ScorePanel({ candidate }) {
   const [loadingFeedback, setLoadingFeedback] = useState(false);
   const { openCV, isOpeningCV } = useOpenCV();
 
-  // Reset feedback state when candidate changes
   useEffect(() => {
     setFeedbackSent(null);
     setLoadingFeedback(false);
   }, [candidate?.id]);
 
-  // ── Derived data ────────────────────────────────────────────────────────────
+  // ── Derived data ─────────────────────────────────────────────────────────
 
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
-  // dimension_scores is the single source of truth produced by
-  // compute_candidate_score() — it already contains both the canonical
-  // v2.1 keys (experience, education, ...) AND the frontend alias keys
-  // (experience_score, education_score, ...) that DIMENSIONS references.
-  const dimensionScores = useMemo(() => {
-    let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
-
-    if (typeof raw === "string") {
-      try {
-        raw = JSON.parse(raw);
-      } catch {
-        raw = {};
-      }
-    }
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) raw = {};
-
-    return raw;
-  }, [candidate, aiData]);
-
+  // ── Dimension score resolution ───────────────────────────────────────────
+  // compute_candidate_score() writes dimension_scores with both canonical keys
+  // (experience, keywords…) AND frontend alias keys (experience_score,
+  // keyword_score…). Depending on which code path wrote the candidate row,
+  // the data can live in several places. We check all of them in priority order.
+  //
+  //   A) aiData.dimension_scores          — compat shim result merged into CV blob
+  //   B) aiData.full_details.dimensions   — score_to_dict() nested result
+  //   C) candidate.dimension_scores       — dedicated JSONB column on the row
+  //   D) candidate.<alias>                — individual float columns on the row
   const dims = useMemo(() => {
+    const parseObj = (v) => {
+      if (!v) return null;
+      if (typeof v === "string") { try { return JSON.parse(v); } catch { return null; } }
+      if (typeof v === "object" && !Array.isArray(v)) return v;
+      return null;
+    };
+
+    const srcA = parseObj(aiData?.dimension_scores);
+    const srcB = parseObj(aiData?.full_details?.dimensions);
+    const srcC = parseObj(candidate?.dimension_scores);
+
     const result = {};
-    for (const { key } of DIMENSIONS) {
-      result[key] = normalizeDimensionValue(dimensionScores[key]);
+    for (const { key, canonical } of DIMENSIONS) {
+      const raw =
+        srcA?.[key]       ?? srcA?.[canonical]  ??  // A: alias then canonical
+        srcB?.[canonical] ?? srcB?.[key]        ??  // B: canonical then alias
+        srcC?.[key]       ?? srcC?.[canonical]  ??  // C: alias then canonical
+        candidate?.[key]  ??                        // D: direct alias column
+        null;
+      result[key] = normalizeDimensionValue(raw);
     }
     return result;
-  }, [dimensionScores]);
+  }, [candidate, aiData]);
 
   const matched = useMemo(
     () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
@@ -393,24 +392,18 @@ export default function ScorePanel({ candidate }) {
   const coveredClusters = useMemo(() => {
     const explicit = safeParseArray(candidate?.covered_clusters ?? aiData?.covered_clusters);
     if (explicit.length > 0) return explicit;
-
-    // Fallback: derive from skills list using CLUSTER_ICONS keys as signal
     const skills = safeParseArray(candidate?.skills ?? aiData?.skills);
     return Object.keys(CLUSTER_ICONS).filter((cluster) =>
       skills.some((s) => String(s).toLowerCase().includes(cluster))
     );
   }, [candidate, aiData]);
 
-  // compute_candidate_score() returns "score" and "confidence" (both
-  // already 0-100). It does NOT return "score_confidence" or
-  // "score_reasoning" — if your API layer renames these before persisting,
-  // keep those aliases too; otherwise fall back to the raw field names.
   const score = candidate?.score ?? aiData?.score ?? null;
   const confidence = normalizeConfidence(
     candidate?.score_confidence ??
-      aiData?.score_confidence ??
-      candidate?.confidence ??
-      aiData?.confidence
+    aiData?.score_confidence ??
+    candidate?.confidence ??
+    aiData?.confidence
   );
   const reasoning =
     candidate?.score_reasoning ??
@@ -421,13 +414,12 @@ export default function ScorePanel({ candidate }) {
   const processingStatus = candidate?.processing_status ?? null;
 
   const hasData = Object.values(dims).some((v) => v > 0);
-  const isPending = processingStatus === "queued";
+  const isPending    = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
-  const isFailed = processingStatus === "failed";
-  // Score exists but dimension detail is missing (partial pipeline run)
-  const isPartial = !hasData && score !== null && !isPending && !isProcessing && !isFailed;
+  const isFailed     = processingStatus === "failed";
+  const isPartial    = !hasData && score !== null && !isPending && !isProcessing && !isFailed;
 
-  // ── Actions ─────────────────────────────────────────────────────────────────
+  // ── Actions ─────────────────────────────────────────────────────────────
 
   async function sendFeedback(type) {
     if (feedbackSent || loadingFeedback) return;
@@ -444,16 +436,15 @@ export default function ScorePanel({ candidate }) {
     }
   }
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-4">
-      {/* ── Score card ─────────────────────────────────────────────────────── */}
+      {/* ── Score card ──────────────────────────────────────────────────── */}
       <Card className="overflow-hidden">
-        {/* Header */}
         <div className="flex items-center gap-2 border-b border-gray-50 px-5 py-4">
           <Sparkles size={15} className="text-indigo-400" />
-          <h2 className="flex-1 text-sm font-bold text-gray-900">Score ATS Intelligent</h2>
+          <h2 className="flex-1 text-sm font-bold text-gray-900">Score ATS</h2>
           {confidence !== null && (
             <span className="text-xs text-gray-400">
               Confiance{" "}
@@ -462,7 +453,6 @@ export default function ScorePanel({ candidate }) {
           )}
         </div>
 
-        {/* Body */}
         <div className="px-5 py-6">
           {score !== null && (
             <div className="mb-7 flex justify-center">
@@ -515,7 +505,6 @@ export default function ScorePanel({ candidate }) {
           )}
         </div>
 
-        {/* AI reasoning */}
         {reasoning && (
           <div className="mx-5 mb-5 rounded-2xl border border-gray-100 bg-gray-50 px-4 py-3">
             <div className="flex items-start gap-2">
@@ -526,7 +515,7 @@ export default function ScorePanel({ candidate }) {
         )}
       </Card>
 
-      {/* ── CV button ──────────────────────────────────────────────────────── */}
+      {/* ── CV button ───────────────────────────────────────────────────── */}
       {candidate?.cv_file_url && (
         <Card className="p-4">
           <button
@@ -540,10 +529,12 @@ export default function ScorePanel({ candidate }) {
         </Card>
       )}
 
-      {/* ── Feedback ───────────────────────────────────────────────────────── */}
+      {/* ── Feedback ────────────────────────────────────────────────────── */}
       <Card className="px-5 py-4">
         <p className="mb-1 text-sm font-bold text-gray-900">Ce candidat vous convient ?</p>
-        <p className="mb-4 text-xs text-gray-400">Votre retour améliore le scoring ATS.</p>
+        <p className="mb-4 text-xs text-gray-400">
+          Votre retour affine les poids du scorer via gradient descent.
+        </p>
         <div className="flex gap-2.5">
           {FEEDBACK_BUTTONS.map(({ type, label, icon: Icon, activeClass, idleClass }) => (
             <button
@@ -561,7 +552,7 @@ export default function ScorePanel({ candidate }) {
         </div>
       </Card>
 
-      {/* ── Clusters ───────────────────────────────────────────────────────── */}
+      {/* ── Clusters ────────────────────────────────────────────────────── */}
       {coveredClusters.length > 0 && (
         <Card className="px-5 py-4">
           <div className="mb-3 flex items-center gap-2">
@@ -576,10 +567,10 @@ export default function ScorePanel({ candidate }) {
         </Card>
       )}
 
-      {/* ── Keywords ───────────────────────────────────────────────────────── */}
+      {/* ── Keywords ────────────────────────────────────────────────────── */}
       {(matched.length > 0 || missing.length > 0) && (
         <Card className="px-5 py-4">
-          <h2 className="mb-4 text-sm font-bold text-gray-900">Analyse mots-clés</h2>
+          <h2 className="mb-4 text-sm font-bold text-gray-900">Mots-clés détectés</h2>
 
           {matched.length > 0 && (
             <div className="mb-4">
