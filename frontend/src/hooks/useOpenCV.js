@@ -1,8 +1,8 @@
 // src/hooks/useOpenCV.js
 import { useState, useCallback } from "react";
 
-const BASE_STORAGE_URL =
-  "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/manual/";
+const BUCKET_BASE_URL =
+  "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/cvs/";
 
 /**
  * Open a candidate CV in a new browser tab.
