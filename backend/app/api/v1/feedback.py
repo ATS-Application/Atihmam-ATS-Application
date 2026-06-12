@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from httpx import RemoteProtocolError
 
 from app.core.security import get_current_user
-from app.db.supabase_admin import get_supabase_admin
+from app.db.supabase_client import get_supabase_admin
 from app.services.scoring_service import (
-    update_weights_from_feedback,
-    FeedbackRecord,
     DEFAULT_WEIGHTS,
+    FeedbackRecord,
+    update_weights_from_feedback,
 )
 
 router = APIRouter(prefix="/feedback", tags=["Feedback"], redirect_slashes=False)
