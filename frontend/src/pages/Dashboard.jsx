@@ -195,13 +195,13 @@ function DomainFoldersSection({ candidates, jobs, onSelectCandidate, selectedCan
   return (
     <section>
       <SectionHeader
-        title="Dossiers par secteur"
+        title="🗂️ Dossiers par secteur"
         subtitle="Classement automatique par poste"
       />
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
         {grouped.map(([domainKey, domainCandidates]) => (
           <DomainFolder
-            key={domainKey}
+            key={`📁${domainKey}`}
             domainKey={domainKey}
             candidates={domainCandidates}
             jobs={jobs}
