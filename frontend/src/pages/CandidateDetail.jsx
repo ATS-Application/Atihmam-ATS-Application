@@ -1,4 +1,5 @@
 // frontend/src/pages/CandidateDetail.jsx
+// Aligned with scoring_service.py v2.1 — hierarchical ATS scorer
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
@@ -14,8 +15,11 @@ import {
   Sparkles,
   Target,
   Zap,
-  FolderOpen,
+  GraduationCap,
+  Award,
   TrendingUp,
+  Languages,
+  Layers,
   Info,
   Brain,
   AlertTriangle,
@@ -24,13 +28,12 @@ import {
   XCircle,
   ThumbsUp,
   ThumbsDown,
-  Layers,
   Trash2,
+  ShieldAlert,
 } from "lucide-react";
 
 import toast from "react-hot-toast";
 import axiosClient from "../api/axiosClient";
-// import { useAuthStore } from "../store/authStore";
 import { useOpenCV } from "../hooks/useOpenCV";
 import { useCandidateWithPolling, useDeleteCandidate } from "../hooks/useCandidates";
 import { useJobs } from "../hooks/useJobs";
@@ -39,90 +42,141 @@ import ScoreBadge from "../components/ScoreBadge";
 import StatusTransitionModal from "../components/StatusTransitionModal";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
+// CONFIG — mirrors score_to_dict() "dimensions" keys from scoring_service.py
 // ─────────────────────────────────────────────────────────────────────────────
 
+// The backend compute_candidate_score() compat shim writes both canonical keys
+// (e.g. "experience") and frontend alias keys (e.g. "experience_score") into
+// dimension_scores. We read the canonical keys from dimension_scores and fall
+// back to the alias keys that may be stored directly on the candidate row.
 const DIMENSIONS = [
   {
-    key: "keyword_score",
-    label: "Match mots-clés",
+    // compute_keyword_score() — ratio of required/domain keywords found in CV
+    key: "keywords",
+    alias: "keyword_score",
+    label: "Mots-clés",
     icon: Target,
     accent: "#f97316",
     track: "#fff7ed",
-    description: "Correspondance sémantique (similarité) avec la fiche de poste",
+    description:
+      "Ratio des mots-clés requis (ou compétences du domaine) détectés dans le CV.",
   },
   {
-    key: "semantic_score",
-    label: "Compétences",
+    // compute_semantic_score() — Jaccard + domain skill coverage vs job description
+    key: "semantic",
+    alias: "semantic_score",
+    label: "Correspondance métier",
     icon: Zap,
     accent: "#8b5cf6",
     track: "#f5f3ff",
-    description: "Profondeur réelle des compétences et technologies détectées",
+    description:
+      "Similarité lexicale entre le CV et la fiche de poste (Jaccard) + couverture des compétences du domaine détecté.",
   },
   {
-    key: "experience_score",
+    // compute_experience_score() — years of experience vs required years
+    key: "experience",
+    alias: "experience_score",
     label: "Expérience",
     icon: Briefcase,
     accent: "#3b82f6",
     track: "#eff6ff",
-    description: "Années d'expérience professionnelle détectées",
+    description:
+      "Années d'expérience détectées rapportées aux années requises pour le poste et le niveau hiérarchique.",
   },
   {
-    key: "project_complexity_score",
-    label: "Projets",
-    icon: FolderOpen,
+    // compute_complexity_score() — multi-domain skill coverage × hierarchy multiplier
+    key: "complexity",
+    alias: "project_complexity_score",
+    label: "Maîtrise du domaine",
+    icon: Layers,
     accent: "#10b981",
     track: "#ecfdf5",
-    description: "Complexité et diversité des projets réalisés",
+    description:
+      "Couverture des compétences clés du domaine détecté et diversité des domaines maîtrisés, pondérée par le niveau hiérarchique.",
   },
   {
-    key: "education_score",
+    // compute_education_score() — education level vs minimum required for hierarchy
+    key: "education",
+    alias: "education_score",
     label: "Formation",
-    icon: TrendingUp,
+    icon: GraduationCap,
     accent: "#ec4899",
     track: "#fdf2f8",
-    description: "Progression académique et niveau d'études",
+    description:
+      "Niveau d'études détecté (CAP → Doctorat) comparé au minimum requis pour le niveau hiérarchique du poste.",
   },
   {
-    key: "certification_score",
+    // compute_certification_score() — weighted match against CERTIFICATION_REGISTRY
+    key: "certifications",
+    alias: "certification_score",
     label: "Certifications",
-    icon: CheckCircle2,
+    icon: Award,
     accent: "#f59e0b",
     track: "#fffbeb",
-    description: "Certifications professionnelles détectées",
+    description:
+      "Certifications reconnues détectées (OHADA, IFRS, PMP, AWS, etc.), pondérées par leur pertinence pour le domaine et le niveau.",
   },
   {
-    key: "leadership_score",
+    // compute_leadership_score() — leadership action verbs + past title detection
+    key: "leadership",
+    alias: "leadership_score",
     label: "Leadership",
     icon: TrendingUp,
     accent: "#6366f1",
     track: "#eef2ff",
-    description: "Capacités d'encadrement et de management détectées",
+    description:
+      "Verbes d'action managériaux détectés (dirigé, piloté, encadré…) et niveaux hiérarchiques des postes précédents.",
+  },
+  {
+    // compute_language_quality_score() — lexical richness + CV structure quality
+    key: "language",
+    alias: "language_score",
+    label: "Qualité rédactionnelle",
+    icon: Languages,
+    accent: "#14b8a6",
+    track: "#f0fdfa",
+    description:
+      "Richesse lexicale, détection de langue (FR/EN), couverture des sections standards du CV et longueur du document.",
   },
 ];
 
-const CLUSTER_ICONS = {
-  word: "📝",
-  powerpoint: "📊",
-  excel: "📈",
-  powerbi: "📉",
-  odoo: "🧩",
-  microsoft_office: "🪟",
-  google_suite: "📧",
-  google_docs: "📄",
-  google_sheets: "📊",
-  google_slides: "📈",
-  oracle: "🗄️",
-  python: "🐍",
-  javascript: "🟨",
-  typescript: "🔷",
-  cloud: "☁️",
-  devops: "⚙️",
-  data: "🗄️",
-  ml: "🤖",
-  mobile: "📱",
-  java: "☕",
-  security: "🔒",
+// Human-readable labels for HierarchyLevel enum values from scoring_service.py
+const HIERARCHY_LABELS = {
+  collaborateur:           "Collaborateur",
+  manager_intermediaire:   "Manager intermédiaire",
+  manager_senior:          "Manager senior",
+  direction:               "Direction",
+};
+
+// Human-readable labels for Domain enum values
+const DOMAIN_LABELS = {
+  tech:          "Technologie",
+  legal:         "Juridique",
+  health:        "Santé",
+  hr:            "RH",
+  finance:       "Finance",
+  marketing:     "Marketing",
+  sales:         "Commercial",
+  education:     "Éducation",
+  agriculture:   "Agriculture",
+  construction:  "BTP",
+  logistics:     "Logistique",
+  telecom:       "Télécom",
+  energy:        "Énergie",
+  mining:        "Mines",
+  hospitality:   "Hôtellerie",
+  media:         "Médias",
+  insurance:     "Assurance",
+  real_estate:   "Immobilier",
+  consulting:    "Conseil",
+  public_admin:  "Administration",
+  ngo:           "ONG",
+  pharma:        "Pharma",
+  retail:        "Distribution",
+  transport:     "Transport",
+  environment:   "Environnement",
+  craftsmanship: "Artisanat",
+  security:      "Sécurité",
 };
 
 const FEEDBACK_BUTTONS = [
@@ -165,15 +219,11 @@ function safeParseArray(value) {
   return [];
 }
 
-function normalizeConfidence(value) {
-  if (value == null) return null;
-  const n = parseFloat(value);
-  if (isNaN(n)) return null;
-  return Math.round(n > 1 ? n : n * 100);
-}
-
 function clamp(n) {
-  return Math.max(0, Math.min(100, Math.round(n ?? 0)));
+  if (n == null || isNaN(Number(n))) return 0;
+  const v = Number(n);
+  // Backend stores scores as 0–1 floats; frontend expects 0–100
+  return Math.max(0, Math.min(100, Math.round(v > 1 ? v : v * 100)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,14 +269,6 @@ function InfoRow({ icon: Icon, label, value }) {
         <p className="mt-0.5 wrap-break-word text-sm text-gray-900">{value}</p>
       </div>
     </div>
-  );
-}
-
-function KeywordBadge({ keyword }) {
-  return (
-    <span className="rounded-xl bg-green-100 px-3 py-1.5 text-xs font-medium text-green-700">
-      {keyword}
-    </span>
   );
 }
 
@@ -335,12 +377,18 @@ function KeywordChip({ word, matched }) {
   );
 }
 
-function ClusterBadge({ name }) {
-  const icon = CLUSTER_ICONS[name?.toLowerCase()] ?? "🔧";
+// Penalty chip — surfaces compute_careness_penalty() activated penalties
+function PenaltyChip({ penalty }) {
   return (
-    <span className="inline-flex items-center gap-2 rounded-2xl border border-indigo-100 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700">
-      {icon} {name}
-    </span>
+    <div className="flex items-start gap-2 rounded-xl border border-red-100 bg-red-50 px-3 py-2">
+      <ShieldAlert size={13} className="mt-0.5 shrink-0 text-red-400" />
+      <div className="min-w-0">
+        <p className="text-xs font-semibold text-red-700">{penalty.description}</p>
+        <p className="mt-0.5 text-xs text-red-400 tabular-nums">
+          Score dimension : {Math.round(penalty.score * 100)} — Seuil : {Math.round(penalty.threshold * 100)} — Malus : −{Math.round(penalty.penalty_applied * 100)}
+        </p>
+      </div>
+    </div>
   );
 }
 
@@ -363,7 +411,7 @@ export default function CandidateDetail() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  // ── ALL hooks at the top — no exceptions ──────────────────────────────────
+  // ── ALL hooks at the top ──────────────────────────────────────────────────
   const [showTransition, setShowTransition] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [feedbackSent, setFeedbackSent] = useState(null);
@@ -375,10 +423,8 @@ export default function CandidateDetail() {
   });
 
   const { data: jobs = [] } = useJobs();
-
   const { mutate: deleteCandidate, isPending: isDeleting } = useDeleteCandidate();
 
-  // Ordered list of candidate IDs passed from CandidateList for prev/next nav.
   const candidateIds = location.state?.candidateIds ?? null;
   const currentIndex = candidateIds ? candidateIds.indexOf(id) : -1;
   const prevId = candidateIds && currentIndex > 0 ? candidateIds[currentIndex - 1] : null;
@@ -414,27 +460,45 @@ export default function CandidateDetail() {
     return jobs.find((j) => j.id === candidate.job_id) ?? null;
   }, [jobs, candidate]);
 
+  // ai_extracted_data may be stored as a JSON string or a plain object
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
+  // ── Dimension scores ───────────────────────────────────────────────────────
+  // Priority: candidate row direct fields → ai_extracted_data.dimension_scores
+  // The compat shim stores both canonical keys AND frontend alias keys in
+  // dimension_scores, so we read the canonical key first, then the alias.
   const dims = useMemo(() => {
-    let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
-    if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { raw = {}; } }
-    if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
-    const merged = {
-      keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
-      semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
-      experience_score: candidate?.experience_score ?? aiData?.experience_score ?? raw.experience_score,
-      project_complexity_score: candidate?.project_complexity_score ?? raw.project_complexity_score,
-      education_score: candidate?.education_score ?? raw.education_score,
-      certification_score: candidate?.certification_score ?? raw.certification_score,
-      leadership_score: candidate?.leadership_score ?? raw.leadership_score,
-      ...raw,
-    };
-    return Object.fromEntries(
-      Object.entries(merged).map(([key, value]) => [key, value > 1 ? value : (value ?? 0) * 100])
-    );
+    // dimension_scores from ai_extracted_data (set by compute_candidate_score)
+    let stored = aiData?.dimension_scores ?? {};
+    if (typeof stored === "string") {
+      try { stored = JSON.parse(stored); } catch { stored = {}; }
+    }
+    if (typeof stored !== "object" || Array.isArray(stored)) stored = {};
+
+    const resolved = {};
+    for (const dim of DIMENSIONS) {
+      const v =
+        // 1. canonical key in dimension_scores
+        stored[dim.key] ??
+        // 2. alias key in dimension_scores
+        stored[dim.alias] ??
+        // 3. alias stored directly on the candidate row (legacy)
+        candidate?.[dim.alias] ??
+        null;
+      resolved[dim.key] = v;
+    }
+    return resolved;
   }, [candidate, aiData]);
 
+  // True when at least 4 dimensions have a non-null score
+  const hasData = useMemo(
+    () => Object.values(dims).filter((v) => v != null).length >= 4,
+    [dims]
+  );
+
+  // ── Keyword analysis — from scoring_service compute_candidate_score() ──────
+  // matched_keywords comes from kw_details["matched_keywords"] (canonical keys)
+  // missing_keywords is always [] in the compat shim (backend doesn't compute it)
   const matched = useMemo(
     () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
     [candidate, aiData]
@@ -443,26 +507,62 @@ export default function CandidateDetail() {
     () => safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords),
     [candidate, aiData]
   );
-  const coveredClusters = useMemo(() => {
-    const explicit = safeParseArray(candidate?.covered_clusters ?? aiData?.covered_clusters);
-    if (explicit.length > 0) return explicit;
-    const skills = safeParseArray(candidate?.skills ?? aiData?.skills);
-    return Object.keys(CLUSTER_ICONS).filter((cluster) =>
-      skills.some((s) => String(s).toLowerCase().includes(cluster))
+
+  // ── Penalty details from compute_careness_penalty() ───────────────────────
+  // Stored inside ai_extracted_data.full_details.penalty_details
+  const penaltyDetails = useMemo(() => {
+    const fullDetails = aiData?.full_details ?? {};
+    return safeParseArray(fullDetails?.penalty_details ?? candidate?.penalty_details);
+  }, [candidate, aiData]);
+
+  // ── Hierarchy & domain context from score_to_dict() ───────────────────────
+  const hierarchyLevel = useMemo(() => {
+    return (
+      aiData?.hierarchy_level ??
+      aiData?.full_details?.hierarchy_level ??
+      candidate?.hierarchy_level ??
+      null
     );
   }, [candidate, aiData]);
 
-  const aiDataWithoutSummary = useMemo(() => {
+  const domain = useMemo(() => {
+    return (
+      aiData?.domain ??
+      aiData?.full_details?.domain ??
+      candidate?.domain ??
+      null
+    );
+  }, [candidate, aiData]);
+
+  // ── Detected education level from score_candidate() ───────────────────────
+  const detectedEducation = useMemo(() => {
+    return (
+      aiData?.full_details?.detected_education ??
+      candidate?.detected_education ??
+      null
+    );
+  }, [candidate, aiData]);
+
+  // ── AI summary (stored in ai_extracted_data.summary by cv_processing) ─────
+  const aiSummary = useMemo(() => {
+    if (typeof aiData?.summary === "string" && aiData.summary.trim()) {
+      return aiData.summary;
+    }
+    return null;
+  }, [aiData]);
+
+  // ── Raw extracted data (excluding summary and scoring artifacts) ───────────
+  const aiRawDisplay = useMemo(() => {
     if (!candidate?.ai_extracted_data) return null;
-    const { summary, ...rest } = candidate.ai_extracted_data;
+    const { summary, dimension_scores, full_details, ...rest } = safeParse(candidate.ai_extracted_data);
     return Object.keys(rest).length > 0 ? rest : null;
   }, [candidate]);
 
-  // ── Early returns come AFTER all hooks ────────────────────────────────────
+  // ── Early returns AFTER all hooks ─────────────────────────────────────────
   if (isLoading || (fetchStatus === "idle" && !candidate)) {
     return (
       <div className="flex h-full items-center justify-center p-10">
-        <p className="animate-pulse text-sm text-gray-400">Chargement du candidat...</p>
+        <p className="animate-pulse text-sm text-gray-400">Chargement du candidat…</p>
       </div>
     );
   }
@@ -475,21 +575,22 @@ export default function CandidateDetail() {
     );
   }
 
-  // ── Derived non-hook values (safe after early returns) ────────────────────
+  // ── Derived values safe after early returns ────────────────────────────────
   const score = candidate?.score ?? aiData?.score ?? null;
-  const confidence = normalizeConfidence(candidate?.score_confidence ?? aiData?.score_confidence);
+  // score_reasoning from score_candidate — stored via ai_service
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
-  const hasData = Object.keys(dims).length > 3;
-  const isPending = processingStatus === "queued";
+
+  const isPending    = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
-  const isFailed = processingStatus === "failed";
-  const isPartial = !hasData && score !== null && !isPending && !isProcessing && !isFailed;
+  const isFailed     = processingStatus === "failed";
+  const isPartial    = !hasData && score !== null && !isPending && !isProcessing && !isFailed;
+
   const experienceLabel = candidate?.experience_years != null
     ? `${candidate.experience_years} an${candidate.experience_years > 1 ? "s" : ""}`
     : null;
 
-  // ── Actions ─────────────────────────────────────────────────────────────────
+  // ── Actions ──────────────────────────────────────────────────────────────
 
   async function sendFeedback(type) {
     if (feedbackSent || loadingFeedback) return;
@@ -522,11 +623,11 @@ export default function CandidateDetail() {
     });
   }
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="mx-auto max-w-6xl p-6 lg:p-8">
-      {/* Top bar: back / prev / next / delete */}
+      {/* Top bar */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <button
           onClick={() => navigate(-1)}
@@ -575,7 +676,7 @@ export default function CandidateDetail() {
         </div>
       </div>
 
-      {/* ── Header card ─────────────────────────────────────────────────────── */}
+      {/* ── Header card ───────────────────────────────────────────────────── */}
       <div className="mb-6 rounded-3xl border border-gray-200 bg-white p-6 shadow-sm">
         <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
           <div className="flex items-start gap-4">
@@ -587,12 +688,25 @@ export default function CandidateDetail() {
               <p className="mt-1 text-sm text-gray-500">
                 {candidate.current_position || "Poste non renseigné"}
               </p>
-              {linkedJob && (
-                <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
-                  <Briefcase size={12} />
-                  Poste ciblé : {linkedJob.title}
-                </div>
-              )}
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                {linkedJob && (
+                  <div className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
+                    <Briefcase size={12} />
+                    {linkedJob.title}
+                  </div>
+                )}
+                {hierarchyLevel && (
+                  <div className="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+                    {HIERARCHY_LABELS[hierarchyLevel] ?? hierarchyLevel}
+                  </div>
+                )}
+                {domain && (
+                  <div className="inline-flex items-center gap-1.5 rounded-full bg-violet-50 px-3 py-1 text-xs font-semibold text-violet-600">
+                    {DOMAIN_LABELS[domain] ?? domain}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
@@ -615,19 +729,24 @@ export default function CandidateDetail() {
         </div>
       </div>
 
-      {/* ── Content grid ────────────────────────────────────────────────────── */}
+      {/* ── Content grid ──────────────────────────────────────────────────── */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
 
-        {/* ── LEFT COLUMN ─────────────────────────────────────────────────── */}
+        {/* ── LEFT COLUMN ───────────────────────────────────────────────── */}
         <div className="space-y-6">
 
           {/* Contact & meta */}
           <SectionCard className="p-5">
             <SectionTitle>Informations</SectionTitle>
             <div className="space-y-4">
-              <InfoRow icon={Mail} label="Email" value={candidate.email} />
-              <InfoRow icon={Phone} label="Téléphone" value={candidate.phone} />
-              <InfoRow icon={Briefcase} label="Expérience" value={experienceLabel} />
+              <InfoRow icon={Mail}        label="Email"      value={candidate.email} />
+              <InfoRow icon={Phone}       label="Téléphone"  value={candidate.phone} />
+              <InfoRow icon={Briefcase}   label="Expérience" value={experienceLabel} />
+              <InfoRow icon={GraduationCap} label="Formation détectée"
+                value={detectedEducation
+                  ? detectedEducation.replace(/_/g, " ").replace("bac+", "Bac+")
+                  : null}
+              />
               {linkedJob && (
                 <InfoRow icon={Briefcase} label="Poste ciblé" value={linkedJob.title} />
               )}
@@ -645,21 +764,13 @@ export default function CandidateDetail() {
             )}
           </SectionCard>
 
-          {/* ── Score ATS ─────────────────────────────────────────────────── */}
+          {/* ── Score ATS ───────────────────────────────────────────────── */}
           <SectionCard className="overflow-hidden">
-            {/* Header */}
             <div className="flex items-center gap-2 border-b border-gray-50 px-5 py-4">
               <Sparkles size={15} className="text-indigo-400" />
-              <h2 className="flex-1 text-sm font-bold text-gray-900">Score ATS Intelligent</h2>
-              {confidence !== null && (
-                <span className="text-xs text-gray-400">
-                  Confiance{" "}
-                  <span className="font-semibold text-gray-700">{confidence}%</span>
-                </span>
-              )}
+              <h2 className="flex-1 text-sm font-bold text-gray-900">Score ATS</h2>
             </div>
 
-            {/* Ring + dimensions */}
             <div className="px-5 py-6">
               {score !== null && (
                 <div className="mb-7 flex justify-center">
@@ -673,7 +784,7 @@ export default function CandidateDetail() {
                     <DimensionRow
                       key={dim.key}
                       dimension={dim}
-                      score={dims[dim.key] ?? 0}
+                      score={dims[dim.key]}
                     />
                   ))}
                 </div>
@@ -712,7 +823,7 @@ export default function CandidateDetail() {
               )}
             </div>
 
-            {/* AI reasoning */}
+            {/* AI reasoning from score_candidate() */}
             {reasoning && (
               <div className="mx-5 mb-5 rounded-2xl border border-gray-100 bg-gray-50 px-4 py-3">
                 <div className="flex items-start gap-2">
@@ -723,10 +834,27 @@ export default function CandidateDetail() {
             )}
           </SectionCard>
 
-          {/* ── Feedback ──────────────────────────────────────────────────── */}
+          {/* ── Penalty alerts from compute_careness_penalty() ─────────── */}
+          {penaltyDetails.length > 0 && (
+            <SectionCard className="px-5 py-4">
+              <div className="mb-3 flex items-center gap-2">
+                <ShieldAlert size={14} className="text-red-400" />
+                <h2 className="text-sm font-bold text-gray-900">Alertes de carence</h2>
+              </div>
+              <div className="space-y-2">
+                {penaltyDetails.map((p, i) => (
+                  <PenaltyChip key={i} penalty={p} />
+                ))}
+              </div>
+            </SectionCard>
+          )}
+
+          {/* ── Feedback ────────────────────────────────────────────────── */}
           <SectionCard className="px-5 py-4">
             <p className="mb-1 text-sm font-bold text-gray-900">Ce candidat vous convient ?</p>
-            <p className="mb-4 text-xs text-gray-400">Votre retour améliore le scoring ATS.</p>
+            <p className="mb-4 text-xs text-gray-400">
+              Votre retour affine les poids du scorer via gradient descent.
+            </p>
             <div className="flex gap-2.5">
               {FEEDBACK_BUTTONS.map(({ type, label, icon: Icon, activeClass, idleClass }) => (
                 <button
@@ -744,25 +872,10 @@ export default function CandidateDetail() {
             </div>
           </SectionCard>
 
-          {/* ── Clusters ──────────────────────────────────────────────────── */}
-          {coveredClusters.length > 0 && (
-            <SectionCard className="px-5 py-4">
-              <div className="mb-3 flex items-center gap-2">
-                <Layers size={14} className="text-indigo-400" />
-                <h2 className="text-sm font-bold text-gray-900">Écosystèmes maîtrisés</h2>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {coveredClusters.map((cluster) => (
-                  <ClusterBadge key={cluster} name={cluster} />
-                ))}
-              </div>
-            </SectionCard>
-          )}
-
-          {/* ── Keywords analysis ─────────────────────────────────────────── */}
+          {/* ── Keyword analysis ────────────────────────────────────────── */}
           {(matched.length > 0 || missing.length > 0) && (
             <SectionCard className="px-5 py-4">
-              <h2 className="mb-4 text-sm font-bold text-gray-900">Analyse mots-clés</h2>
+              <h2 className="mb-4 text-sm font-bold text-gray-900">Mots-clés détectés</h2>
 
               {matched.length > 0 && (
                 <div className="mb-4">
@@ -793,38 +906,34 @@ export default function CandidateDetail() {
           )}
         </div>
 
-        {/* ── RIGHT COLUMN ────────────────────────────────────────────────── */}
+        {/* ── RIGHT COLUMN ──────────────────────────────────────────────── */}
         <div className="space-y-6 lg:col-span-2">
 
           {/* AI summary */}
-          {candidate.ai_extracted_data?.summary && (
+          {aiSummary && (
             <SectionCard className="p-6">
               <div className="mb-3 flex items-center gap-2">
                 <Sparkles size={15} className="text-indigo-400" />
                 <h2 className="text-sm font-semibold text-gray-900">Résumé IA</h2>
               </div>
               <p className="whitespace-pre-line text-sm leading-relaxed text-gray-600">
-                {candidate.ai_extracted_data.summary}
+                {aiSummary}
               </p>
             </SectionCard>
           )}
 
-          {/* Raw AI data */}
+          {/* Raw extracted data */}
           <SectionCard className="p-6">
             <div className="mb-4 flex items-center gap-2">
               <FileText size={15} className="text-gray-400" />
-              <h2 className="text-sm font-semibold text-gray-900">
-                Données extraites par l'IA
-              </h2>
+              <h2 className="text-sm font-semibold text-gray-900">Données extraites par l'IA</h2>
             </div>
-            {aiDataWithoutSummary ? (
+            {aiRawDisplay ? (
               <pre className="max-h-125 overflow-auto rounded-2xl border border-gray-100 bg-gray-50 p-4 text-xs leading-relaxed text-gray-700">
-                {JSON.stringify(aiDataWithoutSummary, null, 2)}
+                {JSON.stringify(aiRawDisplay, null, 2)}
               </pre>
             ) : (
-              <p className="text-sm text-gray-400">
-                Aucune donnée structurée disponible.
-              </p>
+              <p className="text-sm text-gray-400">Aucune donnée structurée disponible.</p>
             )}
           </SectionCard>
         </div>
