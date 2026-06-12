@@ -12,13 +12,14 @@ Quand un recruteur uploade un CV, voici ce qui se passe dans l'ordre :
        → Si aucun poste actif : on score via JD synthétique (qualité CV)
     5. On sauvegarde tout dans la base de données
 
-Changelog v2.1:
-- Removed _make_quality_score_result (dead code; used 'extracted' instead of param 'cv_info' → NameError)
-- _quality_fallback moved to top of helpers, above first call site
-- _quality_fallback no longer mutates dimension_scores in-place (copy-on-write)
-- process_cv fallback now passes enriched_cv (with raw_text) instead of bare cv_info
-- Removed unused DOMAIN_SKILLS import
-- _quality_fallback is the single source of truth; drive_sync.py delegates here
+Changelog v2.2:
+- build_candidate_payload: ai_extracted_data now stores enriched_cv (merged
+  with dimension_scores, matched_keywords, reasoning, hierarchy_level, domain,
+  full_details) instead of bare cv_info — this is what made ScorePanel blank
+- _build_score_payload: added missing language_score flat column
+- build_candidate_payload signature: added enriched_cv parameter (the cv_info
+  dict already containing raw_text); cv_info kept for scalar field extraction
+- process_cv: passes enriched_cv to build_candidate_payload
 
 ⚠️ Version simplifiée : pas de Celery, pas de Redis.
    Le traitement se fait en tâche de fond via FastAPI BackgroundTasks.
@@ -193,7 +194,6 @@ def _quality_fallback(extracted: dict) -> dict:
         Projets     : {", ".join(proj_names[:5]) if proj_names else ""}
     """).strip()
 
-    # Ensure the full CV text is available to the scorer
     cv_data  = dict(extracted)
     raw_text = extracted.get("raw_text") or extracted.get("full_text") or ""
     if raw_text:
@@ -222,8 +222,8 @@ def _quality_fallback(extracted: dict) -> dict:
 def _build_score_payload(score_result: dict) -> dict:
     """
     Build the DB-safe scoring columns from a score_result dict.
-    dimension_scores (jsonb) carries the full breakdown.
-    Flat columns are kept for indexed queries and the ScorePanel frontend aliases.
+    dimension_scores (jsonb) carries the full breakdown for the frontend.
+    Flat alias columns are kept for indexed queries and ScorePanel.jsx source D.
     """
     dims = score_result.get("dimension_scores", {})
     return {
@@ -233,15 +233,43 @@ def _build_score_payload(score_result: dict) -> dict:
         "score_reasoning":  score_result.get("reasoning", ""),
         "matched_keywords": score_result.get("matched_keywords", []),
         "missing_keywords": score_result.get("missing_keywords", []),
-        # Flat columns for indexed queries / ScorePanel.jsx
+        # Flat alias columns (ScorePanel source D / indexed ORDER BY)
         "keyword_score":            dims.get("keyword_score"),
-        "experience_score":         dims.get("experience_score"),
         "semantic_score":           dims.get("semantic_score"),
+        "experience_score":         dims.get("experience_score"),
         "project_complexity_score": dims.get("project_complexity_score"),
         "education_score":          dims.get("education_score"),
         "certification_score":      dims.get("certification_score"),
         "leadership_score":         dims.get("leadership_score"),
+        "language_score":           dims.get("language_score"),   # ← was missing
     }
+
+
+def _enrich_ai_data(cv_info: dict, score_result: dict) -> dict:
+    """
+    Merge scoring metadata into the CV extraction dict before storing as
+    ai_extracted_data. This is what makes ScorePanel source A work:
+    aiData.dimension_scores will be populated.
+
+    raw_text / full_text are stripped — they're already in cv_raw_text column
+    and would bloat ai_extracted_data unnecessarily.
+    """
+    dims = score_result.get("dimension_scores", {})
+    enriched = {
+        **cv_info,
+        # Scoring fields merged into the blob for frontend fallback chains
+        "dimension_scores": dims,
+        "matched_keywords": score_result.get("matched_keywords", []),
+        "missing_keywords": score_result.get("missing_keywords", []),
+        "score_reasoning":  score_result.get("reasoning", ""),
+        "hierarchy_level":  score_result.get("hierarchy_level"),
+        "domain":           score_result.get("domain"),
+        "full_details":     score_result.get("full_details", {}),
+    }
+    # Keep ai_extracted_data lean — raw text lives in cv_raw_text column
+    enriched.pop("raw_text",  None)
+    enriched.pop("full_text", None)
+    return enriched
 
 
 # ============================================================================
@@ -298,13 +326,14 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         # Fallback: no job linked and no active jobs
         if not score_result:
             logger.info("Aucun job actif → quality fallback")
-            # Pass enriched_cv so the fallback scorer has raw_text available
             score_result = _quality_fallback(enriched_cv)
 
-        # Persist
+        # Persist — pass enriched_cv so build_candidate_payload can merge
+        # dimension_scores into ai_extracted_data (the ScorePanel fix)
         payload = build_candidate_payload(
             raw_text=raw_text,
             cv_info=cv_info,
+            enriched_cv=enriched_cv,
             score_result=score_result,
             job_id=job_id,
         )
@@ -335,7 +364,6 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
     """
     logger.info("compute_best_job_match: %d jobs to evaluate", len(jobs))
 
-    # Classify the candidate's domain once
     candidate_position = cv_data.get("current_position", "")
     candidate_domain   = classify_domain(candidate_position)
 
@@ -352,10 +380,9 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
             )
             s = result.get("score", 0)
 
-            # Penalize cross-domain mismatches
             job_domain = classify_domain(job.get("title", ""))
             if job_domain != candidate_domain:
-                s *= 0.70   # 30% penalty for domain mismatch
+                s *= 0.70
                 logger.info(
                     "  Domain mismatch: candidate=%s job=%s → penalized score=%.1f",
                     candidate_domain, job_domain, s
@@ -374,8 +401,6 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
         except Exception as exc:
             logger.error("Erreur scoring poste %s : %s", job.get("id"), exc)
 
-    # If best match is still a domain mismatch after penalty, don't assign a job —
-    # use quality fallback instead so the candidate isn't wrongly categorized
     if best_job_id:
         best_job_domain = classify_domain(
             next((j.get("title","") for j in jobs if j.get("id") == best_job_id), "")
@@ -385,7 +410,7 @@ def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
                 "Best match is cross-domain and low score (%.1f) → falling back to quality score",
                 best_score
             )
-            return None, None   # caller will trigger _quality_fallback
+            return None, None
 
     logger.info("Best match: job_id=%s score=%.1f", best_job_id, best_score)
     return best_result, best_job_id
@@ -395,15 +420,26 @@ def build_candidate_payload(
     raw_text    : str,
     cv_info     : dict,
     score_result: dict,
-    job_id      : str | None = None,
+    enriched_cv : dict | None = None,
+    job_id      : str | None  = None,
 ) -> dict:
     """
     Construit le dictionnaire complet à insérer/mettre à jour en base.
     Utilisé par process_cv et drive_sync.py.
+
+    enriched_cv: cv_info already merged with raw_text (from _enrich_cv_data).
+    When provided, dimension_scores and scoring metadata are merged into
+    ai_extracted_data so ScorePanel.jsx source A resolves correctly.
+    Falls back to bare cv_info for callers that haven't been updated yet.
     """
+    # Build ai_extracted_data: merge scoring metadata into the CV blob
+    # so ScorePanel can find dimension_scores at aiData.dimension_scores
+    base_cv = enriched_cv if enriched_cv is not None else cv_info
+    ai_data = sanitize_ai_data(_enrich_ai_data(base_cv, score_result))
+
     payload = {
         "cv_raw_text":       raw_text[:MAX_TEXT_LENGTH],
-        "ai_extracted_data": sanitize_ai_data(cv_info),
+        "ai_extracted_data": ai_data,            # ← now contains dimension_scores
 
         "full_name": ensure_string(cv_info.get("full_name")),
         "email":     ensure_string(cv_info.get("email")),
