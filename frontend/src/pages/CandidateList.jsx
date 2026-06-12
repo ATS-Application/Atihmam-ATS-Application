@@ -253,7 +253,11 @@ export default function CandidateList() {
                 return (
                   <tr
                     key={c.id}
-                    onClick={() => navigate(`/candidates/${c.id}`)}
+                    onClick={() =>
+                      navigate(`/candidates/${c.id}`, {
+                        state: { candidateIds: filtered.map((x) => x.id) },
+                      })
+                    }
                     className={`cursor-pointer transition-colors hover:bg-gray-50 ${
                       isTop5 ? "bg-green-50/60" : ""
                     }`}

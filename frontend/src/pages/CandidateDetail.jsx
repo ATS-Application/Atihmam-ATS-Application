@@ -1,8 +1,10 @@
 // frontend/src/pages/CandidateDetail.jsx
-import { useState, useMemo, useEffect } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useState, useMemo, useEffect, useCallback } from "react";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import {
   ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
   ExternalLink,
   GitBranch,
   Mail,
@@ -23,13 +25,14 @@ import {
   ThumbsUp,
   ThumbsDown,
   Layers,
+  Trash2,
 } from "lucide-react";
 
 import toast from "react-hot-toast";
 import axiosClient from "../api/axiosClient";
 // import { useAuthStore } from "../store/authStore";
 import { useOpenCV } from "../hooks/useOpenCV";
-import { useCandidateWithPolling } from "../hooks/useCandidates";
+import { useCandidateWithPolling, useDeleteCandidate } from "../hooks/useCandidates";
 import { useJobs } from "../hooks/useJobs";
 import StatusBadge from "../components/StatusBadge";
 import ScoreBadge from "../components/ScoreBadge";
@@ -81,17 +84,17 @@ const DIMENSIONS = [
     description: "Progression académique et niveau d'études",
   },
   {
-  key: "certification_score",
-  label: "Certifications",
-  icon: CheckCircle2,     // already imported
-  accent: "#f59e0b",
-  track: "#fffbeb",
-  description: "Certifications professionnelles détectées",
+    key: "certification_score",
+    label: "Certifications",
+    icon: CheckCircle2,
+    accent: "#f59e0b",
+    track: "#fffbeb",
+    description: "Certifications professionnelles détectées",
   },
   {
     key: "leadership_score",
     label: "Leadership",
-    icon: TrendingUp,       // already imported, or swap for another
+    icon: TrendingUp,
     accent: "#6366f1",
     track: "#eef2ff",
     description: "Capacités d'encadrement et de management détectées",
@@ -358,9 +361,11 @@ function StatusState({ icon: Icon, iconClass, title, subtitle }) {
 export default function CandidateDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
 
   // ── ALL hooks at the top — no exceptions ──────────────────────────────────
   const [showTransition, setShowTransition] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [feedbackSent, setFeedbackSent] = useState(null);
   const [loadingFeedback, setLoadingFeedback] = useState(false);
   const { openCV, isOpeningCV } = useOpenCV();
@@ -369,14 +374,42 @@ export default function CandidateDetail() {
     pollUntilScored: true,
   });
 
-  const { data: jobs = [] } = useJobs();  // ← moved up
+  const { data: jobs = [] } = useJobs();
 
-  useEffect(() => {                        // ← moved up
+  const { mutate: deleteCandidate, isPending: isDeleting } = useDeleteCandidate();
+
+  // Ordered list of candidate IDs passed from CandidateList for prev/next nav.
+  const candidateIds = location.state?.candidateIds ?? null;
+  const currentIndex = candidateIds ? candidateIds.indexOf(id) : -1;
+  const prevId = candidateIds && currentIndex > 0 ? candidateIds[currentIndex - 1] : null;
+  const nextId =
+    candidateIds && currentIndex >= 0 && currentIndex < candidateIds.length - 1
+      ? candidateIds[currentIndex + 1]
+      : null;
+
+  const goTo = useCallback(
+    (targetId) => {
+      if (!targetId) return;
+      navigate(`/candidates/${targetId}`, { state: { candidateIds } });
+    },
+    [navigate, candidateIds]
+  );
+
+  useEffect(() => {
     setFeedbackSent(null);
     setLoadingFeedback(false);
   }, [candidate?.id]);
 
-  const linkedJob = useMemo(() => {        // ← moved up
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (e.key === "ArrowLeft" && prevId) goTo(prevId);
+      if (e.key === "ArrowRight" && nextId) goTo(nextId);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [prevId, nextId, goTo]);
+
+  const linkedJob = useMemo(() => {
     if (!candidate?.job_id) return null;
     return jobs.find((j) => j.id === candidate.job_id) ?? null;
   }, [jobs, candidate]);
@@ -456,7 +489,6 @@ export default function CandidateDetail() {
     ? `${candidate.experience_years} an${candidate.experience_years > 1 ? "s" : ""}`
     : null;
 
-
   // ── Actions ─────────────────────────────────────────────────────────────────
 
   async function sendFeedback(type) {
@@ -474,36 +506,74 @@ export default function CandidateDetail() {
     }
   }
 
-  // ── Loading / empty states ──────────────────────────────────────────────────
-
-  if (isLoading) {
-    return (
-      <div className="flex h-full items-center justify-center p-10">
-        <p className="animate-pulse text-sm text-gray-400">Chargement du candidat...</p>
-      </div>
-    );
-  }
-
-  if (!candidate) {
-    return (
-      <div className="flex h-full items-center justify-center p-10">
-        <p className="text-sm text-gray-400">Candidat introuvable</p>
-      </div>
-    );
+  function confirmDelete() {
+    deleteCandidate(candidate.id, {
+      onSuccess: () => {
+        setShowDeleteModal(false);
+        if (nextId) goTo(nextId);
+        else if (prevId) goTo(prevId);
+        else navigate("/candidates");
+      },
+      onError: (err) => {
+        console.error("[CandidateDetail] delete error:", err);
+        toast.error("Erreur lors de la suppression du candidat");
+        setShowDeleteModal(false);
+      },
+    });
   }
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
     <div className="mx-auto max-w-6xl p-6 lg:p-8">
-      {/* Back button */}
-      <button
-        onClick={() => navigate(-1)}
-        className="mb-6 flex items-center gap-2 text-sm text-gray-500 transition-colors hover:text-gray-900"
-      >
-        <ArrowLeft size={16} />
-        Retour
-      </button>
+      {/* Top bar: back / prev / next / delete */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <button
+          onClick={() => navigate(-1)}
+          className="flex items-center gap-2 text-sm text-gray-500 transition-colors hover:text-gray-900"
+        >
+          <ArrowLeft size={16} />
+          Retour
+        </button>
+
+        <div className="flex items-center gap-2">
+          {candidateIds && (
+            <>
+              <button
+                onClick={() => goTo(prevId)}
+                disabled={!prevId}
+                title="Candidat précédent (←)"
+                className="flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-700 transition-all hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <ChevronLeft size={14} />
+                Précédent
+              </button>
+
+              <span className="px-2 text-xs text-gray-400 tabular-nums">
+                {currentIndex + 1} / {candidateIds.length}
+              </span>
+
+              <button
+                onClick={() => goTo(nextId)}
+                disabled={!nextId}
+                title="Candidat suivant (→)"
+                className="flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-3 py-2 text-xs font-medium text-gray-700 transition-all hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Suivant
+                <ChevronRight size={14} />
+              </button>
+            </>
+          )}
+
+          <button
+            onClick={() => setShowDeleteModal(true)}
+            className="flex items-center gap-2 rounded-full border border-red-200 bg-white px-4 py-2 text-xs font-medium text-red-600 transition-all hover:border-red-300 hover:bg-red-50"
+          >
+            <Trash2 size={14} />
+            Supprimer
+          </button>
+        </div>
+      </div>
 
       {/* ── Header card ─────────────────────────────────────────────────────── */}
       <div className="mb-6 rounded-3xl border border-gray-200 bg-white p-6 shadow-sm">
@@ -766,6 +836,43 @@ export default function CandidateDetail() {
           candidate={candidate}
           onClose={() => setShowTransition(false)}
         />
+      )}
+
+      {/* Delete confirmation modal */}
+      {showDeleteModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+          onClick={() => !isDeleting && setShowDeleteModal(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-xl border border-gray-200 bg-white p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="mb-1 text-sm font-semibold text-gray-900">
+              Supprimer le candidat
+            </h2>
+            <p className="mb-6 text-xs text-gray-500">
+              <span className="font-medium text-gray-700">{candidate.full_name}</span>
+              {" "}sera définitivement supprimé. Cette action est irréversible.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowDeleteModal(false)}
+                disabled={isDeleting}
+                className="h-9 flex-1 rounded-lg border border-gray-200 bg-white text-xs font-medium text-gray-600 transition-colors hover:bg-gray-50 disabled:opacity-50"
+              >
+                Annuler
+              </button>
+              <button
+                onClick={confirmDelete}
+                disabled={isDeleting}
+                className="h-9 flex-1 rounded-lg bg-red-600 text-xs font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
+              >
+                {isDeleting ? "Suppression…" : "Supprimer"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
