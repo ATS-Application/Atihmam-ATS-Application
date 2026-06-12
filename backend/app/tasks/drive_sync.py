@@ -93,8 +93,11 @@ def safe_extract_text(pdf_bytes: bytes, file_name: str) -> str:
 
 def sanitize_filename(filename: str) -> str:
     name, ext = os.path.splitext(filename)
-    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "", name.replace(" ", "_"))
-    return f"{cleaned}{ext}"
+    cleaned_name = re.sub(r"[^a-zA-Z0-9_.-]", "", name.replace(" ", "_"))
+    cleaned_ext = re.sub(r"[^a-zA-Z0-9.]", "", ext)
+    if cleaned_ext.lower() != ".pdf":
+        cleaned_ext = ".pdf"
+    return f"{cleaned_name}{cleaned_ext}"
 
 
 def candidate_exists(supabase, drive_file_id: str) -> bool:
