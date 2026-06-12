@@ -205,7 +205,9 @@ const CLASSIFICATION_RULES = [
       "acheteur", "achats", "purchasing", "procurement",
       "approvisionneur", "approvisionnement",
       "supply chain manager", "gestionnaire achats",
-      "responsable achats",
+      "responsable achats","directeur achats", "buyer",
+      "category manager", "gestionnaire de catégorie",
+      "planificateur supply chain", "demand planner","Responsable d'Achats","Responsable des Achats"
     ],
   },
 
