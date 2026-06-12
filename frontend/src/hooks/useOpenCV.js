@@ -17,17 +17,18 @@ export function useOpenCV() {
 
     setIsOpeningCV(true);
     
-    // 1. Identify the base storage URL for your Supabase project
-    const BASE_URL = "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/";
+    // Ensure the path is clean and prepended with your Supabase storage URL
+    const BASE_STORAGE_URL = "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/";
     
-    // 2. Construct the absolute URL
-    // If it already starts with 'http', use it as-is. 
-    // Otherwise, prepend the base URL and ensure no double slashes.
-    const cleanPath = cvFileUrl.startsWith('/') ? cvFileUrl.substring(1) : cvFileUrl;
-    const finalUrl = cvFileUrl.startsWith('http') ? cvFileUrl : `${BASE_URL}${cleanPath}`;
+    // If the path already has a leading slash, remove it so it doesn't duplicate
+    const path = cvFileUrl.startsWith('/') ? cvFileUrl.substring(1) : cvFileUrl;
+    
+    const finalUrl = cvFileUrl.startsWith('http') 
+        ? cvFileUrl 
+        : `${BASE_STORAGE_URL}${path}`;
 
     try {
-      // 3. Open in a new window/tab as an external resource
+      // By using an absolute URL, the browser treats this as an external file
       window.open(finalUrl, "_blank", "noopener,noreferrer");
     } catch (e) {
       console.error("Failed to open CV:", e);
