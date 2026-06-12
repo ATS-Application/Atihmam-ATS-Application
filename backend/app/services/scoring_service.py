@@ -1167,6 +1167,21 @@ def _build_cv_text(cv_data: dict) -> str:
         parts.append(str(lang))
     return " ".join(filter(None, parts))
 
+def enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
+    """
+    Injects raw_text into cv_data so compute_candidate_score has the full CV
+    body for scoring. Without this, keyword/semantic/education/certification
+    scorers receive empty text (or the sparse _build_cv_text reconstruction)
+    and return artificially low/zero scores.
+
+    Canonical home for this helper — cv_processing.py and drive_sync.py both
+    import from here to avoid the divergence that caused Drive-synced
+    candidates to score off thin text (see backfill_now.py).
+    """
+    enriched = dict(cv_info)
+    enriched["raw_text"] = raw_text
+    return enriched
+
 
 def compute_candidate_score(
     cv_data: Dict[str, Any],
@@ -1357,6 +1372,7 @@ __all__ = [
     "batch_score",
     "rank_candidates",
     "update_weights_from_feedback",
+    "enrich_cv_data",
     "Domain",
     "HierarchyLevel",
     "HierarchyProfile",

@@ -41,6 +41,7 @@ from app.services.scoring_service import (
     compute_candidate_score,
     classify_domain,
     Domain,
+    enrich_cv_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ logger = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH  = 50_000
 MAX_AI_DATA_SIZE = 100_000
+
+DOMAIN_MISMATCH_PENALTY = 0.70   # multiplier applied when candidate ≠ job domain
+MIN_SCORE_TO_ASSIGN_JOB = 50.0   # below this (after penalty) →
 
 PERMANENT_ERRORS = (
     ValueError,
@@ -158,9 +162,8 @@ def _enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
     body for scoring. Without this, keyword/semantic/education/certifications
     scorers receive empty text and return zero.
     """
-    enriched = dict(cv_info)
-    enriched["raw_text"] = raw_text
-    return enriched
+    
+    return enrich_cv_data(cv_info, raw_text)
 
 
 def _quality_fallback(extracted: dict) -> dict:
@@ -299,7 +302,7 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         cv_info = extract_cv_info(raw_text)
 
         # Enrich with raw_text so all scorer dimensions have the full CV body
-        enriched_cv = _enrich_cv_data(cv_info, raw_text)
+        enriched_cv = enrich_cv_data(cv_info, raw_text)
 
         # === SCORING ===
         score_result = None

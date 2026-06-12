@@ -39,7 +39,7 @@ from app.services.drive_service import (
     list_new_pdf_files_since,
     list_pdf_files,
 )
-from app.services.scoring_service import classify_domain, compute_candidate_score
+from app.services.scoring_service import classify_domain, compute_candidate_score, enrich_cv_data
 from app.tasks.cv_processing import (
     build_candidate_payload,
     compute_best_job_match,
@@ -271,7 +271,7 @@ def process_drive_file(
             }
 
         # 5. AI extraction
-        extracted = _enrich_cv_data(extracted, raw_text)
+        extracted = enrich_cv_data(extracted, raw_text)
 
         # 6. Scoring
         score_result, resolved_job_id = resolve_candidate_score(
