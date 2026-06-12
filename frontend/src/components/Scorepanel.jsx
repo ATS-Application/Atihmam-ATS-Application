@@ -26,6 +26,12 @@ import { useOpenCV } from "../hooks/useOpenCV";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
+//
+// Keys here MUST match the "frontend aliases" block in
+// scoring_service.compute_candidate_score()'s `dimension_scores` dict:
+//   keyword_score, semantic_score, experience_score,
+//   project_complexity_score, education_score,
+//   certification_score, leadership_score, language_score
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DIMENSIONS = [
@@ -35,7 +41,7 @@ const DIMENSIONS = [
     icon: Target,
     accent: "#f97316",
     track: "#fff7ed",
-    description: "Correspondance sémantique avec la fiche de poste",
+    description: "Correspondance des mots-clés requis par la fiche de poste",
   },
   {
     key: "semantic_score",
@@ -43,7 +49,7 @@ const DIMENSIONS = [
     icon: Zap,
     accent: "#8b5cf6",
     track: "#f5f3ff",
-    description: "Profondeur réelle des compétences et technologies détectées",
+    description: "Recouvrement sémantique (Jaccard + compétences du domaine) avec la fiche de poste",
   },
   {
     key: "experience_score",
@@ -51,15 +57,15 @@ const DIMENSIONS = [
     icon: Briefcase,
     accent: "#3b82f6",
     track: "#eff6ff",
-    description: "Années d'expérience professionnelle détectées",
+    description: "Années d'expérience détectées vs. requises pour le niveau hiérarchique",
   },
   {
     key: "project_complexity_score",
-    label: "Projets",
+    label: "Complexité / Projets",
     icon: FolderOpen,
     accent: "#10b981",
     track: "#ecfdf5",
-    description: "Complexité et diversité des projets réalisés",
+    description: "Diversité des domaines couverts et maîtrise des compétences du domaine principal",
   },
   {
     key: "education_score",
@@ -67,7 +73,7 @@ const DIMENSIONS = [
     icon: TrendingUp,
     accent: "#ec4899",
     track: "#fdf2f8",
-    description: "Progression académique et niveau d'études",
+    description: "Niveau d'études détecté vs. niveau requis pour le poste",
   },
   {
     key: "certification_score",
@@ -75,7 +81,7 @@ const DIMENSIONS = [
     icon: CheckCircle2,
     accent: "#f59e0b",
     track: "#fffbeb",
-    description: "Certifications professionnelles détectées (AWS, Scrum, Oracle…)",
+    description: "Certifications professionnelles reconnues détectées dans le CV",
   },
   {
     key: "leadership_score",
@@ -83,7 +89,15 @@ const DIMENSIONS = [
     icon: TrendingUp,
     accent: "#6366f1",
     track: "#eef2ff",
-    description: "Capacités d'encadrement et de management détectées",
+    description: "Verbes d'action de management et historique de postes à responsabilité",
+  },
+  {
+    key: "language_score",
+    label: "Qualité linguistique",
+    icon: Brain,
+    accent: "#0ea5e9",
+    track: "#f0f9ff",
+    description: "Richesse lexicale, structure et longueur du CV",
   },
 ];
 
@@ -150,8 +164,10 @@ function safeParseArray(value) {
 }
 
 /**
- * Normalize score_confidence to a 0–100 integer.
- * Backend may return a decimal (0.85) or a percentage (85).
+ * Normalize a confidence/score value to a 0–100 integer.
+ * compute_candidate_score() returns "confidence" already as a 0-100 float
+ * (round(final_score * 100, 2)), but be defensive in case an older record
+ * stored a 0-1 decimal.
  */
 function normalizeConfidence(value) {
   if (value == null) return null;
@@ -162,6 +178,25 @@ function normalizeConfidence(value) {
 
 function clamp(n) {
   return Math.max(0, Math.min(100, Math.round(n ?? 0)));
+}
+
+/**
+ * Each DIMENSIONS[].key maps 1:1 onto a key inside dimension_scores
+ * (the frontend-alias block of compute_candidate_score). Those values
+ * are already 0-100 floats (dims["xxx"] from score_to_dict * ... no —
+ * they come straight from CandidateScore.score_* which are 0-1, scaled
+ * by *100 happens only for "score"/"confidence" at the top level).
+ *
+ * NOTE: score_to_dict()'s "dimensions" block (and therefore
+ * dimension_scores' canonical + alias keys) are 0-1 floats, NOT 0-100.
+ * So every dimension value here still needs *100 scaling.
+ */
+function normalizeDimensionValue(value) {
+  let num = parseFloat(value);
+  if (isNaN(num)) return 0;
+  if (num > 100) num = 100;
+  if (num <= 1.0) num = num * 100;
+  return Math.round(num);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,7 +256,6 @@ function ScoreRing({ score }) {
 
 function DimensionRow({ dimension, score }) {
   const { label, icon: Icon, accent, track, description } = dimension;
-  // score is already normalized to 0–100 by the dims useMemo
   const pct = clamp(score ?? 0);
   const [showTip, setShowTip] = useState(false);
 
@@ -319,7 +353,11 @@ export default function ScorePanel({ candidate }) {
 
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
-  const dims = useMemo(() => {
+  // dimension_scores is the single source of truth produced by
+  // compute_candidate_score() — it already contains both the canonical
+  // v2.1 keys (experience, education, ...) AND the frontend alias keys
+  // (experience_score, education_score, ...) that DIMENSIONS references.
+  const dimensionScores = useMemo(() => {
     let raw = candidate?.dimension_scores ?? aiData?.dimension_scores;
 
     if (typeof raw === "string") {
@@ -329,29 +367,18 @@ export default function ScorePanel({ candidate }) {
         raw = {};
       }
     }
-    if (typeof raw !== "object" || Array.isArray(raw)) raw = {};
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) raw = {};
 
-    const merged = {
-      keyword_score: candidate?.keyword_score ?? aiData?.keyword_score ?? raw.keyword_score,
-      semantic_score: candidate?.semantic_score ?? aiData?.semantic_score ?? raw.semantic_score,
-      experience_score: candidate?.experience_score ?? aiData?.experience_score ?? raw.experience_score,
-      project_complexity_score: candidate?.project_complexity_score ?? raw.project_complexity_score,
-      education_score: candidate?.education_score ?? raw.education_score,
-      certification_score: candidate?.certification_score ?? raw.certification_score,
-      leadership_score: candidate?.leadership_score ?? raw.leadership_score,
-      ...raw,
-    };
+    return raw;
+  }, [candidate, aiData]);
 
-    // Smart normalization: detect scale automatically (decimal 0–1 vs integer 0–100)
-    return Object.fromEntries(
-      Object.entries(merged).map(([key, value]) => {
-        let num = parseFloat(value) || 0;
-        if (num > 100) num = 100;
-        if (num <= 1.0) num = num * 100;
-        return [key, Math.round(num)]; // fixed: was `round(num)` in v2
-      })
-    );
-  }, [candidate, aiData]); // fixed: closing was misplaced in v2
+  const dims = useMemo(() => {
+    const result = {};
+    for (const { key } of DIMENSIONS) {
+      result[key] = normalizeDimensionValue(dimensionScores[key]);
+    }
+    return result;
+  }, [dimensionScores]);
 
   const matched = useMemo(
     () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
@@ -374,14 +401,26 @@ export default function ScorePanel({ candidate }) {
     );
   }, [candidate, aiData]);
 
+  // compute_candidate_score() returns "score" and "confidence" (both
+  // already 0-100). It does NOT return "score_confidence" or
+  // "score_reasoning" — if your API layer renames these before persisting,
+  // keep those aliases too; otherwise fall back to the raw field names.
   const score = candidate?.score ?? aiData?.score ?? null;
   const confidence = normalizeConfidence(
-    candidate?.score_confidence ?? aiData?.score_confidence
+    candidate?.score_confidence ??
+      aiData?.score_confidence ??
+      candidate?.confidence ??
+      aiData?.confidence
   );
-  const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
+  const reasoning =
+    candidate?.score_reasoning ??
+    aiData?.score_reasoning ??
+    candidate?.reasoning ??
+    aiData?.reasoning ??
+    null;
   const processingStatus = candidate?.processing_status ?? null;
 
-  const hasData = Object.keys(dims).length > 3;
+  const hasData = Object.values(dims).some((v) => v > 0);
   const isPending = processingStatus === "queued";
   const isProcessing = processingStatus === "processing";
   const isFailed = processingStatus === "failed";
