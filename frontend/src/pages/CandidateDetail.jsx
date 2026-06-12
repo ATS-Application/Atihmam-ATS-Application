@@ -464,31 +464,71 @@ export default function CandidateDetail() {
   const aiData = useMemo(() => safeParse(candidate?.ai_extracted_data), [candidate]);
 
   // ── Dimension scores ───────────────────────────────────────────────────────
-  // Priority: candidate row direct fields → ai_extracted_data.dimension_scores
-  // The compat shim stores both canonical keys AND frontend alias keys in
-  // dimension_scores, so we read the canonical key first, then the alias.
+  // The scoring result from compute_candidate_score() can land in several
+  // places depending on which code path wrote it:
+  //
+  //   A) ai_extracted_data.dimension_scores  — compat shim result merged into CV data
+  //   B) ai_extracted_data.full_details.dimensions — score_to_dict() nested result
+  //   C) candidate.<alias_col>  — direct DB columns (keyword_score, semantic_score…)
+  //   D) candidate.dimension_scores — a dedicated JSONB column
+  //
+  // We try all four sources and take the first non-null value per dimension.
   const dims = useMemo(() => {
-    // dimension_scores from ai_extracted_data (set by compute_candidate_score)
-    let stored = aiData?.dimension_scores ?? {};
-    if (typeof stored === "string") {
-      try { stored = JSON.parse(stored); } catch { stored = {}; }
-    }
-    if (typeof stored !== "object" || Array.isArray(stored)) stored = {};
+    // Source A: dimension_scores nested in ai_extracted_data
+    const parseObj = (v) => {
+      if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+      return v;
+    };
+    const srcA = parseObj(
+      typeof aiData?.dimension_scores === "string"
+        ? (() => { try { return JSON.parse(aiData.dimension_scores); } catch { return {}; } })()
+        : aiData?.dimension_scores
+    );
+
+    // Source B: score_to_dict().dimensions inside full_details
+    const srcB = parseObj(aiData?.full_details?.dimensions);
+
+    // Source C/D: candidate row — either a dimension_scores JSONB column or
+    //             individual alias columns like keyword_score, semantic_score…
+    const srcCD = parseObj(
+      typeof candidate?.dimension_scores === "string"
+        ? (() => { try { return JSON.parse(candidate.dimension_scores); } catch { return {}; } })()
+        : candidate?.dimension_scores
+    );
 
     const resolved = {};
     for (const dim of DIMENSIONS) {
       const v =
-        // 1. canonical key in dimension_scores
-        stored[dim.key] ??
-        // 2. alias key in dimension_scores
-        stored[dim.alias] ??
-        // 3. alias stored directly on the candidate row (legacy)
+        // A: canonical key in ai_extracted_data.dimension_scores
+        srcA[dim.key] ??
+        // A: alias key in ai_extracted_data.dimension_scores
+        srcA[dim.alias] ??
+        // B: canonical key in full_details.dimensions (score_to_dict format)
+        srcB[dim.key] ??
+        // C/D: canonical key in candidate.dimension_scores column
+        srcCD[dim.key] ??
+        // C/D: alias key in candidate.dimension_scores column
+        srcCD[dim.alias] ??
+        // E: alias stored as a direct top-level column on the candidate row
         candidate?.[dim.alias] ??
         null;
       resolved[dim.key] = v;
     }
     return resolved;
   }, [candidate, aiData]);
+
+  // DEV — uncomment to diagnose a blank score panel:
+  // useEffect(() => {
+  //   if (!candidate) return;
+  //   console.group("[CandidateDetail] dim resolution");
+  //   console.log("aiData keys:", Object.keys(aiData ?? {}));
+  //   console.log("aiData.dimension_scores:", aiData?.dimension_scores);
+  //   console.log("aiData.full_details?.dimensions:", aiData?.full_details?.dimensions);
+  //   console.log("candidate.dimension_scores:", candidate?.dimension_scores);
+  //   console.log("candidate.keyword_score:", candidate?.keyword_score);
+  //   console.log("resolved dims:", dims);
+  //   console.groupEnd();
+  // }, [candidate, aiData, dims]);
 
   // True when at least 4 dimensions have a non-null score
   const hasData = useMemo(
