@@ -2,7 +2,6 @@
 
 """
 Advanced Analytics API for ATS Platform
-Integrated with feedback weight-learning loop.
 """
 
 import time
@@ -30,8 +29,8 @@ from app.services.intelligent_scoring_service import (
     load_recruiter_preferences,
     normalize_text,
 )
-from app.services.scoring_service import DEFAULT_WEIGHTS
 from app.services.keyword_matching_service import KeywordMatchingService
+from app.services.scoring_service import INTELLIGENT_SCORE_DEFAULT_WEIGHTS
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"], redirect_slashes=False)
 
@@ -56,8 +55,11 @@ class RescoreAllRequest(BaseModel):
 
 def _retry_on_disconnect(fn, *args, **kwargs):
     """
-    Call fn(*args, **kwargs), retrying up to _MAX_RETRIES times
-    on RemoteProtocolError (HTTP/2 idle-timeout disconnect).
+    Call fn(*args, **kwargs), recreating the Supabase client and
+    retrying up to _MAX_RETRIES times on RemoteProtocolError.
+
+    Returns (result, fresh_client_or_None).
+    The caller is responsible for threading a fresh client back if needed.
     """
     last_exc = None
     for attempt in range(_MAX_RETRIES):
@@ -82,14 +84,16 @@ class CandidateRepository:
     HTTP/2 idle-timeout disconnect.
     """
 
+    # ----------------------------------------------------------
+    # Internal: always get a live client
+    # ----------------------------------------------------------
     @staticmethod
     def _client():
         return get_supabase_admin()
 
     # ----------------------------------------------------------
-    # Candidates
+    # Public API
     # ----------------------------------------------------------
-
     def get_candidate(self, candidate_id: UUID) -> dict:
         def _call():
             response = (
@@ -142,10 +146,6 @@ class CandidateRepository:
         return _retry_on_disconnect(_call)
 
     def update_candidate_score(self, candidate_id: str, score_data: dict) -> None:
-        """
-        Persists score, reasoning, matched keywords, AND dimension_scores so that
-        the feedback router can read them back for weight-learning.
-        """
         def _call():
             (
                 self._client()
@@ -155,8 +155,7 @@ class CandidateRepository:
                         "score": score_data["score"],
                         "score_reasoning": score_data["reasoning"],
                         "matched_keywords": score_data["matched_keywords"],
-                        # Store breakdown so feedback.py can pick it up
-                        "dimension_scores": score_data.get("score_breakdown", {}),
+                        "dimension_scores": score_data["score_breakdown"],
                     }
                 )
                 .eq("id", candidate_id)
@@ -166,35 +165,58 @@ class CandidateRepository:
         _retry_on_disconnect(_call)
 
     def load_preferences(self) -> dict:
+        """Thin wrapper so AnalyticsService doesn't hold a raw client reference."""
         return load_recruiter_preferences(self._client())
 
-    # ----------------------------------------------------------
-    # Feedback weights  (mirrors feedback.py helpers so analytics
-    # can read the live trained weights before scoring)
-    # ----------------------------------------------------------
-
-    def load_scoring_weights(self) -> dict:
+    def load_ats_weights(self) -> dict | None:
         """
-        Returns the recruiter-trained weights from app_config, falling back to
-        DEFAULT_WEIGHTS if none have been saved yet.
+        Returns the learned weight vector for compute_intelligent_score's
+        6-dimension score_breakdown (skill_match, experience, project_complexity,
+        seniority, domain_diversity, career_progression), or None if not yet
+        calibrated, unreadable, or stored under an incompatible schema.
+
+        When None, compute_intelligent_score falls back to
+        INTELLIGENT_SCORE_DEFAULT_WEIGHTS internally.
         """
         def _call():
-            try:
-                resp = (
-                    self._client()
-                    .table("app_config")
-                    .select("value")
-                    .eq("key", "ats_weights")
-                    .single()
-                    .execute()
-                )
-                if resp.data:
-                    return resp.data["value"]
-            except Exception:
-                pass
-            return dict(DEFAULT_WEIGHTS)
+            response = (
+                self._client()
+                .table("app_config")
+                .select("value")
+                .eq("key", "ats_weights")
+                .single()
+                .execute()
+            )
+            return response.data["value"] if response.data else None
 
-        return _retry_on_disconnect(_call)
+        try:
+            stored = _retry_on_disconnect(_call)
+        except Exception:
+            return None
+
+        if isinstance(stored, dict) and set(stored.keys()) == set(INTELLIGENT_SCORE_DEFAULT_WEIGHTS.keys()):
+            return stored
+        return None
+
+    def count_feedback(self) -> dict:
+        """Returns like/dislike counts for the feedback summary panel."""
+        def _call():
+            response = (
+                self._client()
+                .table("candidate_feedback")
+                .select("feedback")
+                .execute()
+            )
+            return response.data or []
+
+        try:
+            rows = _retry_on_disconnect(_call)
+        except Exception:
+            rows = []
+
+        likes = sum(1 for r in rows if r.get("feedback") == "like")
+        dislikes = sum(1 for r in rows if r.get("feedback") == "dislike")
+        return {"likes": likes, "dislikes": dislikes, "total": len(rows)}
 
 
 # ============================================================
@@ -205,20 +227,20 @@ class CandidateRepository:
 class AnalyticsService:
     def __init__(self):
         self.repo = CandidateRepository()
-
-        # Recruiter learned preferences (hired-candidate patterns)
+        # Preferences loaded via repo so it uses a fresh client too.
         try:
             self.preferences = self.repo.load_preferences()
         except Exception as exc:
             print(f"[PREFERENCES] Could not load recruiter preferences: {exc}")
             self.preferences = {}
 
-        # Live trained weights from feedback loop
+        # Learned weights from feedback — None means "use defaults"
+        # (compute_intelligent_score handles the None case internally).
         try:
-            self.scoring_weights = self.repo.load_scoring_weights()
+            self.ats_weights = self.repo.load_ats_weights()
         except Exception as exc:
-            print(f"[WEIGHTS] Could not load scoring weights: {exc}")
-            self.scoring_weights = dict(DEFAULT_WEIGHTS)
+            print(f"[WEIGHTS] Could not load ats_weights: {exc}")
+            self.ats_weights = None
 
     # --------------------------------------------------------
     # SCORE ENGINE
@@ -233,24 +255,14 @@ class AnalyticsService:
         }
 
     def calculate_score(self, candidate: dict, job: dict | None = None) -> dict:
-        """
-        Calls the intelligent scorer and injects the live feedback-trained
-        weights so recruiter feedback actually changes future scores.
-        """
-        result = compute_intelligent_score(
+        return compute_intelligent_score(
             cv_data=self.build_cv_payload(candidate),
             cv_raw_text=candidate.get("cv_raw_text") or "",
             recruiter_preferences=self.preferences,
             job_title=job["title"] if job else "",
             job_requirements=job.get("requirements", "") if job else "",
+            weights=self.ats_weights,
         )
-
-        # Blend intelligent score breakdown with feedback-trained dimension weights.
-        # The intelligent scorer returns a score_breakdown on 0-100; we annotate
-        # the result with the active weight profile so callers can inspect it.
-        result["active_weights"] = self.scoring_weights
-
-        return result
 
     # --------------------------------------------------------
     # INSIGHTS
@@ -309,14 +321,18 @@ class AnalyticsService:
 @router.get("/recruiter-profile")
 async def recruiter_profile(user: dict = Depends(get_current_user)):
     service = AnalyticsService()
+    feedback = service.repo.count_feedback()
     return {
-        "preferred_skills": service.preferences.get("preferred_skills", {}),
-        "avg_experience":   service.preferences.get("avg_experience"),
-        "common_domains":   service.preferences.get("common_domains", []),
-        "hired_count":      service.preferences.get("hired_count", 0),
-        "insights":         service.recruiter_insights(),
-        # Expose live weights so the frontend can show what the model learned
-        "active_weights":   service.scoring_weights,
+        "preferred_skills":   service.preferences.get("preferred_skills", {}),
+        "avg_experience":     service.preferences.get("avg_experience"),
+        "common_domains":     service.preferences.get("common_domains", []),
+        "hired_count":        service.preferences.get("hired_count", 0),
+        "insights":           service.recruiter_insights(),
+        "feedback_count":     feedback["total"],
+        "feedback_likes":     feedback["likes"],
+        "feedback_dislikes":  feedback["dislikes"],
+        "weights_calibrated": service.ats_weights is not None,
+        "active_weights":     service.ats_weights or INTELLIGENT_SCORE_DEFAULT_WEIGHTS,
     }
 
 
@@ -344,17 +360,16 @@ async def score_breakdown(
     job       = service.repo.get_job(candidate.get("job_id"))
     result    = service.calculate_score(candidate, job)
     return {
-        "candidate_id":    str(candidate_id),
-        "candidate_name":  candidate.get("full_name"),
-        "score":           result["score"],
-        "final_score":     result["score"],       # alias used by modal
-        "score_breakdown": result["score_breakdown"],
-        "matched_keywords": result["matched_keywords"],
-        "missing_keywords": result["missing_keywords"],
-        "insights":        result["insights"],
-        "reasoning":       result["reasoning"],
+        "candidate_id":       str(candidate_id),
+        "candidate_name":     candidate.get("full_name"),
+        "final_score":        result["score"],
+        "score_breakdown":    result["score_breakdown"],
+        "matched_keywords":   result["matched_keywords"],
+        "missing_keywords":   result["missing_keywords"],
+        "insights":           result["insights"],
+        "reasoning":          result["reasoning"],
         "recruiter_suggestions": result.get("recruiter_suggestions", []),
-        "active_weights":  result.get("active_weights", {}),
+        "weights_used":       result.get("weights_used", INTELLIGENT_SCORE_DEFAULT_WEIGHTS),
     }
 
 
@@ -375,7 +390,6 @@ async def pipeline_stats(user: dict = Depends(get_current_user)):
     return {
         "total_candidates":   total,
         "average_score":      avg_score,
-        "avg_score":          avg_score,          # alias for frontend StatCard
         "conversion_rate":    round((hired_count / total) * 100, 1) if total else 0,
         "status_breakdown":   dict(status_breakdown),
         "top_skills":         service.top_skills(candidates),
@@ -430,47 +444,6 @@ async def rescore_candidate(
 
 
 # ============================================================
-# FEEDBACK ENDPOINTS (proxied here so the frontend only needs
-# one base path for analytics + feedback)
-# ============================================================
-
-
-@router.post("/candidates/{candidate_id}/like", status_code=status.HTTP_200_OK)
-async def like_candidate(
-    candidate_id: UUID,
-    user: dict = Depends(get_current_user),
-):
-    """
-    Thin proxy — delegates to the core feedback logic so analytics callers
-    don't need to know about a separate /feedback prefix.
-    """
-    from app.api.v1.feedback import _apply_feedback  # local import to avoid circular
-    _apply_feedback(str(candidate_id), liked=True, user_id=user["id"])
-    return {"status": "liked", "candidate_id": str(candidate_id)}
-
-
-@router.post("/candidates/{candidate_id}/dislike", status_code=status.HTTP_200_OK)
-async def dislike_candidate(
-    candidate_id: UUID,
-    user: dict = Depends(get_current_user),
-):
-    from app.api.v1.feedback import _apply_feedback
-    _apply_feedback(str(candidate_id), liked=False, user_id=user["id"])
-    return {"status": "disliked", "candidate_id": str(candidate_id)}
-
-
-@router.get("/weights", status_code=status.HTTP_200_OK)
-async def get_weights(user: dict = Depends(get_current_user)):
-    """Returns the current live scoring weights (trained by feedback)."""
-    service = AnalyticsService()
-    return {
-        "weights":      service.scoring_weights,
-        "defaults":     DEFAULT_WEIGHTS,
-        "is_customized": service.scoring_weights != DEFAULT_WEIGHTS,
-    }
-
-
-# ============================================================
 # BULK RESCORING
 # ============================================================
 
@@ -479,13 +452,18 @@ def run_bulk_rescore(job_id: UUID | None = None) -> dict:
     """
     Runs in a Starlette BackgroundTask (threadpool).
 
-    AnalyticsService is constructed HERE, inside the thread, not in the
-    request handler — gives the task its own fresh Supabase client.
+    CRITICAL: AnalyticsService is constructed HERE, inside the thread,
+    not in the request handler. This gives the task its own fresh
+    Supabase client and avoids sharing a sync httpx connection across threads.
+
+    AnalyticsService is constructed once for the whole batch (not per
+    candidate), so preferences and ats_weights are loaded once and reused —
+    keeping this an O(1) extra DB round-trip regardless of candidate count.
     """
-    service = AnalyticsService()
+    service = AnalyticsService()  # constructed inside the thread — intentional
 
     candidates = service.repo.get_candidates(job_id=job_id)
-    updated = errors = 0
+    updated = failed = 0
 
     for candidate in candidates:
         candidate_id = candidate.get("id")
@@ -496,9 +474,9 @@ def run_bulk_rescore(job_id: UUID | None = None) -> dict:
             updated += 1
         except Exception as exc:
             print(f"[RESCORE ERROR] {candidate_id} {exc}")
-            errors += 1
+            failed += 1
 
-    return {"updated": updated, "errors": errors, "total": len(candidates)}
+    return {"updated": updated, "failed": failed, "total": len(candidates)}
 
 
 @router.post("/rescore-all")
