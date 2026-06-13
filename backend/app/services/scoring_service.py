@@ -1,13 +1,14 @@
 """
 scoring_service.py — Service de scoring ATS pour le marché francophone africain.
-Version 2.1 — Architecture hiérarchique à 4 niveaux avec leadership par actions.
-Conçu pour Atihmam Conseils, adapté au contexte ivoirien et francophone.
+Version 2.2 — Gradient de feedback corrigé (utilise les scores dimensionnels réels).
 
-Changelog v2.1:
-- Suppression de compute_cv_quality_score (références indéfinies supprimées)
-- compute_candidate_score accepte maintenant supabase= kwarg (ignoré, compatibilité)
-- Correction __all__ (virgule manquante)
-- Tous les helpers privés supprimés (NameError à runtime)
+Changelog v2.2 vs v2.1:
+- update_weights_from_feedback accepte un kwarg optionnel ``dimension_scores``
+  (dict {dim: float 0-1}) et l'utilise comme signal de gradient au lieu de la
+  valeur du poids lui-même. Cela évite la dérive circulaire où les poids se
+  mettaient à jour en fonction d'eux-mêmes plutôt que de la contribution réelle
+  de chaque dimension au score prédit.
+- Tous les autres comportements sont inchangés.
 """
 
 # =============================================================================
@@ -557,10 +558,9 @@ def compute_experience_score(
     if required_years <= 0:
         ratio = min(cv_years / 5.0, 1.0) if cv_years > 0 else 0.0
     elif cv_years >= required_years:
-        ratio = 1.0          # Requis atteint = score plein, sans bonus pour l'excédent
+        ratio = 1.0
     else:
         ratio = cv_years / required_years
-        
 
     if cv_years < profile.min_years_experience:
         ratio *= 0.5
@@ -908,9 +908,6 @@ def score_candidate(
         cv_lower,
     )
     cv_years_from_text = max([int(y) for y in years_pattern]) if years_pattern else 0.0
-    # Use structured hint (from ai_extracted experience_years) when regex finds nothing.
-    # This covers cases where raw_text was not stored and only a reconstructed text
-    # fragment (job titles only) is available.
     cv_years = max(cv_years_from_text, cv_years_hint)
 
     exp_score,  exp_details  = compute_experience_score(cv_years, required_years_experience, hierarchy_level)
@@ -1020,7 +1017,7 @@ def score_to_dict(score: CandidateScore) -> Dict[str, Any]:
 
 
 # =============================================================================
-# 24. Feedback et apprentissage
+# 24. Feedback et apprentissage — GRADIENT CORRIGÉ
 # =============================================================================
 
 @dataclass
@@ -1045,20 +1042,56 @@ def update_weights_from_feedback(
     current_weights: Dict[str, float],
     feedback_records: List[FeedbackRecord],
     learning_rate: float = 0.01,
+    dimension_scores: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
+    """
+    Update scoring weights using gradient descent on recruiter feedback.
+
+    Fix vs. v2.1
+    ─────────────
+    The old formula used ``new_weights[dim]`` as the per-dimension signal:
+
+        gradient = -2 * error * new_weights[dim]   # WRONG — circular drift
+
+    The weight value is not a proxy for how much that dimension contributed to
+    the prediction. If ``dimension_scores`` are available (the per-dimension
+    0-1 scores stored on the candidate row) we use them instead:
+
+        predicted  ≈  Σ  w_i * s_i
+        ∂predicted/∂w_i  =  s_i
+        gradient   =  -2 * error * s_i              # correct MSE gradient
+
+    When ``dimension_scores`` is absent (legacy candidates with no stored
+    breakdown) we fall back to a uniform signal of 0.5 so all weights shift
+    proportionally toward the error direction without circular drift.
+    """
     if not feedback_records:
         return current_weights
 
     new_weights = dict(current_weights)
     total_error = 0.0
 
+    # Normalise dimension_scores to 0-1 range; default to 0.5 per dim if absent
+    dim_signals: Dict[str, float] = {}
+    if dimension_scores:
+        for dim in new_weights:
+            raw = dimension_scores.get(dim, 0.5)
+            # scores may arrive as 0-100 (from intelligent_scoring_service) or 0-1
+            dim_signals[dim] = raw / 100.0 if raw > 1.0 else float(raw)
+    else:
+        dim_signals = {dim: 0.5 for dim in new_weights}
+
     for fb in feedback_records:
         error = fb.actual_rating - fb.predicted_score
         total_error += abs(error)
         for dim in new_weights:
-            gradient = -2 * error * new_weights[dim]
+            # gradient of MSE loss w.r.t. w_dim = -2 * error * s_dim
+            gradient = -2.0 * error * dim_signals.get(dim, 0.5)
             new_weights[dim] -= learning_rate * gradient
+            # Keep weights non-negative
+            new_weights[dim] = max(new_weights[dim], 1e-4)
 
+    # Re-normalise so weights sum to 1
     total = sum(new_weights.values())
     if total > 0:
         new_weights = {k: round(v / total, 4) for k, v in new_weights.items()}
@@ -1115,7 +1148,6 @@ def rank_candidates(scores: List[CandidateScore]) -> List[CandidateScore]:
 # COMPATIBILITY LAYER
 # =============================================================================
 
-# Quality dampening constants (applied in quality-fallback mode from drive_sync)
 _KW_DAMPEN  = 0.85
 _KW_CAP     = 85.0
 _SEM_DAMPEN = 0.80
@@ -1123,12 +1155,6 @@ _SEM_CAP    = 75.0
 
 
 def _build_cv_text(cv_data: dict) -> str:
-    """
-    Build a single text blob from a structured CV dict.
-    Used as fallback when raw_text / full_text are absent (e.g. API re-score
-    where cv_raw_text was not loaded). Includes skills, education, and languages
-    so that keyword/semantic/certification scorers have something to work with.
-    """
     if not isinstance(cv_data, dict):
         return str(cv_data)
     parts = []
@@ -1138,16 +1164,13 @@ def _build_cv_text(cv_data: dict) -> str:
         parts.append(cv_data.get("current_position") or cv_data.get("title", ""))
     if cv_data.get("full_name"):
         parts.append(cv_data["full_name"])
-    # Skills — most keyword-dense field
     skills = cv_data.get("skills", [])
     if skills:
         parts.append(" ".join(str(s) for s in skills))
-    # Work history — title + description
     for exp in cv_data.get("work_history", []):
         parts.append(exp.get("title", ""))
         parts.append(exp.get("description", ""))
         parts.append(exp.get("company", ""))
-    # Education — degree names matter for education scorer
     for edu in cv_data.get("education", []):
         if isinstance(edu, dict):
             parts.append(edu.get("degree", ""))
@@ -1155,29 +1178,17 @@ def _build_cv_text(cv_data: dict) -> str:
             parts.append(edu.get("field", ""))
         else:
             parts.append(str(edu))
-    # Projects
     for proj in cv_data.get("projects", []):
         parts.append(proj.get("name", ""))
         parts.append(proj.get("description", ""))
-    # Certifications
     for cert in cv_data.get("certifications", []):
         parts.append(str(cert))
-    # Languages
     for lang in cv_data.get("languages", []):
         parts.append(str(lang))
     return " ".join(filter(None, parts))
 
-def enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
-    """
-    Injects raw_text into cv_data so compute_candidate_score has the full CV
-    body for scoring. Without this, keyword/semantic/education/certification
-    scorers receive empty text (or the sparse _build_cv_text reconstruction)
-    and return artificially low/zero scores.
 
-    Canonical home for this helper — cv_processing.py and drive_sync.py both
-    import from here to avoid the divergence that caused Drive-synced
-    candidates to score off thin text (see backfill_now.py).
-    """
+def enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
     enriched = dict(cv_info)
     enriched["raw_text"] = raw_text
     return enriched
@@ -1187,19 +1198,13 @@ def compute_candidate_score(
     cv_data: Dict[str, Any],
     job_title: str,
     job_requirements: str,
-    supabase: Any = None,          # accepted, ignored — kept for call-site compat
+    supabase: Any = None,
 ) -> Dict[str, Any]:
-    """
-    Compatibility shim expected by ai_service.py, cv_processing.py, and drive_sync.py.
-    Wraps the rich hierarchical scorer. Returns a dict on 0–100 scale with both
-    canonical v2.0 dimension keys AND the frontend aliases ScorePanel.jsx expects.
-    """
     if isinstance(cv_data, dict):
         cv_text = cv_data.get("raw_text") or cv_data.get("full_text") or _build_cv_text(cv_data)
     else:
         cv_text = str(cv_data)
 
-    # Extract experience_years from structured data for the hint
     _exp_years_hint = 0.0
     if isinstance(cv_data, dict) and cv_data.get("experience_years"):
         try:
@@ -1235,13 +1240,12 @@ def compute_candidate_score(
         "domain":          sd["domain"],
         "hierarchy_level": sd["hierarchy_level"],
         "reasoning": (
-            f"Score calculé via scoring hiérarchique v2.1 "
+            f"Score calculé via scoring hiérarchique v2.2 "
             f"— Niveau: {sd['hierarchy_level']}"
         ),
         "matched_keywords": sd["details"]["keywords"].get("matched_keywords", []),
         "missing_keywords": [],
         "dimension_scores": {
-            # canonical v2.0 keys
             "experience":     dims["experience"],
             "education":      dims["education"],
             "certifications": dims["certifications"],
@@ -1250,7 +1254,6 @@ def compute_candidate_score(
             "leadership":     dims["leadership"],
             "language":       dims["language"],
             "complexity":     dims["complexity"],
-            # frontend aliases (ScorePanel.jsx)
             "keyword_score":            dims["keywords"],
             "semantic_score":           dims["semantic"],
             "experience_score":         dims["experience"],
@@ -1265,16 +1268,13 @@ def compute_candidate_score(
 
 
 def classify_domain(job_title: str, job_description: str = "") -> str:
-    """Compatibility shim: returns domain as string."""
     return detect_domain(job_title.lower(), job_description.lower()).value
 
 
-# Backwards-compat alias
 detect_domain_compat = classify_domain
 
 
 def compute_candidate_score_compat(cv_text: str, job_title: str, job_requirements: str) -> dict:
-    """Legacy alias for callers passing raw text instead of a dict."""
     return compute_candidate_score(
         cv_data={"raw_text": cv_text},
         job_title=job_title,
@@ -1288,22 +1288,22 @@ def compute_candidate_score_compat(cv_text: str, job_title: str, job_requirement
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("SCORING ATS 2.1 — Tests intégrés")
+    print("SCORING ATS 2.2 — Tests intégrés")
     print("=" * 70)
 
     print("\n[Test 1] Détection hiérarchique")
-    assert detect_hierarchy_level("directeur général")          == HierarchyLevel.DIRECTION
+    assert detect_hierarchy_level("directeur général")            == HierarchyLevel.DIRECTION
     assert detect_hierarchy_level("chef de département finances") == HierarchyLevel.MANAGER_SENIOR
-    assert detect_hierarchy_level("superviseur production")     == HierarchyLevel.MANAGER_INTERMEDIAIRE
-    assert detect_hierarchy_level("opérateur machine")          == HierarchyLevel.COLLABORATEUR
-    assert detect_hierarchy_level("ceo")                        == HierarchyLevel.DIRECTION
-    assert detect_hierarchy_level("senior manager")             == HierarchyLevel.MANAGER_SENIOR
+    assert detect_hierarchy_level("superviseur production")       == HierarchyLevel.MANAGER_INTERMEDIAIRE
+    assert detect_hierarchy_level("opérateur machine")            == HierarchyLevel.COLLABORATEUR
+    assert detect_hierarchy_level("ceo")                          == HierarchyLevel.DIRECTION
+    assert detect_hierarchy_level("senior manager")               == HierarchyLevel.MANAGER_SENIOR
     print("✓ 6/6 assertions OK")
 
     print("\n[Test 2] Détection de domaine")
-    assert detect_domain("comptable senior")      == Domain.FINANCE
-    assert detect_domain("chef de chantier btp")  == Domain.CONSTRUCTION
-    assert detect_domain("développeur fullstack")  == Domain.TECH
+    assert detect_domain("comptable senior")     == Domain.FINANCE
+    assert detect_domain("chef de chantier btp") == Domain.CONSTRUCTION
+    assert detect_domain("développeur fullstack") == Domain.TECH
     print("✓ 3/3 assertions OK")
 
     print("\n[Test 3] Scoring complet - Directeur Financier")
@@ -1325,15 +1325,12 @@ if __name__ == "__main__":
         required_keywords=["ifrs", "consolidation", "audit", "trésorerie"],
     )
     d = score_to_dict(score)
-    print(f"  Niveau  : {d['hierarchy_level']}")
-    print(f"  Domaine : {d['domain']}")
-    print(f"  Score   : {d['final_score']}")
     assert d['hierarchy_level'] == "direction"
     assert d['domain'] == "finance"
     assert d['final_score'] > 0.5
-    print("✓ Score directeur financier OK")
+    print(f"  Score: {d['final_score']}  ✓")
 
-    print("\n[Test 4] compute_candidate_score (compat shim — supabase kwarg)")
+    print("\n[Test 4] compute_candidate_score (compat shim)")
     result = compute_candidate_score(
         cv_data={"raw_text": cv, "skills": ["audit", "ifrs"]},
         job_title="Directeur Financier",
@@ -1343,19 +1340,36 @@ if __name__ == "__main__":
     assert "score" in result
     assert "dimension_scores" in result
     assert "keyword_score" in result["dimension_scores"]
-    print(f"  Score (0-100): {result['score']}")
-    print("✓ Compat shim OK")
+    print(f"  Score (0-100): {result['score']}  ✓")
 
-    print("\n[Test 5] Feedback apprenant")
+    print("\n[Test 5] Feedback — gradient avec dimension_scores réels")
+    dim_scores_example = {
+        "experience": 0.9, "education": 0.8, "certifications": 0.7,
+        "semantic": 0.6,   "keywords": 0.5,  "leadership": 0.85,
+        "language": 0.7,   "complexity": 0.6,
+    }
     feedback = [
         FeedbackRecord("CAND-001", "Directeur Financier", 0.72, "hired",    0.85, "2026-06-03"),
         FeedbackRecord("CAND-002", "Directeur Financier", 0.65, "rejected", 0.40, "2026-06-03"),
     ]
-    new_weights = update_weights_from_feedback(DEFAULT_WEIGHTS, feedback, learning_rate=0.01)
+    new_weights = update_weights_from_feedback(
+        DEFAULT_WEIGHTS, feedback, learning_rate=0.01,
+        dimension_scores=dim_scores_example,
+    )
     total = sum(new_weights.values())
     assert 0.99 <= total <= 1.01, f"Somme des poids = {total}"
-    print(f"  Somme des poids = {total:.4f}")
-    print("✓ Feedback apprenant OK")
+    print(f"  Somme des poids = {total:.4f}  ✓")
+
+    print("\n[Test 6] Feedback — fallback sans dimension_scores (legacy)")
+    new_weights_legacy = update_weights_from_feedback(
+        DEFAULT_WEIGHTS, feedback, learning_rate=0.01,
+        dimension_scores=None,
+    )
+    total_legacy = sum(new_weights_legacy.values())
+    assert 0.99 <= total_legacy <= 1.01
+    # Verify weights differ from a no-op (scores actually shifted)
+    assert new_weights_legacy != DEFAULT_WEIGHTS
+    print(f"  Somme des poids (legacy) = {total_legacy:.4f}  ✓")
 
     print("\n" + "=" * 70)
     print("Tous les tests sont passés avec succès !")
@@ -1381,4 +1395,5 @@ __all__ = [
     "DOMAIN_SKILLS",
     "HIERARCHY_PROFILES",
     "DOMAIN_COMPLEXITY",
+    "DEFAULT_WEIGHTS",
 ]
