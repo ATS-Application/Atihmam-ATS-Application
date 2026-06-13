@@ -9,7 +9,7 @@ from httpx import RemoteProtocolError
 from app.core.security import get_current_user
 from app.db.supabase_client import get_supabase_admin
 from app.services.scoring_service import (
-    DEFAULT_WEIGHTS,
+    INTELLIGENT_SCORE_DEFAULT_WEIGHTS,
     FeedbackRecord,
     update_weights_from_feedback,
 )
@@ -37,8 +37,7 @@ def _get_candidate_or_404(candidate_id: str) -> dict:
         resp = (
             get_supabase_admin()
             .table("candidates")
-            # Also fetch job_id so we can resolve job_title for context-aware learning
-            .select("id, score, ai_extracted_data, dimension_scores, job_id")
+            .select("id, score, ai_extracted_data, dimension_scores")
             .eq("id", candidate_id)
             .single()
             .execute()
@@ -46,46 +45,33 @@ def _get_candidate_or_404(candidate_id: str) -> dict:
         if not resp.data:
             raise HTTPException(status_code=404, detail="Candidate not found")
         return resp.data
-
     return _retry(_call)
 
 
-def _get_job_title(supabase, job_id: str | None) -> str:
-    """Resolve a job title from job_id. Returns '' if unavailable."""
-    if not job_id:
-        return ""
-    try:
-        resp = (
-            supabase.table("jobs")
-            .select("title")
-            .eq("id", job_id)
-            .single()
-            .execute()
-        )
-        return (resp.data or {}).get("title", "") if resp.data else ""
-    except Exception:
-        return ""
-
-
-def load_weights(supabase) -> dict:
+def _load_current_weights(supabase) -> dict:
     """
-    Load recruiter-trained weights from app_config.
-    Single DB call — callers must not call this twice for the same request.
-    Falls back to DEFAULT_WEIGHTS if nothing has been saved yet.
+    Returns the learned weight vector for compute_intelligent_score's
+    6-dimension score_breakdown (skill_match, experience, project_complexity,
+    seniority, domain_diversity, career_progression).
+
+    Falls back to INTELLIGENT_SCORE_DEFAULT_WEIGHTS if not yet calibrated,
+    and self-heals if the stored dict has a stale/incompatible key set
+    (e.g. leftover rows from the old 8-key hierarchical-scorer weight space,
+    which compute_intelligent_score never consumed).
     """
     try:
-        resp = (
-            supabase.table("app_config")
-            .select("value")
-            .eq("key", "ats_weights")
-            .single()
-            .execute()
-        )
+        resp = supabase.table("app_config").select("value").eq("key", "ats_weights").single().execute()
         if resp.data:
-            return resp.data["value"]
+            stored = resp.data["value"]
+            if isinstance(stored, dict) and set(stored.keys()) == set(INTELLIGENT_SCORE_DEFAULT_WEIGHTS.keys()):
+                return stored
+            print(
+                f"[feedback] Discarding incompatible stored ats_weights "
+                f"keys={list(stored.keys()) if isinstance(stored, dict) else stored!r}"
+            )
     except Exception:
         pass
-    return dict(DEFAULT_WEIGHTS)
+    return dict(INTELLIGENT_SCORE_DEFAULT_WEIGHTS)
 
 
 def _save_weights(supabase, weights: dict) -> None:
@@ -96,72 +82,43 @@ def _save_weights(supabase, weights: dict) -> None:
 
 
 def _apply_feedback(candidate_id: str, liked: bool, user_id: str) -> None:
-    """
-    Core feedback logic shared by the /feedback router and the /analytics proxy.
-
-    Fixes vs. previous version
-    ─────────────────────────
-    1. job_title is resolved from the candidate's job_id so weight updates are
-       context-aware (finance likes don't drift tech weights).
-    2. update_weights_from_feedback now receives the candidate's actual
-       dimension_scores so the gradient is computed against real per-dimension
-       contributions rather than the weight values themselves.
-    3. load_weights is called exactly once per _apply_feedback invocation
-       (single DB round-trip).
-
-    dimension_scores resolution order
-    ──────────────────────────────────
-    1. Top-level ``dimension_scores`` column  (written by analytics rescore)
-    2. ``ai_extracted_data.dimension_scores`` (legacy location)
-    3. Empty dict — weight update still runs but with zero per-dimension signal
-    """
     candidate = _get_candidate_or_404(candidate_id)
 
-    dim_scores: dict = candidate.get("dimension_scores") or {}
-    if not dim_scores:
-        dim_scores = (candidate.get("ai_extracted_data") or {}).get(
-            "dimension_scores", {}
-        )
-
+    dim_scores = (
+        candidate.get("dimension_scores")
+        or (candidate.get("ai_extracted_data") or {}).get("dimension_scores")
+        or {}
+    )
     predicted_score = (candidate.get("score") or 0) / 100.0
-    actual_rating   = 0.85 if liked else 0.25
+    actual_rating = 0.85 if liked else 0.25
+
+    feedback_record = FeedbackRecord(
+        candidate_id=candidate_id,
+        job_title="",
+        predicted_score=predicted_score,
+        actual_outcome="liked" if liked else "disliked",
+        actual_rating=actual_rating,
+    )
 
     def _call():
-        supabase      = get_supabase_admin()
-        job_title     = _get_job_title(supabase, candidate.get("job_id"))
-        current_weights = load_weights(supabase)   # single call
-
-        feedback_record = FeedbackRecord(
-            candidate_id    = candidate_id,
-            job_title       = job_title,            # now context-aware
-            predicted_score = predicted_score,
-            actual_outcome  = "liked" if liked else "disliked",
-            actual_rating   = actual_rating,
-        )
-
+        supabase = get_supabase_admin()
+        current_weights = _load_current_weights(supabase)
         new_weights = update_weights_from_feedback(
-            current_weights   = current_weights,
-            feedback_records  = [feedback_record],
-            learning_rate     = 0.01,
-            dimension_scores  = dim_scores,         # pass real scores for correct gradient
+            current_weights=current_weights,
+            feedback_records=[feedback_record],
+            learning_rate=0.01,
         )
         _save_weights(supabase, new_weights)
-
         supabase.table("candidate_feedback").upsert(
             {
                 "candidate_id": candidate_id,
                 "recruiter_id": user_id,
-                "feedback":     "like" if liked else "dislike",
+                "feedback": "like" if liked else "dislike",
             },
             on_conflict="candidate_id,recruiter_id",
         ).execute()
 
     _retry(_call)
-
-
-# ============================================================
-# ROUTES
-# ============================================================
 
 
 @router.post("/{candidate_id}/like", status_code=status.HTTP_200_OK)
@@ -185,12 +142,7 @@ async def dislike_candidate(
 @router.get("/weights", status_code=status.HTTP_200_OK)
 async def get_current_weights(user: dict = Depends(get_current_user)):
     supabase = get_supabase_admin()
-    weights  = load_weights(supabase)          # single call
-    return {
-        "weights":       weights,
-        "defaults":      DEFAULT_WEIGHTS,
-        "is_customized": weights != DEFAULT_WEIGHTS,
-    }
+    return {"weights": _load_current_weights(supabase)}
 
 
 @router.delete("/weights/reset", status_code=status.HTTP_200_OK)
