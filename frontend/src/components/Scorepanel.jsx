@@ -331,6 +331,16 @@ function StatusState({ icon: Icon, iconClass, title, subtitle }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function ScorePanel({ candidate }) {
+  // SÉCURITÉ ANTI-CRASH : Si pas de candidat ou pas d'ID, on ne rend rien.
+  // Cela évite l'erreur "Cannot read properties of undefined" qui cause l'écran blanc.
+  if (!candidate || !candidate.id) {
+    return (
+      <div className="p-8 text-center text-gray-400 bg-white rounded-3xl border border-dashed border-gray-200">
+        Chargement de l'analyse...
+      </div>
+    );
+  }
+
   const [feedbackSent, setFeedbackSent] = useState(null);
   const [loadingFeedback, setLoadingFeedback] = useState(false);
   const { openCV, isOpeningCV } = useOpenCV();
@@ -380,12 +390,24 @@ export default function ScorePanel({ candidate }) {
   }, [candidate, aiData]);
 
   const matched = useMemo(
-    () => safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords),
+    () => {
+      const raw = safeParseArray(candidate?.matched_keywords ?? aiData?.matched_keywords);
+      // On force la conversion en String pour éviter le crash "Objects are not valid as a React child"
+      return raw
+        .map(kw => (typeof kw === 'string' ? kw : String(kw)))
+        .filter(kw => kw && kw !== 'null' && kw !== 'undefined' && !kw.includes("{text}") && !kw.includes("${"));
+    },
     [candidate, aiData]
   );
 
   const missing = useMemo(
-    () => safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords),
+    () => {
+      const raw = safeParseArray(candidate?.missing_keywords ?? aiData?.missing_keywords);
+      // On force la conversion en String pour éviter le crash "Objects are not valid as a React child"
+      return raw
+        .map(kw => (typeof kw === 'string' ? kw : String(kw)))
+        .filter(kw => kw && kw !== 'null' && kw !== 'undefined' && !kw.includes("{text}") && !kw.includes("${"));
+    },
     [candidate, aiData]
   );
 
@@ -405,12 +427,23 @@ export default function ScorePanel({ candidate }) {
     candidate?.confidence ??
     aiData?.confidence
   );
-  const reasoning =
-    candidate?.score_reasoning ??
-    aiData?.score_reasoning ??
-    candidate?.reasoning ??
-    aiData?.reasoning ??
-    null;
+
+  const reasoning = useMemo(() => {
+    const raw =
+      candidate?.score_reasoning ??
+      aiData?.score_reasoning ??
+      candidate?.reasoning ??
+      aiData?.reasoning ??
+      null;
+    if (!raw) return null;
+    // Sécurité anti-crash : on force en string pur
+    const text = typeof raw === 'string' ? raw : String(raw);
+    return text
+      .replace(/\$\{.*?\}|\{.*?text\}|`.*?`|\{.*?_.*?\}|\{.*?skills.*?\}|{.*?text.*?}/gi, "")
+      .replace(/grand logistics|Learn more/gi, "")
+      .trim();
+  }, [candidate, aiData]);
+
   const processingStatus = candidate?.processing_status ?? null;
 
   const hasData = Object.values(dims).some((v) => v > 0);

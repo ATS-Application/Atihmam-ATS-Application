@@ -398,30 +398,36 @@ def compute_final_score(
     job_requirements: str,
 ) -> float:
     """
-    Blended score = 60 % relevance (keyword/semantic) + 40 % CV depth/quality.
+    Blended score = 70 % pertinence poste + 30 % qualité/profondeur CV.
 
-    This is the correct home for this function because:
-      • It calls analyze_cv_depth()       — defined here in ai_service
-      • It calls compute_candidate_score() — imported from scoring_service
+    Pondération v2.2 :
+      • 70 % relevance_score  — keywords + sémantique vs le POSTE (corrigé v2.2 :
+                                 les keywords proviennent de job_requirements, plus
+                                 des skills du candidat lui-même).
+      • 30 % quality_score    — profondeur du CV (métriques chiffrées, descriptions
+                                 riches, progression de carrière). Rôle secondaire :
+                                 un candidat très pertinent mais CV peu détaillé ne
+                                 doit pas être pénalisé autant qu'avant (40 % → 30 %).
 
-    Keeping it here avoids the circular import that would result from placing
-    it in scoring_service (which already imports from ai_service).
+    La qualité seule ne doit pas compenser un mauvais alignement métier.
 
     Returns a float in [0, 100].
     """
-    # 1. CV depth / quality score (AI-powered)
+    # 1. CV depth / quality score (AI-powered, 0-100)
     depth_report  = analyze_cv_depth(cv_data)
-    quality_score = depth_report.get("overall_depth_score") or 0
+    quality_score = float(depth_report.get("overall_depth_score") or 0)
+    quality_score = max(0.0, min(100.0, quality_score))   # borne défensive
 
-    # 2. Relevance score — compute_candidate_score is keyword-only and returns
-    #    a dict; extract the scalar "score" key before blending.
-    score_result   = compute_candidate_score(
+    # 2. Relevance score : keywords du POSTE vs CV (0-100).
+    #    compute_candidate_score utilise maintenant _parse_job_keywords(job_requirements)
+    #    donc ce score mesure bien l'alignement candidat ↔ poste.
+    score_result    = compute_candidate_score(
         cv_data=cv_data,
         job_title=job_title,
         job_requirements=job_requirements,
     )
     relevance_score = float(score_result.get("score", 0))
+    relevance_score = max(0.0, min(100.0, relevance_score))  # borne défensive
 
-    # 3. Weighted blend (60 % relevance, 40 % evidence/quality).
-    #    Prevents keyword-stuffing from carrying a candidate.
-    return round(relevance_score * 0.6 + quality_score * 0.4, 2)
+    # 3. Blend pondéré : pertinence > qualité
+    return round(relevance_score * 0.70 + quality_score * 0.30, 2)

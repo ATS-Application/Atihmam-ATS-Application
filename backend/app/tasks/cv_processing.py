@@ -31,6 +31,7 @@ import concurrent.futures
 import json
 import logging
 import textwrap
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -55,7 +56,6 @@ MAX_TEXT_LENGTH  = 50_000
 MAX_AI_DATA_SIZE = 100_000
 
 DOMAIN_MISMATCH_PENALTY = 0.70   # multiplier applied when candidate ≠ job domain
-MIN_SCORE_TO_ASSIGN_JOB = 50.0   # below this (after penalty) →
 
 PERMANENT_ERRORS = (
     ValueError,
@@ -90,10 +90,13 @@ def ensure_string(value: Any) -> str:
 def sanitize_ai_data(data: dict) -> dict:
     try:
         serialized = json.dumps(data)
+        # Si les données sont trop volumineuses, on ne tronque pas brutalement (casse le JSON)
+        # On préfère supprimer les champs lourds si nécessaire, mais ici on augmente juste la limite
         if len(serialized) > MAX_AI_DATA_SIZE:
-            serialized = serialized[:MAX_AI_DATA_SIZE]
+            logger.warning("Données IA trop volumineuses (%d octets)", len(serialized))
         return json.loads(serialized)
-    except Exception:
+    except Exception as e:
+        logger.error("Erreur lors de la sanitisation des données IA : %s", e)
         return {}
 
 
@@ -109,6 +112,25 @@ def extract_text_safe(pdf_bytes: bytes, timeout: int = 30) -> str:
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(extract_text_from_bytes, pdf_bytes)
         return future.result(timeout=timeout)
+
+
+def _sanitize_reasoning(text: str) -> str:
+    """Supprime les templates JS mal formés et les textes parasites du reasoning."""
+    if not text:
+        return ""
+
+    # Sécurité : s'assurer que l'IA n'a pas renvoyé un objet
+    text_str = text if isinstance(text, str) else json.dumps(text)
+
+    # Supprime les patterns type ${...}, {skills text}, backticks ou variables avec underscore (regex renforcée)
+    text_str = re.sub(r'(\$\{.*?\}|\{.*?text\}|`.*?`|\{.*?_.*?\})', '', text_str)
+    text_str = re.sub(r'\{[^{}]*?skills[^{}]*?\}', '', text_str)
+    text_str = re.sub(r'\{[^{}]*?text[^{}]*?\}', '', text_str)
+    # Supprime les textes parasites spécifiques identifiés
+    parasites = ["grand logistics", "Learn more"]
+    for p in parasites:
+        text_str = text_str.replace(p, "")
+    return text_str.strip()
 
 
 # ============================================================================
@@ -182,7 +204,14 @@ def _quality_fallback(extracted: dict) -> dict:
     )
     domain_str = classify_domain(position)
 
-    skills       = extracted.get("skills", [])[:25]
+    # Nettoyage des compétences pour éviter d'inclure des parasites dans le JD synthétique
+    raw_skills = extracted.get("skills", []) or []
+    skills = []
+    for s in raw_skills[:25]:
+        s_str = str(s)
+        if s and "text}" not in s_str.lower() and "${" not in s_str:
+            skills.append(s_str)
+    
     work_history = extracted.get("work_history", [])
     projects     = extracted.get("projects", [])
 
@@ -233,7 +262,7 @@ def _build_score_payload(score_result: dict) -> dict:
         "score":            score_result.get("score", 0),
         "dimension_scores": dims,
         "score_confidence": score_result.get("confidence", 0),
-        "score_reasoning":  score_result.get("reasoning", ""),
+        "score_reasoning":  _sanitize_reasoning(score_result.get("reasoning", "")),
         "matched_keywords": score_result.get("matched_keywords", []),
         "missing_keywords": score_result.get("missing_keywords", []),
         # Flat alias columns (ScorePanel source D / indexed ORDER BY)
@@ -251,14 +280,21 @@ def _build_score_payload(score_result: dict) -> dict:
 def _enrich_ai_data(cv_info: dict, score_result: dict) -> dict:
     dims = score_result.get("dimension_scores", {})
     full_details = score_result.get("full_details", {})
+    
+    # On s'assure que le champ 'reasoning' brut de l'IA ne pollue pas l'affichage
+    # s'il est utilisé en fallback côté frontend.
+    clean_info = dict(cv_info)
+    if "reasoning" in clean_info:
+        clean_info["reasoning"] = _sanitize_reasoning(clean_info["reasoning"])
+    if "skills" in clean_info:
+        clean_info["skills"] = [str(s) for s in clean_info.get("skills", []) if s]
+
     enriched = {
-        **cv_info,
+        **clean_info,
         "dimension_scores": dims,
-        "matched_keywords": score_result.get("matched_keywords", []),
-        "missing_keywords": score_result.get("missing_keywords", []),
-        "score_reasoning":  score_result.get("reasoning", ""),
-        "hierarchy_level":  score_result.get("hierarchy_level"),
-        "domain":           score_result.get("domain"),
+        "matched_keywords": [_sanitize_reasoning(str(k)) for k in score_result.get("matched_keywords", []) if k],
+        "missing_keywords": [_sanitize_reasoning(str(k)) for k in score_result.get("missing_keywords", []) if k],
+        "score_reasoning":  _sanitize_reasoning(score_result.get("reasoning", "")),
         "detected_education": full_details.get("detected_education", "none"),  # ← added
         "full_details":     full_details,
     }
@@ -354,60 +390,107 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 def compute_best_job_match(supabase, cv_data: dict, jobs: list) -> tuple:
     """
     Trouve le poste qui correspond le mieux à un CV parmi une liste de postes.
-    cv_data must already contain raw_text (call _enrich_cv_data first).
+    cv_data must already contain raw_text (call enrich_cv_data first).
     Retourne (meilleur_score_result, meilleur_job_id).
+
+    FIX v2.3 — 3 corrections majeures :
+
+    1. La détection du domaine candidat utilise maintenant le texte COMPLET du CV
+       (skills + work_history + current_position), pas uniquement current_position.
+       Un "Acheteur" dont current_position est vide ne tombait plus en "consulting".
+
+    2. La détection du domaine du poste utilise titre + requirements (description),
+       pas uniquement le titre. Un "Responsable Technique" avec une description
+       BTP/génie civil est maintenant bien classé construction.
+
+    3. Le score sauvegardé en base EST le score pénalisé — avant, la pénalité
+       domaine était appliquée pour le classement mais le score non-pénalisé
+       était sauvegardé dans best_result, créant l'incohérence visible en UI.
     """
-    logger.info("compute_best_job_match: %d jobs to evaluate", len(jobs))
+    logger.info("compute_best_job_match: %d jobs à évaluer", len(jobs))
 
+    # ── Domaine candidat : utilise le texte complet du CV, pas juste le titre ──
     candidate_position = cv_data.get("current_position", "")
-    candidate_domain   = classify_domain(candidate_position)
+    # On construit un texte combiné pour mieux détecter le domaine :
+    # current_position + les 5 premiers titres de work_history + les skills
+    wh_titles = " ".join(
+        e.get("title", "") for e in cv_data.get("work_history", [])[:5]
+    )
+    skills_text = " ".join(str(s) for s in cv_data.get("skills", [])[:20])
+    
+    # FIX: On sépare le titre (poids fort) de la description (poids faible) 
+    # pour que la fonction réelle l'emporte sur les compétences secondaires.
+    candidate_domain = classify_domain(
+        job_title=candidate_position,
+        job_description=f"{wh_titles} {skills_text}"
+    )
 
-    best_score  = -1
-    best_result = None
-    best_job_id = None
+    logger.info("  Domaine candidat détecté : %s (Titre: '%s')",
+                candidate_domain, candidate_position)
+
+    best_score         = -1.0
+    best_result        = None
+    best_job_id        = None
+    best_penalized     = False   # garde trace pour le log final
 
     for job in jobs:
         try:
+            job_title       = job.get("title", "")
+            job_requirements = job.get("requirements", "") or ""
+
+            # Score brut candidat ↔ poste
             result = compute_candidate_score(
                 cv_data=cv_data,
-                job_title=job.get("title", ""),
-                job_requirements=job.get("requirements", ""),
+                job_title=job_title,
+                job_requirements=job_requirements,
             )
-            s = result.get("score", 0)
+            raw_score = float(result.get("score", 0))
 
-            job_domain = classify_domain(job.get("title", ""))
-            if job_domain != candidate_domain:
-                s *= 0.70
-                logger.info(
-                    "  Domain mismatch: candidate=%s job=%s → penalized score=%.1f",
-                    candidate_domain, job_domain, s
-                )
-            else:
-                logger.info(
-                    "  Job '%s' [%s] → score=%.1f",
-                    job.get("title"), job_domain, s
-                )
+            # ── Domaine du poste : titre + description ──────────────────────
+            # FIX : on passe requirements en plus du titre pour éviter qu'un
+            # "Responsable Technique" soit classé consulting faute de mots-clés
+            # dans le titre seul.
+            job_domain = classify_domain(
+                f"{job_title} {job_requirements[:300]}"
+            )
 
-            if s > best_score:
-                best_score  = s
-                best_result = result
-                best_job_id = job.get("id")
+            # ── Pénalité domaine ────────────────────────────────────────────
+            is_mismatch  = (job_domain != candidate_domain)
+            penalized_score = raw_score * DOMAIN_MISMATCH_PENALTY if is_mismatch else raw_score
+
+            logger.info(
+                "  Poste '%s' [%s] → score brut=%.1f%s",
+                job_title, job_domain, raw_score,
+                f" → pénalisé={penalized_score:.1f} (mismatch candidat={candidate_domain})"
+                if is_mismatch else "",
+            )
+
+            if penalized_score > best_score:
+                best_score     = penalized_score
+                best_job_id    = job.get("id")
+                best_penalized = is_mismatch
+
+                # FIX : on stocke le score PÉNALISÉ dans result pour que la
+                # valeur sauvegardée en base corresponde à ce qui est affiché.
+                best_result = {
+                    **result,
+                    "score":      round(penalized_score, 2),
+                    "confidence": round(penalized_score, 2),
+                    "reasoning":  result.get("reasoning", "") + (
+                        f" [pénalité domaine ×{DOMAIN_MISMATCH_PENALTY} : "
+                        f"candidat={candidate_domain} / poste={job_domain}]"
+                        if is_mismatch else ""
+                    ),
+                }
 
         except Exception as exc:
             logger.error("Erreur scoring poste %s : %s", job.get("id"), exc)
 
-    if best_job_id:
-        best_job_domain = classify_domain(
-            next((j.get("title","") for j in jobs if j.get("id") == best_job_id), "")
-        )
-        if best_job_domain != candidate_domain and best_score < 50:
-            logger.info(
-                "Best match is cross-domain and low score (%.1f) → falling back to quality score",
-                best_score
-            )
-            return None, None
-
-    logger.info("Best match: job_id=%s score=%.1f", best_job_id, best_score)
+    logger.info(
+        "Meilleur match : job_id=%s score=%.1f%s",
+        best_job_id, best_score,
+        " [pénalisé domaine]" if best_penalized else "",
+    )
     return best_result, best_job_id
 
 

@@ -94,6 +94,7 @@ class Domain(str, Enum):
     RETAIL = "retail"
     TRANSPORT = "transport"
     ENVIRONMENT = "environment"
+    PURCHASING = "purchasing" # Ajout du nouveau domaine pour les achats
     CRAFTSMANSHIP = "craftsmanship"
     SECURITY = "security"
 
@@ -220,6 +221,7 @@ DOMAIN_COMPLEXITY: Dict[Domain, float] = {
     Domain.PHARMA: 1.5, Domain.RETAIL: 0.7, Domain.TRANSPORT: 1.0,
     Domain.ENVIRONMENT: 1.2, Domain.CRAFTSMANSHIP: 1.1, Domain.SECURITY: 0.8,
 }
+DOMAIN_COMPLEXITY[Domain.PURCHASING] = 1.1 # Complexité par défaut pour les achats
 
 # =============================================================================
 # 5. Dictionnaires de compétences par domaine
@@ -251,8 +253,9 @@ DOMAIN_SKILLS: Dict[Domain, List[str]] = {
                           "filière", "coopérative", "certification bio"],
     Domain.CONSTRUCTION: ["btp", "gros œuvre", "second œuvre", "bim", "bâtiment",
                            "travaux publics", "génie civil", "chantier", "topographie"],
-    Domain.LOGISTICS: ["supply chain", "transport", "entrepôt", "stock",
-                        "inventaire", "douane", "incoterms", "fret", "flux"],
+    Domain.LOGISTICS: ["supply chain", "transport", "entrepôt", "entrepot", "stock",
+                        "inventaire", "douane", "incoterms", "fret", "flux", "magasinier",
+                        "gestion des stocks", "manutention", "logistique"],
     Domain.TELECOM: ["réseau", "fibre", "télécommunication", "antenne",
                       "5g", "ftth", "opérateur", "spectre", "datacenter"],
     Domain.ENERGY: ["électricité", "renouvelable", "solaire", "éolien",
@@ -283,6 +286,10 @@ DOMAIN_SKILLS: Dict[Domain, List[str]] = {
                           "carbone", "bilan", "recyclage", "biodiversité"],
     Domain.CRAFTSMANSHIP: ["artisanat", "métier", "fabrication", "manuel",
                             "atelier", "savoir-faire", "compagnon"],
+    Domain.PURCHASING: ["achats", "achat", "procurement", "sourcing", "acheteur",
+                        "approvisionnement", "fournisseur", "négociation fournisseur",
+                        "appel d'offres", "rfq", "vendor management", "contrat fournisseur",
+                        "acheteur industriel", "acheteur projet", "acheteur technique", "gestion des stocks"],
     Domain.SECURITY: ["sécurité", "sûreté", "gardiennage", "surveillance",
                        "télésurveillance", "contrôle d'accès", "prévention"],
 }
@@ -465,8 +472,13 @@ DOMAIN_TITLE_KEYWORDS: Dict[Domain, List[str]] = {
                  "gpec", "talent", "people", "human resources"],
     Domain.AGRICULTURE: ["agronome", "agricole", "agriculture", "agro",
                           "élevage", "elevage", "cultures", "plantation"],
-    Domain.CONSTRUCTION: ["btp", "bâtiment", "batiment", "construction",
-                           "génie civil", "genie civil", "chantier", "architecte"],
+    Domain.CONSTRUCTION: ["btp", "bâtiment", "batiment", "génie civil", "genie civil",
+                           "chantier", "conducteur de travaux", "chef de chantier",
+                           "topographe", "gros oeuvre", "second oeuvre", "bim",
+                           "directeur technique", "responsable technique", 
+                           "ingenieur btp", "ingénieur btp"],
+    # NOTE: "construction" retiré — trop ambigu (un acheteur peut travailler
+    # dans "une entreprise de construction"). Les termes spécifiques BTP suffisent.
     Domain.HEALTH: ["médecin", "medecin", "infirmier", "pharmacien", "santé",
                      "sante", "clinique", "hôpital", "hopital", "soins"],
     Domain.LEGAL: ["juriste", "avocat", "legal", "juridique", "conformité",
@@ -474,7 +486,8 @@ DOMAIN_TITLE_KEYWORDS: Dict[Domain, List[str]] = {
     Domain.EDUCATION: ["enseignant", "professeur", "formateur", "éducation",
                         "education", "pédagogie", "pedagogie", "école", "ecole"],
     Domain.LOGISTICS: ["logistique", "supply chain", "transport", "entrepôt",
-                        "entrepot", "magasinier", "douane"],
+                        "entrepot", "magasinier", "douane",
+                        "gestionnaire de flux", "gestionnaire de stock", "fret"],
     Domain.MARKETING: ["marketing", "communication", "digital", "brand",
                         "social media", "community manager"],
     Domain.SALES: ["commercial", "vente", "business developer", "kam",
@@ -499,19 +512,55 @@ DOMAIN_TITLE_KEYWORDS: Dict[Domain, List[str]] = {
     Domain.RETAIL: ["vendeur", "caissier", "magasin", "grande distribution"],
     Domain.TRANSPORT: ["chauffeur", "conducteur", "routier", "maritime", "aérien"],
     Domain.ENVIRONMENT: ["environnement", "environnementaliste", "rse", "durable"],
+    Domain.PURCHASING: ["acheteur", "achats", "procurement", "sourcing", "approvisionnement",
+                        "responsable achats", "directeur achats", "acheteur industriel",
+                        "acheteur projet", "acheteur technique", "category manager",
+                        "gestion des fournisseurs", "appel d'offres", "négociation"],
     Domain.CRAFTSMANSHIP: ["artisan", "menuiserie", "plomberie", "électricien bâtiment"],
     Domain.SECURITY: ["agent de sécurité", "vigile", "gardiennage", "sûreté"],
 }
 
 
 def detect_domain(title_lower: str, description_lower: str = "") -> Domain:
-    combined = f"{title_lower} {description_lower}"
-    scores: Dict[Domain, int] = {}
+    """
+    Détecte le domaine métier depuis le titre et la description du poste.
+
+    FIX v2.2 : scoring pondéré avec priorité aux correspondances dans le titre
+    (poids x3) vs la description (poids x1). Auparavant un simple count sans
+    pondération donnait des résultats incohérents quand des mots génériques comme
+    "construction" (présents dans achats ET BTP) faisaient basculer le domaine.
+    """
+    scores: Dict[Domain, float] = {}
+
     for domain, keywords in DOMAIN_TITLE_KEYWORDS.items():
-        count = sum(1 for kw in keywords if kw in combined)
-        if count > 0:
-            scores[domain] = count
-    return max(scores, key=scores.get) if scores else Domain.CONSULTING
+        score = 0.0
+        for kw in keywords:
+            # Correspondance dans le titre → poids fort (x3)
+            if kw in title_lower:
+                score += 3.0
+            # Correspondance dans la description seulement → poids faible (x1)
+            elif kw in description_lower:
+                score += 1.0
+        if score > 0:
+            scores[domain] = score
+
+    if not scores:
+        return Domain.CONSULTING
+
+    best = max(scores, key=scores.get)
+
+    # Garde-fou : si le meilleur score est inférieur à 3 (= aucune correspondance
+    # dans le titre, seulement des mots génériques dans la description), on retourne
+    # CONSULTING plutôt qu'un faux positif.
+    if scores[best] < 3.0:
+        # Dernière chance : correspondance exacte sur un terme fort
+        for domain, keywords in DOMAIN_TITLE_KEYWORDS.items():
+            for kw in keywords[:4]:   # les 4 premiers = les plus spécifiques
+                if kw in title_lower:
+                    return domain
+        return Domain.CONSULTING
+
+    return best
 
 
 # =============================================================================
@@ -1213,6 +1262,64 @@ def enrich_cv_data(cv_info: dict, raw_text: str) -> dict:
     return enriched
 
 
+def _parse_job_keywords(job_requirements: str, job_title: str = "") -> List[str]:
+    """
+    Extrait les mots-clés MÉTIER depuis le texte du poste (job_requirements + job_title).
+
+    Logique :
+      1. Tokenise et nettoie le texte du poste.
+      2. Retire les stopwords génériques (verbes courants, articles, etc.).
+      3. Retourne jusqu'à 40 tokens pertinents — ce sont les vrais critères du poste.
+
+    Cette fonction est la correction du bug critique où required_keywords était
+    alimenté par cv_data.get("skills", []) — les compétences DU CANDIDAT lui-même —
+    ce qui faisait scorer le candidat contre ses propres skills (score toujours élevé,
+    sans rapport avec le poste).
+    """
+    _JOB_STOPWORDS = {
+        # Français
+        "le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "en",
+        "dans", "sur", "avec", "pour", "par", "est", "sont", "avoir", "être",
+        "vous", "nous", "il", "elle", "ils", "elles", "que", "qui", "mais",
+        "donc", "car", "si", "ni", "ce", "se", "sa", "son", "ses", "leur",
+        "leurs", "au", "aux", "plus", "très", "bien", "bonne", "bon",
+        "fort", "forte", "capacité", "capacités", "aptitude", "aptitudes",
+        "compétence", "compétences", "connaissance", "connaissances",
+        "maîtrise", "maitrise", "expérience", "expériences", "profil",
+        "poste", "candidat", "candidature", "recherche", "recherchons",
+        "requis", "requise", "souhaité", "souhaitée", "idéalement",
+        "minimum", "ans", "années", "année", "lieu",
+        # Anglais
+        "the", "a", "an", "and", "or", "in", "on", "at", "to", "of", "for",
+        "with", "by", "from", "is", "are", "be", "have", "has", "will",
+        "you", "we", "he", "she", "they", "it", "this", "that", "but",
+        "required", "preferred", "minimum", "strong", "good", "excellent",
+        "ability", "skills", "skill", "experience", "knowledge", "understanding",
+        "familiar", "proficient", "working", "using", "years", "year",
+    }
+
+    combined = f"{job_title} {job_requirements}".lower()
+    # Supprime la ponctuation et les caractères spéciaux (sauf / et +)
+    combined = re.sub(r"[^\w\s/+#.-]", " ", combined)
+    tokens = combined.split()
+
+    keywords = []
+    seen = set()
+    for tok in tokens:
+        tok = tok.strip(".,;:!?()-")
+        if len(tok) < 3:
+            continue
+        if tok in _JOB_STOPWORDS:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            keywords.append(tok)
+        if len(keywords) >= 40:
+            break
+
+    return keywords
+
+
 def compute_candidate_score(
     cv_data: Dict[str, Any],
     job_title: str,
@@ -1223,6 +1330,10 @@ def compute_candidate_score(
     Compatibility shim expected by ai_service.py, cv_processing.py, and drive_sync.py.
     Wraps the rich hierarchical scorer. Returns a dict on 0–100 scale with both
     canonical v2.0 dimension keys AND the frontend aliases ScorePanel.jsx expects.
+
+    FIX v2.2 : required_keywords est maintenant parsé depuis job_requirements + job_title
+    (via _parse_job_keywords) au lieu des skills du candidat. Les missing_keywords
+    retournés sont donc les vrais mots-clés du poste absents du CV.
     """
     if isinstance(cv_data, dict):
         cv_text = cv_data.get("raw_text") or cv_data.get("full_text") or _build_cv_text(cv_data)
@@ -1237,6 +1348,9 @@ def compute_candidate_score(
         except (ValueError, TypeError):
             pass
 
+    # Keywords extraits du POSTE (correction du bug : était cv_data.get("skills"))
+    job_keywords = _parse_job_keywords(job_requirements, job_title)
+
     score_obj = score_candidate(
         candidate_id="COMPAT-" + str(hash(cv_text[:100])),
         cv_text=cv_text,
@@ -1245,9 +1359,11 @@ def compute_candidate_score(
         required_years_experience=(
             cv_data.get("experience_years") or 0 if isinstance(cv_data, dict) else 0
         ),
-        required_keywords=(
-            cv_data.get("skills", []) if isinstance(cv_data, dict) else []
-        ),
+        # FIX: on parse les mots-clés depuis le POSTE (job_title + job_requirements),
+        # PAS depuis les skills du candidat. L'ancienne version utilisait
+        # cv_data.get("skills", []) ce qui faisait scorer le candidat contre
+        # lui-même → score keywords toujours élevé sans rapport avec le poste.
+        required_keywords=job_keywords,
         past_titles=[
             exp.get("title")
             for exp in (cv_data.get("work_history", []) if isinstance(cv_data, dict) else [])
@@ -1259,17 +1375,22 @@ def compute_candidate_score(
     sd = score_to_dict(score_obj)
     dims = sd["dimensions"]
 
+    # Calcule les missing_keywords réels : mots du poste absents du CV
+    cv_text_norm = normalize_text(cv_text)
+    matched_kw = sd["details"]["keywords"].get("matched_keywords", [])
+    missing_kw = [kw for kw in job_keywords if normalize_text(kw) not in cv_text_norm]
+
     return {
         "score":           round(sd["final_score"] * 100, 2),
         "confidence":      round(sd["final_score"] * 100, 2),
         "domain":          sd["domain"],
         "hierarchy_level": sd["hierarchy_level"],
         "reasoning": (
-            f"Score calculé via scoring hiérarchique v2.1 "
+            f"Score calculé via scoring hiérarchique v2.2 "
             f"— Niveau: {sd['hierarchy_level']}"
         ),
-        "matched_keywords": sd["details"]["keywords"].get("matched_keywords", []),
-        "missing_keywords": [],
+        "matched_keywords": matched_kw,
+        "missing_keywords": missing_kw[:20],   # top 20 mots-clés du poste absents du CV
         "dimension_scores": {
             # canonical v2.0 keys
             "experience":     dims["experience"],

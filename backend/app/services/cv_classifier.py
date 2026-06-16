@@ -30,7 +30,7 @@ from app.config.classification_rules import CLASSIFICATION_RULES
 # =========================================================
 
 EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
-    "informatique_dev": {
+    "tech": {
         "strong": [
             "software engineer",
             "software developer",
@@ -120,7 +120,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "construction_btp": {
+    "construction": {
         "strong": [
             "civil engineer",
             "genie civil",
@@ -143,7 +143,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "ingenierie": {
+    "engineering": {
         "strong": [
             "mechanical engineer",
             "electrical engineer",
@@ -165,7 +165,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "finance_comptabilite": {
+    "finance": {
         "strong": [
             "comptable",
             "accountant",
@@ -187,7 +187,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "banque_assurance": {
+    "insurance": {
         "strong": [
             "conseiller bancaire",
             "analyste credit",
@@ -207,7 +207,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "ressources_humaines": {
+    "hr": {
         "strong": [
             "hr manager",
             "responsable rh",
@@ -225,7 +225,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "marketing_communication": {
+    "marketing": {
         "strong": [
             "marketing manager",
             "community manager",
@@ -245,7 +245,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "logistique_transport": {
+    "logistics": {
         "strong": [
             "supply chain manager",
             "responsable logistique",
@@ -264,7 +264,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "sante_medical": {
+    "health": {
         "strong": [
             "medecin",
             "médecin",
@@ -307,7 +307,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "droit_juridique": {
+    "legal": {
         "strong": [
             "juriste",
             "avocat",
@@ -345,7 +345,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "industrie_production": {
+    "production": {
         "strong": [
             "responsable production",
             "chef atelier",
@@ -363,7 +363,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-    "etudiant_stage": {
+    "internship": {
         "strong": [
             "etudiant",
             "étudiant",
@@ -385,7 +385,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         ],
     },
 
-"responsable_achats": {
+"purchasing": {
     "strong": [
         # Core procurement roles
         "responsable achats",
@@ -430,7 +430,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
     ],
 
     "weak": [
-        # Procurement vocabulary
+        # Vocabulaire achats — termes fonctionnels spécifiques à la fonction
         "achat",
         "achats",
         "purchasing",
@@ -440,7 +440,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         "strategic sourcing",
         "approvisionnement",
         "supply",
-        "supply chain",
+        # NOTE: "supply chain" seul retiré — trop générique (couvert par logistique)
         "vendor management",
         "gestion fournisseurs",
         "supplier management",
@@ -449,7 +449,7 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         "fournisseur",
         "fournisseurs",
 
-        # Negotiation / contracts
+        # Négociation / contrats fournisseurs
         "negociation",
         "négociation",
         "contract",
@@ -462,25 +462,13 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         "rfi",
         "rfp",
 
-        # Logistics / inventory related
-        "stock",
-        "inventory",
-        "warehouse",
-        "logistique",
-        "transport",
-        "distribution",
-        "livraison",
-
-        # ERP / tools
+        # ERP spécifiques achats (pas les ERP génériques)
         "sap mm",
-        "sap",
         "oracle procurement",
-        "erp",
-        "sage",
-        "excel",
-        "power bi",
+        # NOTE: "sap", "erp", "sage", "excel", "power bi" retirés — trop génériques,
+        #        présents dans presque tous les CV, faussent la classification.
 
-        # Purchasing KPIs
+        # KPIs achats
         "cost reduction",
         "cost optimization",
         "budget achats",
@@ -490,12 +478,16 @@ EXTENDED_DOMAINS: dict[str, dict[str, list[str]]] = {
         "forecast",
         "forecasting",
 
-        # International trade
-        "import",
-        "export",
-        "douane",
+        # Commerce international — uniquement le terme propre aux achats
         "incoterms",
-        "freight",
+        # NOTE: "import", "export", "douane", "freight" retirés — couverts par logistique/transport.
+        # NOTE CRITIQUE : "stock", "inventory", "warehouse", "logistique", "transport",
+        #   "distribution", "livraison", "entrepot" TOUS RETIRÉS — appartiennent
+        #   au domaine logistique. Leur présence ici classait les responsables
+        #   logistique BTP en "achats" par erreur.
+        # NOTE CRITIQUE : "construction" RETIRÉ — terme sectoriel (secteur d'activité),
+        #   non fonctionnel. Un acheteur travaillant dans le BTP ne doit pas être
+        #   classé "construction" à cause de son secteur.
     ],
 },
 }
@@ -661,4 +653,3 @@ if __name__ == "__main__":
     result = classify_cv(sample_cv)
 
     print("Detected domain:", result)
-
