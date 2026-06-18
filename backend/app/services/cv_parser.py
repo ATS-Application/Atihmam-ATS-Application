@@ -1,57 +1,69 @@
 # backend/app/services/cv_parser.py
 """
 Orchestrateur Principal du Pipeline - Atihmam ATS
-===================================================
-Coordonne séquentiellement les étapes :
-CV → Lecture & Extraction → Identification du poste exact → Évaluation isolée
+Coordonne : CV → Lecture & Extraction → Classification domaine → Évaluation.
 """
 
 from __future__ import annotations
 
-import io
-from app.services.cv_extractor import CVExtractor
-from app.services.cv_router import CVRouter
-from app.services.cv_evaluator import CVEvaluator
+import logging
 
-DOMAIN_VALUE_MAP = {
-    "Informatique & Développement logiciel": "informatique_dev",
-    "Réseaux & Cybersécurité":               "reseaux_cyber",
-    "Construction & BTP":                    "construction_btp",
-    "Ingénierie":                            "ingenierie",
-    "Finance & Comptabilité":                "finance_comptabilite",
-    "Banque & Assurance":                    "banque_assurance",
-    "Ressources Humaines":                   "ressources_humaines",
-    "Marketing & Communication":             "marketing_communication",
-    "Logistique & Transport":                "logistique_transport",
-    "Santé & Médical":                       "sante_medical",
-    "Éducation & Formation":                 "education",
-    "Droit & Juridique":                     "droit_juridique",
-    "Design & Créatif":                      "design_creatif",
-    "Industrie & Production":                "industrie_production",
-    "Étudiant / Stage":                      "etudiant_stage",
+from app.services.cv_extractor import CVExtractor, extract_text_from_bytes, extract_text_from_path
+from app.services.cv_router import CVRouter
+
+logger = logging.getLogger(__name__)
+
+FOLDER_LABELS: dict[str, str] = {
+    "informatique_dev": "📁 Informatique",
+    "reseaux_cyber": "📁 Réseaux & Cybersécurité",
+    "construction_btp": "📁 Construction & BTP",
+    "ingenierie": "📁 Ingénierie",
+    "finance_comptabilite": "📁 Finance",
+    "banque_assurance": "📁 Banque & Assurance",
+    "ressources_humaines": "📁 Ressources Humaines",
+    "marketing_communication": "📁 Marketing",
+    "logistique_transport": "📁 Logistique",
+    "sante_medical": "📁 Santé",
+    "education": "📁 Éducation",
+    "droit_juridique": "📁 Juridique",
+    "design_creatif": "📁 Design",
+    "industrie_production": "📁 Industrie",
+    "etudiant_stage": "📁 Étudiant / Stage",
+    "autres": "📁 Autres",
 }
+
 
 def process_candidate_resume(candidate, extracted_text: str):
     """
-    Nouveau déroulement de traitement strict :
-      1. Lecture du CV (effectuée en amont) ou extraction si nécessaire
-      2. Affectation directe du poste correspondant au domaine métier sans déviation
+    Pipeline de classification :
+      1. Texte déjà extrait en amont
+      2. Affectation du domaine métier via CVRouter
       3. Retourne le candidat classé
     """
     if not extracted_text:
-        print("[PIPELINE] Texte extrait manquant — Affectation par défaut 'autres'")
+        logger.warning("Texte extrait manquant — affectation par défaut 'autres'")
         candidate.domain = "autres"
-        candidate.folder = "📁 Autres"
+        candidate.folder = FOLDER_LABELS["autres"]
         return candidate
 
-    # Utilisation du nouveau routeur modulaire
     domain = CVRouter.assign_domain_strictly(
-        extracted_title=getattr(candidate, "extracted_title", ""),
-        full_text=extracted_text
+        extracted_title=getattr(candidate, "extracted_title", "")
+        or getattr(candidate, "current_position", ""),
+        full_text=extracted_text,
     )
 
     candidate.domain = domain or "autres"
-    candidate.folder = candidate.domain
-    
-    print(f"[PIPELINE] Domaine attribué avec succès : {candidate.domain}")
+    candidate.folder = FOLDER_LABELS.get(candidate.domain, FOLDER_LABELS["autres"])
+
+    logger.info("Domaine attribué : %s", candidate.domain)
     return candidate
+
+
+__all__ = [
+    "CVExtractor",
+    "CVRouter",
+    "extract_text_from_bytes",
+    "extract_text_from_path",
+    "process_candidate_resume",
+    "FOLDER_LABELS",
+]
