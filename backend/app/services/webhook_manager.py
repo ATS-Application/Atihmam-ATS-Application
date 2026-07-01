@@ -3,6 +3,7 @@ import time
 from app.config import get_settings
 from app.services.drive_service import register_webhook, stop_webhook
 from app.db.drive_channels import save_channel, get_active_channel, delete_channel
+from app.db.supabase_client import get_supabase_admin
 
 RENEWAL_BUFFER_MS = 24 * 60 * 60 * 1000  # 1 day
 
@@ -41,6 +42,10 @@ def ensure_webhook_registered() -> dict:
         folder_id=folder_id,
         expiration_ms=channel["expiration_ms"],
     )
+    get_supabase_admin().table("app_config").upsert(
+        {"key": "drive_page_token", "value": channel["start_page_token"]},
+        on_conflict="key",
+    ).execute()
     return {
         "status": "registered",
         "channel_id": channel["channel_id"],

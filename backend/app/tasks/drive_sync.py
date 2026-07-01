@@ -24,6 +24,7 @@ Changelog v2.2:
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import re
 import subprocess
@@ -36,6 +37,7 @@ from app.services.ai_service import extract_cv_info
 from app.services.drive_service import (
     download_file_bytes,
     get_file_metadata,
+    get_start_page_token,
     list_new_pdf_files_since,
     list_pdf_files,
 )
@@ -50,6 +52,14 @@ from app.tasks.cv_processing import (
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_drive_folder_id(settings) -> str:
+    folder_id = (getattr(settings, "drive_folder_id", "") or "").strip()
+    if not folder_id or folder_id.lower() == "root":
+        return "root"
+    return folder_id
+
+
 # Quality-fallback dampening constants
 _KW_DAMPEN  = 0.85
 _KW_CAP     = 85.0
@@ -61,7 +71,7 @@ _SEM_CAP    = 75.0
 # TEXT EXTRACTION  (defined first — used by process_drive_file below)
 # --------------------------------------------------------------------------- #
 
-def safe_extract_text(pdf_bytes: bytes, file_name: str) -> str:
+def safe_extract_text(file_bytes: bytes, file_name: str) -> str:
     """
     Extract PDF text in an isolated subprocess so a native C crash
     (SIGABRT/SIGSEGV from a malformed PDF) cannot kill the Celery worker.
@@ -74,7 +84,7 @@ def safe_extract_text(pdf_bytes: bytes, file_name: str) -> str:
     try:
         result = subprocess.run(
             [sys.executable, "-c", script],
-            input=pdf_bytes,
+            input=file_bytes,
             capture_output=True,
             timeout=60,
         )
@@ -92,12 +102,22 @@ def safe_extract_text(pdf_bytes: bytes, file_name: str) -> str:
 # HELPERS
 # --------------------------------------------------------------------------- #
 
-def sanitize_filename(filename: str) -> str:
+def _extension_for_mime(mime_type: str | None) -> str:
+    if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return ".docx"
+    if mime_type == "application/msword":
+        return ".doc"
+    if mime_type == "image/jpeg":
+        return ".jpg"
+    return mimetypes.guess_extension(mime_type or "") or ".pdf"
+
+
+def sanitize_filename(filename: str, mime_type: str | None = None) -> str:
     name, ext = os.path.splitext(filename)
     cleaned_name = re.sub(r"[^a-zA-Z0-9_.-]", "", name.replace(" ", "_"))
     cleaned_ext = re.sub(r"[^a-zA-Z0-9.]", "", ext)
-    if cleaned_ext.lower() != ".pdf":
-        cleaned_ext = ".pdf"
+    if not cleaned_ext:
+        cleaned_ext = _extension_for_mime(mime_type)
     return f"{cleaned_name}{cleaned_ext}"
 
 
@@ -116,14 +136,18 @@ def upload_cv_to_storage(
     supabase,
     drive_file_id: str,
     file_name: str,
-    pdf_bytes: bytes,
+    file_bytes: bytes,
+    mime_type: str | None = None,
 ) -> str:
     # Path inside the bucket — no bucket name prefix
     storage_path = f"drive/{drive_file_id}/{file_name}"
     supabase.storage.from_("cvs").upload(
         storage_path,
-        pdf_bytes,
-        file_options={"content-type": "application/pdf", "upsert": "true"},
+        file_bytes,
+        file_options={
+            "content-type": mime_type or "application/octet-stream",
+            "upsert": "true",
+        },
     )
     return supabase.storage.from_("cvs").get_public_url(storage_path)
 
@@ -251,17 +275,24 @@ def process_drive_file(
             logger.info("Skipping already-processed file: %s", drive_file_id)
             return {"status": "skipped", "drive_file_id": drive_file_id}
 
-        # 2. Fetch metadata + download PDF
+        # 2. Fetch metadata + download file
         metadata  = get_file_metadata(drive_file_id)
-        file_name = sanitize_filename(metadata.get("name", f"{drive_file_id}.pdf"))
-        pdf_bytes = download_file_bytes(drive_file_id)
+        mime_type = metadata.get("mimeType")
+        file_name = sanitize_filename(metadata.get("name", drive_file_id), mime_type)
+        file_bytes = download_file_bytes(drive_file_id)
 
         # 3. Upload to Supabase storage
-        cv_url = upload_cv_to_storage(supabase, drive_file_id, file_name, pdf_bytes)
+        cv_url = upload_cv_to_storage(
+            supabase,
+            drive_file_id,
+            file_name,
+            file_bytes,
+            mime_type,
+        )
 
         # 4. Extract raw text (isolated subprocess to guard against C-level crashes)
-        logger.info("Extracting text: %s (%d bytes)", file_name, len(pdf_bytes))
-        raw_text = safe_extract_text(pdf_bytes, file_name)
+        logger.info("Extracting text: %s (%d bytes)", file_name, len(file_bytes))
+        raw_text = safe_extract_text(file_bytes, file_name)
         if not raw_text.strip():
             logger.warning("Empty text extracted from file: %s", drive_file_id)
             return {
@@ -316,12 +347,10 @@ def process_drive_file(
 
 def sync_drive_folder(job_id: str | None = None) -> dict:
     settings = get_settings()
-
-    if not settings.drive_folder_id:
-        return {"status": "skipped", "reason": "missing_drive_folder_id"}
+    drive_folder_id = _resolve_drive_folder_id(settings)
 
     supabase = get_supabase_admin()  # single client for the entire sync
-    files    = list_pdf_files(settings.drive_folder_id)
+    files    = list_pdf_files(drive_folder_id)
 
     existing = supabase.table("candidates").select("drive_file_id").execute()
     processed_ids = {
@@ -355,9 +384,7 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
 
 def sync_drive_webhook(job_id: str | None = None) -> dict:
     settings = get_settings()
-
-    if not settings.drive_folder_id:
-        return {"status": "skipped", "reason": "missing_drive_folder_id"}
+    drive_folder_id = _resolve_drive_folder_id(settings)
 
     supabase = get_supabase_admin()
 
@@ -371,11 +398,20 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
     page_token = config_row.data["value"] if config_row.data else None
 
     if not page_token:
-        logger.info("No page token found — falling back to full folder sync")
-        return sync_drive_folder(job_id)
+        logger.info("No page token found — running initial full folder sync")
+        initial_result = sync_drive_folder(job_id)
+        start_page_token = get_start_page_token()
+        supabase.table("app_config").upsert(
+            {"key": "drive_page_token", "value": start_page_token}
+        ).execute()
+        return {
+            **initial_result,
+            "status": "initialized",
+            "reason": "initial_full_sync_completed",
+        }
 
     new_files, next_token = list_new_pdf_files_since(
-        settings.drive_folder_id,
+        drive_folder_id,
         page_token,
     )
 

@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from httpx import RemoteProtocolError
 
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_role
 from app.db.supabase_client import get_supabase_admin
 from app.services.scoring_service import (
     INTELLIGENT_SCORE_DEFAULT_WEIGHTS,
@@ -140,13 +140,13 @@ async def dislike_candidate(
 
 
 @router.get("/weights", status_code=status.HTTP_200_OK)
-async def get_current_weights(user: dict = Depends(get_current_user)):
+async def get_current_weights(user: dict = Depends(require_role("admin"))):
     supabase = get_supabase_admin()
     return {"weights": _load_current_weights(supabase)}
 
 
 @router.delete("/weights/reset", status_code=status.HTTP_200_OK)
-async def reset_weights(user: dict = Depends(get_current_user)):
+async def reset_weights(user: dict = Depends(require_role("admin"))):
     supabase = get_supabase_admin()
     supabase.table("app_config").delete().eq("key", "ats_weights").execute()
     return {"status": "reset"}

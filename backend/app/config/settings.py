@@ -1,4 +1,5 @@
 # backend/app/config/settings.py
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
@@ -25,7 +26,7 @@ class Settings(BaseSettings):
     supabase_service_role_key: str | None = None
 
     # ── CORS ─────────────────────────────
-    allowed_origins: List[str] = []
+    allowed_origins: List[str] = Field(default_factory=list)
 
     # ── Celery ───────────────────────────
     celery_broker_url: str | None = None
@@ -42,6 +43,7 @@ class Settings(BaseSettings):
     google_drive_credentials_json: str | None = None
     drive_folder_id: str | None = None
     webhook_base_url: str | None = None
+    drive_webhook_token: str | None = None
 
     disable_ssl_verification: bool = False
 
@@ -53,4 +55,7 @@ class Settings(BaseSettings):
 
 
 def get_settings():
-    return Settings()
+    settings = Settings()
+    if settings.app_env != "development" and settings.secret_key == "change-me":
+        raise ValueError("SECRET_KEY must be set outside development")
+    return settings

@@ -32,7 +32,7 @@ from fastapi import (
     status,
 )
 
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_role
 from app.core.state_machine import validate_transition
 from app.db.supabase_client import get_supabase, get_supabase_admin
 from app.models.candidate import (
@@ -386,7 +386,7 @@ async def delete_candidate(
 
 
 @router.delete("", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_all_candidates(user: dict = Depends(get_current_user)):
+async def delete_all_candidates(user: dict = Depends(require_role("admin"))):
     supabase = get_supabase()
     supabase.table("candidates").delete().neq(
         "id", "00000000-0000-0000-0000-000000000000"
@@ -399,7 +399,10 @@ async def delete_all_candidates(user: dict = Depends(get_current_user)):
 # ============================================================================
 
 @router.post("/admin/backfill-dimensions")
-async def backfill_dimensions(supabase=Depends(get_supabase_admin)):
+async def backfill_dimensions(
+    user: dict = Depends(require_role("admin")),
+    supabase=Depends(get_supabase_admin),
+):
     """
     Re-score all completed candidates with the latest scoring pipeline.
     Candidates linked to a job use compute_candidate_score;

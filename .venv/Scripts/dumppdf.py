@@ -1,4 +1,4 @@
-#!C:\Users\LENOVO\Desktop\Internship_Projects\Task2\Atihmam-ATS-App\.venv\Scripts\python.exe
+#!C:\Users\LENOVO\Desktop\Atihmam-ATS-Application\.venv\Scripts\python.exe
 """Extract pdf structure in XML format"""
 import logging
 import os.path

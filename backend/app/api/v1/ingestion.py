@@ -20,11 +20,13 @@ from fastapi import (
     status,
 )
 
+from app.config import get_settings
 from app.core.security import (
     get_current_user,
     require_role,
 )
 
+from app.db.drive_channels import get_active_channel
 from app.db.supabase_client import (
     get_supabase_admin,
 )
@@ -34,7 +36,7 @@ from app.services.webhook_manager import (
 )
 
 from app.tasks.cv_processing import process_cv
-from app.tasks.drive_sync import sync_drive_folder
+from app.tasks.drive_sync import sync_drive_folder, sync_drive_webhook
 
 router = APIRouter(
     prefix="/ingestion",
@@ -151,14 +153,17 @@ def queue_cv_processing(
 def queue_drive_sync(
     background_tasks: BackgroundTasks,
     job_id: str | None = None,
+    incremental: bool = False,
 ):
     """
     Try Celery first.
     Fallback to FastAPI BackgroundTasks.
     """
 
+    sync_func = sync_drive_webhook if incremental else sync_drive_folder
+
     try:
-        sync_drive_folder.delay(
+        sync_func.delay(
             job_id=job_id,
         )
 
@@ -166,11 +171,31 @@ def queue_drive_sync(
 
     except Exception:
         background_tasks.add_task(
-            sync_drive_folder,
+            sync_func,
             job_id=job_id,
         )
 
         return "background"
+
+
+def verify_drive_webhook(headers) -> bool:
+    settings = get_settings()
+
+    expected_token = settings.drive_webhook_token
+    if expected_token and headers.get("x-goog-channel-token") != expected_token:
+        return False
+
+    if not settings.drive_folder_id:
+        return False
+
+    active_channel = get_active_channel(settings.drive_folder_id)
+    if not active_channel:
+        return False
+
+    return (
+        headers.get("x-goog-channel-id") == active_channel.get("channel_id")
+        and headers.get("x-goog-resource-id") == active_channel.get("resource_id")
+    )
 
 
 # =========================================================
@@ -355,6 +380,12 @@ async def drive_webhook(
 ):
     headers = request.headers
 
+    if not verify_drive_webhook(headers):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid Drive webhook signature.",
+        )
+
     resource_state = headers.get(
         "x-goog-resource-state",
         ""
@@ -388,7 +419,8 @@ async def drive_webhook(
         }
 
     worker = queue_drive_sync(
-        background_tasks=background_tasks
+        background_tasks=background_tasks,
+        incremental=True,
     )
 
     return {

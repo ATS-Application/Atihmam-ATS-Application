@@ -1,4 +1,4 @@
-#!C:\Users\LENOVO\Desktop\Internship_Projects\Task2\Atihmam-ATS-App\.venv\Scripts\python.exe
+#!C:\Users\LENOVO\Desktop\Atihmam-ATS-Application\.venv\Scripts\python.exe
 """A command line tool for extracting text and images from PDF and
 output it to plain text, html, xml or tags."""
 import argparse
