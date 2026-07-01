@@ -46,8 +46,15 @@ router = APIRouter(
 # CONFIG
 # =========================================================
 
+# Autorise désormais les formats PDF, Word et Images (OCR)
 ALLOWED_CONTENT_TYPES = {
     "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "application/msword",  # .doc
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp"
 }
 
 MAX_FILE_SIZE_MB = 10
@@ -183,12 +190,13 @@ async def upload_cv(
     """
     Upload a CV and queue asynchronous processing.
     Supports Celery and FastAPI BackgroundTasks.
+    Supports PDF, Word, and Image (OCR) files.
     """
 
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are accepted.",
+            detail="Seuls les formats PDF, Word (.docx, .doc) et Images (.png, .jpeg, .jpg, .webp) sont autorisés.",
         )
 
     content = await file.read()
@@ -255,8 +263,19 @@ async def upload_cv(
         note="CV uploaded manually.",
     )
 
+    # Détermine l'extension appropriée selon le content-type si le nom de fichier est manquant
+    default_ext = "pdf"
+    if file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        default_ext = "docx"
+    elif file.content_type == "application/msword":
+        default_ext = "doc"
+    elif "image/" in (file.content_type or ""):
+        default_ext = (file.content_type or "").split("/")[-1]
+        if default_ext == "jpeg":
+            default_ext = "jpg"
+
     safe_filename = sanitize_filename(
-        file.filename or "cv.pdf"
+        file.filename or f"cv.{default_ext}"
     )
 
     unique_filename = (
@@ -268,6 +287,7 @@ async def upload_cv(
     )
 
     try:
+        # Upload vers Supabase avec le type MIME dynamique du fichier d'origine
         (
             supabase.storage
             .from_("cvs")
@@ -275,7 +295,7 @@ async def upload_cv(
                 storage_path,
                 content,
                 file_options={
-                    "content-type": "application/pdf",
+                    "content-type": file.content_type,
                     "upsert": "false",
                 },
             )

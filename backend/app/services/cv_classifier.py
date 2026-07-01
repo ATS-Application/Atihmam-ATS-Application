@@ -653,3 +653,5 @@ if __name__ == "__main__":
     result = classify_cv(sample_cv)
 
     print("Detected domain:", result)
+backend/app/services/cv_parser.py
+
