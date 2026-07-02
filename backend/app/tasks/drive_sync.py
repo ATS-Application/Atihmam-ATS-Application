@@ -229,6 +229,50 @@ def insert_candidate(supabase, payload: dict, drive_file_id: str) -> dict:
         raise
 
 
+def record_failed_drive_candidate(
+    supabase,
+    drive_file_id: str,
+    file_name: str | None,
+    error_message: str,
+    job_id: str | None = None,
+) -> dict:
+    """Record a failed file in the database so it's not repeatedly retried."""
+    try:
+        payload = {
+            "full_name": file_name or f"Fichier Drive ({drive_file_id})",
+            "drive_file_id": drive_file_id,
+            "processing_status": "failed",
+            "processing_error": error_message[:500],
+            "status": "applied",
+        }
+        if job_id:
+            from uuid import UUID
+            try:
+                payload["job_id"] = str(UUID(job_id))
+            except ValueError:
+                pass
+        supabase.table("candidates").insert(payload).execute()
+        return {
+            "status": "failed",
+            "reason": error_message,
+            "drive_file_id": drive_file_id,
+        }
+    except Exception as exc:
+        exc_str = str(exc)
+        if "23505" in exc_str or "uq_candidates_drive_file_id" in exc_str:
+            return {
+                "status": "skipped",
+                "reason": "duplicate",
+                "drive_file_id": drive_file_id,
+            }
+        logger.exception("Failed to write failed candidate status to database for %s", drive_file_id)
+        return {
+            "status": "error",
+            "reason": str(exc),
+            "drive_file_id": drive_file_id,
+        }
+
+
 # --------------------------------------------------------------------------- #
 # SCORING
 # --------------------------------------------------------------------------- #
@@ -326,6 +370,7 @@ def process_drive_file(
     supabase,                       # injected by caller; no new client per file
     job_id: str | None = None,
 ) -> dict:
+    file_name = None
     try:
         # 1. Idempotency check
         if candidate_exists(supabase, drive_file_id):
@@ -352,11 +397,13 @@ def process_drive_file(
         raw_text = safe_extract_text(file_bytes, file_name)
         if not raw_text.strip():
             logger.warning("Empty text extracted from file: %s", drive_file_id)
-            return {
-                "status":        "failed",
-                "reason":        "empty_text",
-                "drive_file_id": drive_file_id,
-            }
+            return record_failed_drive_candidate(
+                supabase,
+                drive_file_id=drive_file_id,
+                file_name=file_name,
+                error_message="Empty text extracted from file",
+                job_id=job_id,
+            )
 
         # 5. AI extraction
         extracted = extract_cv_info(raw_text)
@@ -393,9 +440,15 @@ def process_drive_file(
         # 8. Insert
         return insert_candidate(supabase, payload, drive_file_id)
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Error processing Drive file %s", drive_file_id)
-        return {"status": "error", "drive_file_id": drive_file_id}
+        return record_failed_drive_candidate(
+            supabase,
+            drive_file_id=drive_file_id,
+            file_name=file_name,
+            error_message=str(exc),
+            job_id=job_id,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -447,7 +500,7 @@ def sync_drive_folder(job_id: str | None = None, batch_size: int = _DEFAULT_BATC
         )
         result = process_drive_file(file_id, supabase, job_id)
         results.append(result)
-        if result.get("status") == "processed":
+        if result.get("status") in ("processed", "failed", "skipped"):
             processed_ids.add(file_id)
         # Throttle AI API calls to stay within rate limits
         if idx < len(batch) - 1:
@@ -498,6 +551,90 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
     return {**summary, "mode": "full_reconcile"}
 
 
+def _run_full_sync_until_done(job_id: str | None = None) -> None:
+    """
+    Keep calling sync_drive_folder in batches until every file has been
+    imported (status == 'done') or no new files were processed in the last
+    batch (circuit-breaker to avoid infinite loops on persistent errors).
+    Saves the sync status to app_config in the database.
+    """
+    from datetime import datetime
+    supabase = get_supabase_admin()
+
+    sync_status = {
+        "status": "processing",
+        "started_at": datetime.utcnow().isoformat() + "Z",
+        "processed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": 0,
+        "remaining": 0,
+        "total_files": 0,
+        "message": "La synchronisation a commencé."
+    }
+
+    def save_status(status_dict):
+        try:
+            supabase.table("app_config").upsert(
+                {"key": "drive_sync_status", "value": status_dict},
+                on_conflict="key"
+            ).execute()
+        except Exception:
+            logger.exception("Failed to save sync status to app_config")
+
+    save_status(sync_status)
+
+    max_rounds = 50       # safety cap: at most 50 × batch_size files total
+    round_num  = 0
+    while round_num < max_rounds:
+        round_num += 1
+        try:
+            summary = sync_drive_folder(job_id=job_id)
+            logger.info("Batch %d/%d — summary: %s", round_num, max_rounds, summary)
+            
+            # Accumulate progress
+            sync_status["processed"] += summary.get("processed", 0)
+            sync_status["failed"] += summary.get("failed", 0)
+            sync_status["skipped"] += summary.get("skipped", 0)
+            sync_status["errors"] += summary.get("errors", 0)
+            sync_status["remaining"] = summary.get("remaining", 0)
+            sync_status["total_files"] = summary.get("total_files", 0)
+            
+            if summary.get("status") == "done":
+                sync_status["status"] = "completed"
+                sync_status["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                sync_status["message"] = f"Synchronisation terminée avec succès. Total: {sync_status['total_files']} fichier(s). Importés: {sync_status['processed']}. Échoués: {sync_status['failed']}. Doublons: {sync_status['skipped']}."
+                save_status(sync_status)
+                logger.info("Full sync complete after %d batch(es).", round_num)
+                break
+                
+            progress = summary.get("processed", 0) + summary.get("failed", 0) + summary.get("skipped", 0)
+            if progress == 0 and summary.get("remaining", 0) > 0:
+                reason = f"Aucun fichier n'a pu être traité, marqué en échec ou ignoré dans le lot {round_num}."
+                sync_status["status"] = "stopped"
+                sync_status["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                sync_status["message"] = f"Synchronisation arrêtée : {reason}. Fichiers restants : {sync_status['remaining']}."
+                save_status(sync_status)
+                logger.warning(
+                    "No files were successfully processed, failed, or skipped in batch %d (remaining=%d). "
+                    "Stopping to avoid an infinite loop — check errors above.",
+                    round_num,
+                    summary.get("remaining", 0),
+                )
+                break
+            else:
+                sync_status["message"] = f"Synchronisation en cours... Traité lot {round_num}. Fichiers restants : {sync_status['remaining']}."
+                save_status(sync_status)
+        except Exception as exc:
+            reason = f"Erreur inattendue dans le lot {round_num} : {str(exc)}"
+            sync_status["status"] = "failed"
+            sync_status["completed_at"] = datetime.utcnow().isoformat() + "Z"
+            sync_status["message"] = reason
+            save_status(sync_status)
+            logger.exception("Unexpected error in batch %d; aborting full sync.", round_num)
+            break
+
+
 # --------------------------------------------------------------------------- #
 # WEBHOOK RENEWAL
 # --------------------------------------------------------------------------- #
@@ -515,8 +652,8 @@ try:
     from app.core.celery_config import celery_app
 
     @celery_app.task(name="app.tasks.drive_sync.sync_drive_folder", bind=True)
-    def sync_drive_folder_task(self, job_id: str | None = None) -> dict:
-        return sync_drive_folder(job_id)
+    def sync_drive_folder_task(self, job_id: str | None = None) -> None:
+        _run_full_sync_until_done(job_id)
 
     @celery_app.task(name="app.tasks.drive_sync.sync_drive_webhook", bind=True)
     def sync_drive_webhook_task(self, job_id: str | None = None) -> dict:

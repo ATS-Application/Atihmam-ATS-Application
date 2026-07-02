@@ -12,6 +12,7 @@ import {
   deleteCandidate,
   uploadCV,
   triggerDriveSync,
+  getDriveSyncStatus,
 } from "../api/candidatesApi";
 
 // Processing statuses that mean "still in flight" — poll until we leave these.
@@ -134,13 +135,6 @@ export function useUploadCV() {
 
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["candidates"] });
-      toast.success("CV uploadé — traitement en cours");
-    },
-
-    onError: (err) => {
-      toast.error(
-        err.response?.data?.detail || "Échec de l'upload"
-      );
     },
   });
 }
@@ -151,17 +145,25 @@ export function useDriveSync() {
   return useMutation({
     mutationFn: triggerDriveSync,
 
-    onSuccess: (response) => {
-      const data = response?.data ?? {};
-      const msg =
-        data.message ||
-        `Sync terminée — ${data.processed ?? 0} nouveau(x) CV importé(s).`;
-      toast.success(msg, { duration: 6000 });
+    onSuccess: () => {
+      toast.success("Synchronisation démarrée en arrière-plan...", { duration: 4000 });
+      qc.invalidateQueries({ queryKey: ["driveSyncStatus"] });
       qc.invalidateQueries({ queryKey: ["candidates"] });
     },
 
     onError: () => {
       toast.error("Échec de la synchronisation Drive");
     },
+  });
+}
+
+export function useDriveSyncStatus(options = {}) {
+  return useQuery({
+    queryKey: ["driveSyncStatus"],
+    queryFn: async () => {
+      const response = await getDriveSyncStatus();
+      return response.data;
+    },
+    ...options,
   });
 }

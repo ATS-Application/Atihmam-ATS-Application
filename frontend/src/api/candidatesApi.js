@@ -55,3 +55,6 @@ export const triggerDriveSync = (job_id) =>
       params: { job_id },
     }
   );
+
+export const getDriveSyncStatus = () =>
+  axiosClient.get("/ingestion/drive/sync/status");

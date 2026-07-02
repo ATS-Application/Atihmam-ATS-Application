@@ -7,7 +7,6 @@ import {
   FileText,
   Briefcase,
   Sparkles,
-  CheckCircle2,
 } from "lucide-react";
 
 import toast from "react-hot-toast";
@@ -16,63 +15,108 @@ import { useUploadCV } from "../hooks/useCandidates";
 import { useJobs } from "../hooks/useJobs";
 
 export default function UploadCVModal({ onClose }) {
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);
   const [jobId, setJobId] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
 
   const fileRef = useRef();
 
-  const { mutate, isPending } = useUploadCV();
+  const { mutateAsync } = useUploadCV();
   const { data: jobs = [] } = useJobs();
+
+  const ALLOWED_TYPES = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp"
+  ];
+
+  const ALLOWED_EXTENSIONS = [
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".png",
+    ".jpeg",
+    ".jpg",
+    ".webp"
+  ];
+
+  const isValidFile = (file) => {
+    if (ALLOWED_TYPES.includes(file.type)) return true;
+    const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+    return ALLOWED_EXTENSIONS.includes(ext);
+  };
 
   function handleDrop(e) {
     e.preventDefault();
     setIsDragging(false);
 
-    const dropped = e.dataTransfer.files?.[0];
+    const dropped = Array.from(e.dataTransfer.files || []);
+    const validFiles = dropped.filter(isValidFile);
 
-    if (dropped?.type === "application/pdf") {
-      setFile(dropped);
+    if (validFiles.length > 0) {
+      setFiles((prev) => [...prev, ...validFiles]);
+    }
+
+    if (dropped.length !== validFiles.length) {
+      toast.error("Certains fichiers ont été ignorés (PDF, Word, Images uniquement)");
     }
   }
 
   function handleFileSelect(e) {
-    const selected = e.target.files?.[0];
+    const selected = Array.from(e.target.files || []);
+    const validFiles = selected.filter(isValidFile);
 
-    if (selected?.type === "application/pdf") {
-      setFile(selected);
+    if (validFiles.length > 0) {
+      setFiles((prev) => [...prev, ...validFiles]);
+    }
+
+    if (selected.length !== validFiles.length) {
+      toast.error("Certains fichiers ont été ignorés (PDF, Word, Images uniquement)");
     }
   }
 
-  function handleSubmit() {
-    if (!file) return;
+  async function handleSubmit() {
+    if (files.length === 0) return;
+    setIsUploading(true);
 
-    mutate(
-      {
-        file,
-        job_id: jobId || undefined,
-      },
-      {
-        onSuccess: () => {
-          toast.success("CV uploaded successfully");
-          onClose();
-        },
+    let successCount = 0;
+    let failCount = 0;
+    let dupCount = 0;
 
-        onError: (error) => {
-          if (error?.response?.status === 409) {
-            toast.error(
-              error.response?.data?.detail ||
-                "This CV has already been processed."
-            );
-            return;
-          }
-
-          toast.error("Failed to upload CV.");
-        },
+    for (const file of files) {
+      try {
+        await mutateAsync({
+          file,
+          job_id: jobId || undefined,
+        });
+        successCount++;
+      } catch (error) {
+        if (error?.response?.status === 409) {
+          dupCount++;
+        } else {
+          failCount++;
+        }
       }
-    );
-  }
+    }
 
+    setIsUploading(false);
+
+    if (successCount > 0) {
+      toast.success(`${successCount} CV importé(s) avec succès`);
+      onClose();
+    }
+    if (dupCount > 0) {
+      toast.error(`${dupCount} CV déjà existant(s)`);
+    }
+    if (failCount > 0) {
+      toast.error(`${failCount} échec(s) d'importation`);
+    }
+  }
 
   return (
     <div
@@ -88,8 +132,7 @@ export default function UploadCVModal({ onClose }) {
       <div
         className="
           relative
-          w-full max-w-lg h-150
-          overflow-hidden
+          w-full max-w-lg
           rounded-3xl
           border border-white/20
           bg-white
@@ -111,12 +154,12 @@ export default function UploadCVModal({ onClose }) {
 
             <div>
               <h2 className="text-xl font-bold text-gray-900">
-                Uploader un CV
+                Uploader des CV
               </h2>
 
               <p className="text-sm text-gray-500 mt-1">
-                Importez un CV PDF et
-                associez-le à un poste
+                Importez un ou plusieurs CV et
+                associez-les à un poste
               </p>
             </div>
           </div>
@@ -141,7 +184,7 @@ export default function UploadCVModal({ onClose }) {
           {/* Upload Area */}
           <div
             onClick={() =>
-              fileRef.current?.click()
+              files.length === 0 && fileRef.current?.click()
             }
             onDragOver={(e) => {
               e.preventDefault();
@@ -157,9 +200,9 @@ export default function UploadCVModal({ onClose }) {
               overflow-hidden
               rounded-3xl
               border-2 border-dashed
-              p-10
+              p-8
               text-center
-              cursor-pointer
+              ${files.length === 0 ? "cursor-pointer" : "cursor-default"}
               transition-all duration-300
 
               ${
@@ -181,7 +224,8 @@ export default function UploadCVModal({ onClose }) {
             <input
               ref={fileRef}
               type="file"
-              accept="application/pdf"
+              accept="application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/*"
+              multiple
               className="hidden"
               onChange={handleFileSelect}
             />
@@ -189,47 +233,45 @@ export default function UploadCVModal({ onClose }) {
             {/* Glow */}
             <div className="absolute inset-0 bg-linear-to-br from-orange-500/5 to-amber-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
 
-            {file ? (
-              <div className="relative flex flex-col items-center">
-                <div className="relative">
-                  <div className="p-5 rounded-3xl bg-green-100">
-                    <FileText
-                      size={34}
-                      className="text-green-600"
-                    />
-                  </div>
-
-                  <div className="absolute -bottom-1 -right-1">
-                    <CheckCircle2
-                      size={22}
-                      className="text-green-500 bg-white rounded-full"
-                    />
-                  </div>
+            {files.length > 0 ? (
+              <div className="relative flex flex-col w-full text-left" onClick={(e) => e.stopPropagation()}>
+                <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
+                  Fichiers sélectionnés ({files.length})
+                </h4>
+                <div className="max-h-40 overflow-y-auto space-y-2 pr-1">
+                  {files.map((f, i) => (
+                    <div key={i} className="flex items-center justify-between p-2.5 rounded-2xl bg-gray-50 border border-gray-100 hover:border-gray-200 transition-colors">
+                      <div className="flex items-center gap-3 truncate">
+                        <div className="p-2 rounded-xl bg-orange-100/50">
+                          <FileText size={16} className="text-orange-600" />
+                        </div>
+                        <div className="truncate">
+                          <p className="text-xs font-semibold text-gray-700 truncate">{f.name}</p>
+                          <p className="text-[10px] text-gray-400">{(f.size / (1024 * 1024)).toFixed(2)} MB</p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFiles((prev) => prev.filter((_, idx) => idx !== i));
+                        }}
+                        className="p-1 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-
-                <h3 className="mt-4 font-semibold text-orange-900">
-                  {file.name}
-                </h3>
-
-                <p className="text-sm text-gray-500 mt-1">
-                  PDF sélectionné avec
-                  succès
-                </p>
-
+                
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    setFile(null);
+                    fileRef.current?.click();
                   }}
-                  className="
-                    mt-4
-                    text-sm font-medium
-                    text-red-500
-                    hover:text-red-600
-                    transition-colors
-                  "
+                  className="mt-4 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-gray-200 bg-white text-gray-600 text-xs font-semibold hover:bg-gray-50 transition-colors"
                 >
-                  Retirer le fichier
+                  <Upload size={12} />
+                  Ajouter d'autres fichiers
                 </button>
               </div>
             ) : (
@@ -242,18 +284,17 @@ export default function UploadCVModal({ onClose }) {
                 </div>
 
                 <h3 className="text-lg font-semibold text-gray-900">
-                  Déposez votre CV ici
+                  Déposez vos CV ici
                 </h3>
 
                 <p className="text-sm text-gray-500 mt-2">
-                  Glissez-déposez un PDF
-                  ou cliquez pour
-                  sélectionner un fichier
+                  Glissez-déposez un ou plusieurs PDF/Word
+                  ou cliquez pour sélectionner
                 </p>
 
                 <div className="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-orange-100 text-orange-700 text-sm font-medium">
                   <Upload size={15} />
-                  Choisir un fichier
+                  Choisir des fichiers
                 </div>
               </div>
             )}
@@ -335,7 +376,7 @@ export default function UploadCVModal({ onClose }) {
             </button>
 
             <button
-              disabled={!file || isPending}
+              disabled={files.length === 0 || isUploading}
               onClick={handleSubmit}
               className="
                 flex items-center gap-2
@@ -357,15 +398,15 @@ export default function UploadCVModal({ onClose }) {
               <Upload
                 size={16}
                 className={
-                  isPending
+                  isUploading
                     ? "animate-bounce"
                     : ""
                 }
               />
 
-              {isPending
+              {isUploading
                 ? "Upload en cours..."
-                : "Uploader le CV"}
+                : "Uploader les CV"}
             </button>
           </div>
         </div>
