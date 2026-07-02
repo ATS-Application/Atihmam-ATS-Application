@@ -156,6 +156,39 @@ def queue_cv_processing(
         return "background"
 
 
+
+def _run_full_sync_until_done(job_id: str | None = None) -> None:
+    """
+    Keep calling sync_drive_folder in batches until every file has been
+    imported (status == 'done') or no new files were processed in the last
+    batch (circuit-breaker to avoid infinite loops on persistent errors).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    max_rounds = 50       # safety cap: at most 50 × batch_size files total
+    round_num  = 0
+    while round_num < max_rounds:
+        round_num += 1
+        try:
+            summary = sync_drive_folder(job_id=job_id)
+            _log.info("Batch %d/%d — summary: %s", round_num, max_rounds, summary)
+            if summary.get("status") == "done":
+                _log.info("Full sync complete after %d batch(es).", round_num)
+                break
+            # If this batch processed 0 new files, stop to avoid infinite loop
+            if summary.get("processed", 0) == 0 and summary.get("remaining", 0) > 0:
+                _log.warning(
+                    "No new files were processed in batch %d (remaining=%d). "
+                    "Stopping to avoid an infinite loop — check errors above.",
+                    round_num,
+                    summary.get("remaining", 0),
+                )
+                break
+        except Exception:
+            _log.exception("Unexpected error in batch %d; aborting full sync.", round_num)
+            break
+
+
 def queue_drive_sync(
     background_tasks: BackgroundTasks,
     job_id: str | None = None,
@@ -165,7 +198,7 @@ def queue_drive_sync(
     Queue Drive sync via Celery when a worker is available,
     otherwise run in a FastAPI background task.
     """
-    sync_func = sync_drive_webhook if incremental else sync_drive_folder
+    sync_func   = sync_drive_webhook    if incremental else _run_full_sync_until_done
     celery_task = sync_drive_webhook_task if incremental else sync_drive_folder_task
 
     if celery_task is not None:
@@ -175,8 +208,9 @@ def queue_drive_sync(
         except Exception:
             pass
 
-    background_tasks.add_task(sync_func, job_id=job_id)
+    background_tasks.add_task(sync_func, job_id)
     return "background"
+
 
 
 async def run_drive_sync_blocking(

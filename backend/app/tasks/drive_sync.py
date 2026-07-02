@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import time
 
 from app.config import get_settings
 from app.db.supabase_client import get_supabase_admin
@@ -154,15 +155,15 @@ def fetch_all_drive_file_ids(supabase) -> set[str]:
     return ids
 
 
-def _summarize_sync_results(results: list[dict], total_files: int) -> dict:
+def _summarize_sync_results(results: list[dict], total_files: int, remaining: int = 0) -> dict:
     processed = [r for r in results if r.get("status") == "processed"]
     skipped   = [r for r in results if r.get("status") == "skipped"]
     failed    = [r for r in results if r.get("status") == "failed"]
     errors    = [r for r in results if r.get("status") == "error"]
-    already_in_db = total_files - len(results)
+    already_in_db = total_files - len(results) - remaining
 
     return {
-        "status":           "done",
+        "status":           "partial" if remaining > 0 else "done",
         "total_files":      total_files,
         "already_in_db":    already_in_db,
         "attempted":        len(results),
@@ -171,6 +172,7 @@ def _summarize_sync_results(results: list[dict], total_files: int) -> dict:
         "failed":           len(failed),
         "errors":           len(errors),
         "empty_text":       len([r for r in failed if r.get("reason") == "empty_text"]),
+        "remaining":        remaining,
         # backwards-compatible keys
         "queued":           len(results),
     }
@@ -400,7 +402,15 @@ def process_drive_file(
 # FULL FOLDER SYNC
 # --------------------------------------------------------------------------- #
 
-def sync_drive_folder(job_id: str | None = None) -> dict:
+# Maximum number of files processed per sync call.
+# Keep low enough that the total runtime stays well under Render's 25-minute
+# background-worker limit (≈ 1-2 min/CV × batch_size).
+_DEFAULT_BATCH_SIZE = 20
+# Seconds to wait between files to avoid AI provider rate limiting.
+_INTER_FILE_DELAY = 1.5
+
+
+def sync_drive_folder(job_id: str | None = None, batch_size: int = _DEFAULT_BATCH_SIZE) -> dict:
     settings = get_settings()
     drive_folder_id = _resolve_drive_folder_id(settings)
 
@@ -408,31 +418,49 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
     files = list_pdf_files(drive_folder_id)
     processed_ids = fetch_all_drive_file_ids(supabase)
 
+    # Files that still need processing
+    pending = [f for f in files if f["id"] not in processed_ids]
+
     logger.info(
-        "sync_drive_folder start — folder=%s drive_files=%d already_in_db=%d",
+        "sync_drive_folder start — folder=%s drive_files=%d already_in_db=%d pending=%d batch_size=%d",
         drive_folder_id,
         len(files),
         len(processed_ids),
+        len(pending),
+        batch_size,
     )
 
+    # Only process up to `batch_size` files per call so the process isn't killed
+    # mid-way by Render's worker timeout. The sync is idempotent: re-running it
+    # will continue from where it left off.
+    batch = pending[:batch_size]
+    remaining_after_batch = len(pending) - len(batch)
+
     results: list[dict] = []
-    for file_data in files:
+    for idx, file_data in enumerate(batch):
         file_id = file_data["id"]
-        if file_id in processed_ids:
-            continue
+        logger.info(
+            "Processing file %d/%d: %s",
+            idx + 1,
+            len(batch),
+            file_id,
+        )
         result = process_drive_file(file_id, supabase, job_id)
         results.append(result)
         if result.get("status") == "processed":
             processed_ids.add(file_id)
+        # Throttle AI API calls to stay within rate limits
+        if idx < len(batch) - 1:
+            time.sleep(_INTER_FILE_DELAY)
 
-    summary = _summarize_sync_results(results, len(files))
+    summary = _summarize_sync_results(results, len(files), remaining=remaining_after_batch)
     logger.info(
-        "sync_drive_folder complete — total=%d processed=%d failed=%d errors=%d empty_text=%d",
+        "sync_drive_folder batch complete — total=%d processed=%d failed=%d errors=%d remaining=%d",
         summary["total_files"],
         summary["processed"],
         summary["failed"],
         summary["errors"],
-        summary["empty_text"],
+        summary["remaining"],
     )
     return summary
 
