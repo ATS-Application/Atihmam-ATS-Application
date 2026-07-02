@@ -473,16 +473,12 @@ async def trigger_drive_sync(
     """
     Full Drive folder reconcile — scans every CV on Drive and imports
     any file not yet present in the candidates table.
-  Runs synchronously so the client receives real import counts.
+    Runs asynchronously to prevent client-side/gateway timeouts.
     """
-    result = await run_drive_sync_blocking(job_id=job_id, incremental=False)
+    worker_type = queue_drive_sync(background_tasks, job_id=job_id, incremental=False)
 
     return {
         "success": True,
-        "message": (
-            f"Sync terminée — {result.get('processed', 0)} nouveau(x) CV importé(s), "
-            f"{result.get('total_files', 0)} fichier(s) trouvé(s) sur Drive."
-        ),
-        "worker": "inline",
-        **result,
+        "message": "La synchronisation Google Drive a été lancée en arrière-plan et traitera tous les fichiers.",
+        "worker": worker_type,
     }

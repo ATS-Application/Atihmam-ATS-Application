@@ -103,6 +103,7 @@ def _list_files_in_folder(service, folder_id: str, page_token: str | None = None
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
             pageToken=page_token,
+            pageSize=1000,
         )
     )
     response = request.execute()
@@ -123,6 +124,7 @@ def _list_subfolders(service, folder_id: str) -> list[str]:
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
                 pageToken=page_token,
+                pageSize=1000,
             )
             .execute()
         )
@@ -296,6 +298,7 @@ def list_new_pdf_files_since(folder_id: str, page_token: str) -> tuple[list[dict
                 ),
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
+                pageSize=1000,
             )
             .execute()
         )
