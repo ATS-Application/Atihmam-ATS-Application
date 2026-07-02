@@ -358,7 +358,7 @@ async def delete_candidate(
     candidate_id: UUID,
     user: dict = Depends(get_current_user),
 ):
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
     cid = str(candidate_id)
 
     # 1. Delete feedback records (new dependency identified from your schema)
@@ -385,13 +385,28 @@ async def delete_candidate(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.delete("", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("", status_code=status.HTTP_200_OK)
 async def delete_all_candidates(user: dict = Depends(require_role("admin"))):
-    supabase = get_supabase()
-    supabase.table("candidates").delete().neq(
+    """Delete all candidates and related records (service role — bypasses RLS)."""
+    supabase = get_supabase_admin()
+
+    supabase.table("candidate_feedback").delete().neq(
+        "candidate_id", "00000000-0000-0000-0000-000000000000"
+    ).execute()
+    supabase.table("candidate_status_history").delete().neq(
+        "candidate_id", "00000000-0000-0000-0000-000000000000"
+    ).execute()
+
+    resp = supabase.table("candidates").delete().neq(
         "id", "00000000-0000-0000-0000-000000000000"
     ).execute()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    deleted_count = len(resp.data or [])
+    return {
+        "success": True,
+        "deleted": deleted_count,
+        "message": f"{deleted_count} candidat(s) supprimé(s).",
+    }
 
 
 # ============================================================================

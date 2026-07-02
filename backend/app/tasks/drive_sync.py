@@ -38,7 +38,6 @@ from app.services.drive_service import (
     download_file_bytes,
     get_file_metadata,
     get_start_page_token,
-    list_new_pdf_files_since,
     list_pdf_files,
 )
 from app.services.scoring_service import classify_domain, compute_candidate_score, enrich_cv_data
@@ -73,9 +72,18 @@ _SEM_CAP    = 75.0
 
 def safe_extract_text(file_bytes: bytes, file_name: str) -> str:
     """
-    Extract PDF text in an isolated subprocess so a native C crash
-    (SIGABRT/SIGSEGV from a malformed PDF) cannot kill the Celery worker.
+    Extract text from CV bytes. Tries in-process first (supports PDF/DOCX/images),
+    then falls back to an isolated subprocess for malformed PDFs.
     """
+    from app.services.cv_parser import extract_text_from_bytes
+
+    try:
+        text = extract_text_from_bytes(file_bytes)
+        if text and text.strip():
+            return text
+    except Exception as exc:
+        logger.warning("In-process extraction failed for %s: %s", file_name, exc)
+
     script = (
         "import sys; "
         "from app.services.cv_parser import extract_text_from_bytes; "
@@ -86,7 +94,7 @@ def safe_extract_text(file_bytes: bytes, file_name: str) -> str:
             [sys.executable, "-c", script],
             input=file_bytes,
             capture_output=True,
-            timeout=60,
+            timeout=120,
         )
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace")
@@ -119,6 +127,53 @@ def sanitize_filename(filename: str, mime_type: str | None = None) -> str:
     if not cleaned_ext:
         cleaned_ext = _extension_for_mime(mime_type)
     return f"{cleaned_name}{cleaned_ext}"
+
+
+def fetch_all_drive_file_ids(supabase) -> set[str]:
+    """Load every drive_file_id from candidates (paginated — PostgREST default is 1000)."""
+    ids: set[str] = set()
+    page_size = 1000
+    offset = 0
+
+    while True:
+        response = (
+            supabase.table("candidates")
+            .select("drive_file_id")
+            .not_.is_("drive_file_id", "null")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = response.data or []
+        for row in rows:
+            if row.get("drive_file_id"):
+                ids.add(row["drive_file_id"])
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    return ids
+
+
+def _summarize_sync_results(results: list[dict], total_files: int) -> dict:
+    processed = [r for r in results if r.get("status") == "processed"]
+    skipped   = [r for r in results if r.get("status") == "skipped"]
+    failed    = [r for r in results if r.get("status") == "failed"]
+    errors    = [r for r in results if r.get("status") == "error"]
+    already_in_db = total_files - len(results)
+
+    return {
+        "status":           "done",
+        "total_files":      total_files,
+        "already_in_db":    already_in_db,
+        "attempted":        len(results),
+        "processed":        len(processed),
+        "skipped":          len(skipped),
+        "failed":           len(failed),
+        "errors":           len(errors),
+        "empty_text":       len([r for r in failed if r.get("reason") == "empty_text"]),
+        # backwards-compatible keys
+        "queued":           len(results),
+    }
 
 
 def candidate_exists(supabase, drive_file_id: str) -> bool:
@@ -349,33 +404,37 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
     settings = get_settings()
     drive_folder_id = _resolve_drive_folder_id(settings)
 
-    supabase = get_supabase_admin()  # single client for the entire sync
-    files    = list_pdf_files(drive_folder_id)
+    supabase = get_supabase_admin()
+    files = list_pdf_files(drive_folder_id)
+    processed_ids = fetch_all_drive_file_ids(supabase)
 
-    existing = supabase.table("candidates").select("drive_file_id").execute()
-    processed_ids = {
-        row["drive_file_id"]
-        for row in (existing.data or [])
-        if row.get("drive_file_id")
-    }
-
-    results = [
-        process_drive_file(file_data["id"], supabase, job_id)
-        for file_data in files
-        if file_data["id"] not in processed_ids
-    ]
-
-    errors = [r for r in results if r.get("status") == "error"]
     logger.info(
-        "sync_drive_folder complete — total=%d queued=%d errors=%d",
-        len(files), len(results), len(errors),
+        "sync_drive_folder start — folder=%s drive_files=%d already_in_db=%d",
+        drive_folder_id,
+        len(files),
+        len(processed_ids),
     )
-    return {
-        "status":      "done",
-        "total_files": len(files),
-        "queued":      len(results),
-        "errors":      len(errors),
-    }
+
+    results: list[dict] = []
+    for file_data in files:
+        file_id = file_data["id"]
+        if file_id in processed_ids:
+            continue
+        result = process_drive_file(file_id, supabase, job_id)
+        results.append(result)
+        if result.get("status") == "processed":
+            processed_ids.add(file_id)
+
+    summary = _summarize_sync_results(results, len(files))
+    logger.info(
+        "sync_drive_folder complete — total=%d processed=%d failed=%d errors=%d empty_text=%d",
+        summary["total_files"],
+        summary["processed"],
+        summary["failed"],
+        summary["errors"],
+        summary["empty_text"],
+    )
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -383,54 +442,32 @@ def sync_drive_folder(job_id: str | None = None) -> dict:
 # --------------------------------------------------------------------------- #
 
 def sync_drive_webhook(job_id: str | None = None) -> dict:
+    """
+    Webhook handler: run a full folder reconcile so files missed by prior
+    partial syncs are imported, not only Drive changes since page_token.
+    """
     settings = get_settings()
     drive_folder_id = _resolve_drive_folder_id(settings)
-
     supabase = get_supabase_admin()
 
-    config_row = (
-        supabase.table("app_config")
-        .select("value")
-        .eq("key", "drive_page_token")
-        .single()
-        .execute()
-    )
-    page_token = config_row.data["value"] if config_row.data else None
+    summary = sync_drive_folder(job_id)
 
-    if not page_token:
-        logger.info("No page token found — running initial full folder sync")
-        initial_result = sync_drive_folder(job_id)
-        start_page_token = get_start_page_token()
+    # Advance the changes token so future diagnostics stay aligned with Drive.
+    try:
+        next_token = get_start_page_token()
         supabase.table("app_config").upsert(
-            {"key": "drive_page_token", "value": start_page_token}
+            {"key": "drive_page_token", "value": next_token},
+            on_conflict="key",
         ).execute()
-        return {
-            **initial_result,
-            "status": "initialized",
-            "reason": "initial_full_sync_completed",
-        }
-
-    new_files, next_token = list_new_pdf_files_since(
-        drive_folder_id,
-        page_token,
-    )
-
-    results = [process_drive_file(f["id"], supabase, job_id) for f in new_files]
-    errors  = [r for r in results if r.get("status") == "error"]
-
-    supabase.table("app_config").upsert(
-        {"key": "drive_page_token", "value": next_token}
-    ).execute()
+    except Exception:
+        logger.exception("Failed to refresh drive_page_token after webhook sync")
 
     logger.info(
-        "sync_drive_webhook complete — new=%d errors=%d",
-        len(new_files), len(errors),
+        "sync_drive_webhook complete — folder=%s processed=%d",
+        drive_folder_id,
+        summary.get("processed", 0),
     )
-    return {
-        "status":    "done",
-        "new_files": len(new_files),
-        "errors":    len(errors),
-    }
+    return {**summary, "mode": "full_reconcile"}
 
 
 # --------------------------------------------------------------------------- #
@@ -440,3 +477,23 @@ def sync_drive_webhook(job_id: str | None = None) -> dict:
 def renew_drive_webhook() -> dict:
     from app.services.webhook_manager import ensure_webhook_registered
     return ensure_webhook_registered()
+
+
+# --------------------------------------------------------------------------- #
+# CELERY TASK WRAPPERS
+# --------------------------------------------------------------------------- #
+
+try:
+    from app.core.celery_config import celery_app
+
+    @celery_app.task(name="app.tasks.drive_sync.sync_drive_folder", bind=True)
+    def sync_drive_folder_task(self, job_id: str | None = None) -> dict:
+        return sync_drive_folder(job_id)
+
+    @celery_app.task(name="app.tasks.drive_sync.sync_drive_webhook", bind=True)
+    def sync_drive_webhook_task(self, job_id: str | None = None) -> dict:
+        return sync_drive_webhook(job_id)
+
+except Exception:  # Celery optional in local dev / API-only deploys
+    sync_drive_folder_task = None
+    sync_drive_webhook_task = None

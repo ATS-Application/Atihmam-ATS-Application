@@ -74,7 +74,13 @@ export function useDeleteAllCandidates() {
     // Fix: was referencing undefined `api` — use axiosClient directly.
     mutationFn: () => axiosClient.delete("/candidates"),
 
-    onSuccess: () => {
+    onSuccess: (response) => {
+      const count = response?.data?.deleted;
+      toast.success(
+        count != null
+          ? `${count} candidat(s) supprimé(s)`
+          : "Tous les candidats ont été supprimés"
+      );
       queryClient.invalidateQueries({ queryKey: ["candidates"] });
     },
 
@@ -145,10 +151,12 @@ export function useDriveSync() {
   return useMutation({
     mutationFn: triggerDriveSync,
 
-    onSuccess: () => {
-      toast.success("Synchronisation Drive lancée");
-      // Invalidate immediately — new candidates appear as stubs right away.
-      // Individual polling hooks handle live score updates from there.
+    onSuccess: (response) => {
+      const data = response?.data ?? {};
+      const msg =
+        data.message ||
+        `Sync terminée — ${data.processed ?? 0} nouveau(x) CV importé(s).`;
+      toast.success(msg, { duration: 6000 });
       qc.invalidateQueries({ queryKey: ["candidates"] });
     },
 

@@ -24,6 +24,7 @@ TOKEN_PATH = os.environ.get("GOOGLE_TOKEN_PATH", "token.json")
 
 SUPPORTED_MIME_TYPES = {
     "application/pdf",
+    "application/octet-stream",  # common Drive MIME for uploaded PDFs
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/msword",
     "image/png",
@@ -110,17 +111,57 @@ def _list_files_in_folder(service, folder_id: str, page_token: str | None = None
 
 def _list_subfolders(service, folder_id: str) -> list[str]:
     query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    response = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
+    folder_ids: list[str] = []
+    page_token: str | None = None
+
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=query,
+                fields="files(id), nextPageToken",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                pageToken=page_token,
+            )
+            .execute()
         )
-        .execute()
-    )
-    return [item["id"] for item in response.get("files", [])]
+        folder_ids.extend(item["id"] for item in response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return folder_ids
+
+
+def file_is_under_folder(service, file_parents: list[str], root_folder_id: str) -> bool:
+    """Return True if any parent chain leads to root_folder_id."""
+    if root_folder_id == "root":
+        return bool(file_parents)
+
+    to_visit = list(file_parents)
+    visited: set[str] = set()
+
+    while to_visit:
+        parent_id = to_visit.pop()
+        if parent_id == root_folder_id:
+            return True
+        if parent_id in visited:
+            continue
+        visited.add(parent_id)
+
+        parent_meta = (
+            service.files()
+            .get(
+                fileId=parent_id,
+                fields="id, parents",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        to_visit.extend(parent_meta.get("parents") or [])
+
+    return False
 
 
 def list_pdf_files(folder_id: str) -> list[dict]:
@@ -273,21 +314,8 @@ def list_new_pdf_files_since(folder_id: str, page_token: str) -> tuple[list[dict
             if not parents:
                 continue
 
-            if folder_id == "root":
+            if file_is_under_folder(service, parents, folder_id):
                 new_files.append(file_data)
-                continue
-
-            if folder_id in parents:
-                new_files.append(file_data)
-                continue
-
-            # If the file is not a direct child, inspect its parent chain recursively.
-            parent_chain = parents[:]
-            while parent_chain:
-                parent_id = parent_chain.pop()
-                if parent_id == folder_id:
-                    new_files.append(file_data)
-                    break
 
         next_page_token = response.get("nextPageToken")
         if next_page_token:

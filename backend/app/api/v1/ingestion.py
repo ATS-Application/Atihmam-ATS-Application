@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import unicodedata
@@ -36,7 +37,12 @@ from app.services.webhook_manager import (
 )
 
 from app.tasks.cv_processing import process_cv
-from app.tasks.drive_sync import sync_drive_folder, sync_drive_webhook
+from app.tasks.drive_sync import (
+    sync_drive_folder,
+    sync_drive_webhook,
+    sync_drive_folder_task,
+    sync_drive_webhook_task,
+)
 
 router = APIRouter(
     prefix="/ingestion",
@@ -156,26 +162,30 @@ def queue_drive_sync(
     incremental: bool = False,
 ):
     """
-    Try Celery first.
-    Fallback to FastAPI BackgroundTasks.
+    Queue Drive sync via Celery when a worker is available,
+    otherwise run in a FastAPI background task.
     """
-
     sync_func = sync_drive_webhook if incremental else sync_drive_folder
+    celery_task = sync_drive_webhook_task if incremental else sync_drive_folder_task
 
-    try:
-        sync_func.delay(
-            job_id=job_id,
-        )
+    if celery_task is not None:
+        try:
+            celery_task.delay(job_id=job_id)
+            return "celery"
+        except Exception:
+            pass
 
-        return "celery"
+    background_tasks.add_task(sync_func, job_id=job_id)
+    return "background"
 
-    except Exception:
-        background_tasks.add_task(
-            sync_func,
-            job_id=job_id,
-        )
 
-        return "background"
+async def run_drive_sync_blocking(
+    job_id: str | None = None,
+    incremental: bool = False,
+) -> dict:
+    """Run Drive sync in a worker thread and wait for the full result."""
+    sync_func = sync_drive_webhook if incremental else sync_drive_folder
+    return await asyncio.to_thread(sync_func, job_id)
 
 
 def verify_drive_webhook(headers) -> bool:
@@ -448,7 +458,7 @@ async def register_drive_webhook(
 
 @router.post(
     "/drive/sync",
-    status_code=status.HTTP_202_ACCEPTED,
+    status_code=status.HTTP_200_OK,
 )
 async def trigger_drive_sync(
     background_tasks: BackgroundTasks,
@@ -460,13 +470,19 @@ async def trigger_drive_sync(
         )
     ),
 ):
-    worker = queue_drive_sync(
-        background_tasks=background_tasks,
-        job_id=job_id,
-    )
+    """
+    Full Drive folder reconcile — scans every CV on Drive and imports
+    any file not yet present in the candidates table.
+  Runs synchronously so the client receives real import counts.
+    """
+    result = await run_drive_sync_blocking(job_id=job_id, incremental=False)
 
     return {
         "success": True,
-        "message": "Drive sync queued.",
-        "worker": worker,
+        "message": (
+            f"Sync terminée — {result.get('processed', 0)} nouveau(x) CV importé(s), "
+            f"{result.get('total_files', 0)} fichier(s) trouvé(s) sur Drive."
+        ),
+        "worker": "inline",
+        **result,
     }

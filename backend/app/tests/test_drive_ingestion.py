@@ -32,20 +32,21 @@ class TestDriveWebhook:
         assert response.status_code == 200
         assert response.json()["status"] == "ignored"
 
-    @patch("app.api.v1.ingestion.sync_drive_folder")
-    def test_add_event_queues_sync(self, mock_sync):
-        mock_sync.delay = MagicMock()
-        response = client.post(
-            "/api/v1/ingestion/drive/webhook",
-            headers={
-                "x-goog-channel-id": "test-channel",
-                "x-goog-resource-state": "add",
-                "x-goog-resource-id": "file-resource-id",
-            },
-        )
+    @patch("app.api.v1.ingestion.sync_drive_webhook_task")
+    def test_add_event_queues_sync(self, mock_sync_task):
+        mock_sync_task.delay = MagicMock()
+        with patch("app.api.v1.ingestion.verify_drive_webhook", return_value=True):
+            response = client.post(
+                "/api/v1/ingestion/drive/webhook",
+                headers={
+                    "x-goog-channel-id": "test-channel",
+                    "x-goog-resource-state": "add",
+                    "x-goog-resource-id": "file-resource-id",
+                },
+            )
         assert response.status_code == 200
         assert response.json()["status"] == "queued"
-        mock_sync.delay.assert_called_once()
+        mock_sync_task.delay.assert_called_once()
 
     def test_missing_resource_id_ignored(self):
         response = client.post(
@@ -87,7 +88,7 @@ class TestDriveWebhook:
     @patch("app.tasks.drive_sync.get_start_page_token")
     @patch("app.tasks.drive_sync.get_settings")
     @patch("app.tasks.drive_sync.get_supabase_admin")
-    def test_sync_webhook_runs_initial_full_sync_and_stores_page_token(
+    def test_sync_webhook_runs_full_reconcile_and_stores_page_token(
         self,
         mock_supabase_admin,
         mock_get_settings,
@@ -99,26 +100,25 @@ class TestDriveWebhook:
         mock_sync_drive_folder.return_value = {
             "status": "done",
             "total_files": 3,
-            "queued": 3,
+            "processed": 2,
+            "queued": 2,
             "errors": 0,
         }
 
         mock_supabase = MagicMock()
         mock_table = MagicMock()
         mock_supabase.table.return_value = mock_table
-        mock_table.select.return_value = mock_table
-        mock_table.eq.return_value = mock_table
-        mock_table.single.return_value = mock_table
-        mock_table.execute.return_value = MagicMock(data=None)
         mock_table.upsert.return_value = mock_table
+        mock_table.execute.return_value = MagicMock(data=[])
         mock_supabase_admin.return_value = mock_supabase
 
         result = sync_drive_webhook()
 
-        assert result["status"] == "initialized"
-        assert result["reason"] == "initial_full_sync_completed"
+        assert result["mode"] == "full_reconcile"
+        assert result["processed"] == 2
         mock_sync_drive_folder.assert_called_once_with(None)
         mock_get_start_page_token.assert_called_once()
         mock_table.upsert.assert_called_once_with(
-            {"key": "drive_page_token", "value": "page-token-1"}
+            {"key": "drive_page_token", "value": "page-token-1"},
+            on_conflict="key",
         )
