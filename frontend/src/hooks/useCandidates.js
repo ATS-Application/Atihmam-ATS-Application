@@ -158,12 +158,16 @@ export function useDriveSync() {
 }
 
 export function useDriveSyncStatus(options = {}) {
+  const isHydrated = useAuthStore((state) => state._hydrated);
+  const token = useAuthStore((state) => state.token);
+
   return useQuery({
     queryKey: ["driveSyncStatus"],
     queryFn: async () => {
       const response = await getDriveSyncStatus();
       return response.data;
     },
+    enabled: isHydrated && !!token,
     ...options,
   });
 }

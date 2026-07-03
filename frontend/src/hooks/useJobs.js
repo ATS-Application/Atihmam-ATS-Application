@@ -1,4 +1,4 @@
-﻿// src/hooks/useJobs.js
+// src/hooks/useJobs.js
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
 import { useAuthStore } from "../store/authStore";
@@ -7,7 +7,6 @@ import { getJobs, createJob, updateJob, deleteJob } from "../api/jobsApi";
 export function useJobs() {
   const isHydrated = useAuthStore((state) => state._hydrated);
   const token = useAuthStore((state) => state.token);
-  console.log("useJobs enabled check →", { isHydrated, hasToken: !!token });
   return useQuery({
     queryKey: ["jobs"],
     queryFn: getJobs,
