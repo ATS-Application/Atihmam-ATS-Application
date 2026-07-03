@@ -164,10 +164,28 @@ export function useDriveSyncStatus(options = {}) {
   return useQuery({
     queryKey: ["driveSyncStatus"],
     queryFn: async () => {
-      const response = await getDriveSyncStatus();
-      return response.data;
+      try {
+        const response = await getDriveSyncStatus();
+        return response.data;
+      } catch (err) {
+        // If the endpoint doesn't exist yet on the deployed backend (404),
+        // return null silently rather than throwing — this prevents
+        // React Query from retrying and spamming the console.
+        if (err?.response?.status === 404) return null;
+        throw err;
+      }
     },
     enabled: isHydrated && !!token,
+    // Don't retry on errors — avoids hammering a 404 endpoint.
+    retry: (failureCount, err) => {
+      if (err?.response?.status === 404) return false;
+      return failureCount < 2;
+    },
+    // Pause the polling interval when the query is in an error state.
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return false;
+      return options.refetchInterval ?? false;
+    },
     ...options,
   });
 }
