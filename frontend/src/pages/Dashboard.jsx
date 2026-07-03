@@ -346,10 +346,19 @@ export default function Dashboard() {
               </p>
               <p className="text-xs mt-0.5 leading-relaxed">{syncStatus.message}</p>
               {isSyncActive && (
-                <div className="mt-1.5 flex items-center gap-2">
-                  <span className="text-[10px] bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-semibold">Traités: {syncStatus.processed}</span>
-                  <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-semibold">Échecs: {syncStatus.failed}</span>
-                  <span className="text-[10px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded-full font-semibold">Reste: {syncStatus.remaining}</span>
+                <div className="mt-3 w-full max-w-md">
+                  <div className="flex items-center justify-between text-[10px] font-semibold mb-1">
+                    <span className="text-blue-700">Téléchargement : {syncStatus.total_files > 0 ? Math.round(((syncStatus.total_files - syncStatus.remaining) / syncStatus.total_files) * 100) : 0}%</span>
+                    <span className="text-slate-500">{syncStatus.total_files - syncStatus.remaining} / {syncStatus.total_files} fichiers</span>
+                  </div>
+                  <div className="w-full bg-blue-200/60 rounded-full h-1.5 mb-2 overflow-hidden">
+                    <div className="bg-blue-600 h-1.5 rounded-full transition-all duration-500 ease-out" style={{ width: `${syncStatus.total_files > 0 ? Math.round(((syncStatus.total_files - syncStatus.remaining) / syncStatus.total_files) * 100) : 0}%` }}></div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-semibold">En attente IA: {syncStatus.processed}</span>
+                    {syncStatus.failed > 0 && <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-semibold">Échecs: {syncStatus.failed}</span>}
+                    {syncStatus.skipped > 0 && <span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-semibold">Ignorés: {syncStatus.skipped}</span>}
+                  </div>
                 </div>
               )}
             </div>
