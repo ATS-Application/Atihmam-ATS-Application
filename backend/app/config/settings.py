@@ -1,4 +1,5 @@
 # backend/app/config/settings.py
+from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
@@ -54,6 +55,7 @@ class Settings(BaseSettings):
     )
 
 
+@lru_cache
 def get_settings():
     settings = Settings()
     if settings.app_env != "development" and settings.secret_key == "change-me":

@@ -392,53 +392,52 @@ def process_drive_file(
             mime_type,
         )
 
-        # 4. Extract raw text (isolated subprocess to guard against C-level crashes)
-        logger.info("Extracting text: %s (%d bytes)", file_name, len(file_bytes))
-        raw_text = safe_extract_text(file_bytes, file_name)
-        if not raw_text.strip():
-            logger.warning("Empty text extracted from file: %s", drive_file_id)
-            return record_failed_drive_candidate(
-                supabase,
-                drive_file_id=drive_file_id,
-                file_name=file_name,
-                error_message="Empty text extracted from file",
+        # 4. Insert into candidates table with 'queued' status
+        payload = {
+            "job_id": job_id,
+            "status": "applied",
+            "processing_status": "queued",
+            "full_name": file_name,  # temporary placeholder until AI extraction
+            "drive_file_id": drive_file_id,
+            "cv_file_url": cv_url,
+        }
+        
+        from datetime import datetime, timezone
+        payload["created_at"] = datetime.now(timezone.utc).isoformat()
+
+        insert_result = insert_candidate(supabase, payload, drive_file_id)
+        
+        if insert_result.get("status") == "skipped":
+            return insert_result
+
+        candidate_id = insert_result.get("candidate_id")
+
+        # 5. Enqueue processing asynchronously
+        from app.tasks.cv_processing import process_cv
+        storage_path = f"drive/{drive_file_id}/{file_name}"
+
+        logger.info("Enqueuing background processing for drive file %s (candidate: %s)", drive_file_id, candidate_id)
+
+        try:
+            process_cv.delay(
+                candidate_id=candidate_id,
+                storage_path=storage_path,
                 job_id=job_id,
             )
-
-        # 5. AI extraction
-        extracted = extract_cv_info(raw_text)
-
-        # Enrich with raw_text so keyword/semantic/education/cert scorers see
-        # the full CV body, not the sparse _build_cv_text reconstruction.
-        enriched = enrich_cv_data(extracted, raw_text)
-
-        # 6. Scoring
-        score_result, resolved_job_id = resolve_candidate_score(
-            supabase, enriched, job_id
-        )
-        logger.info(
-            "Scored file %s → %.1f (job_id=%s)",
-            drive_file_id,
-            score_result.get("score", 0),
-            resolved_job_id,
-        )
-
-        # 7. Build DB payload
-        payload = build_candidate_payload(
-            raw_text=raw_text,
-            cv_info=extracted,
-            enriched_cv=enriched,
-            score_result=score_result,
-            job_id=resolved_job_id,
-        )
-        payload.update({
-            "cv_file_url":   cv_url,
-            "drive_file_id": drive_file_id,
-            "status":        "applied",
-        })
-
-        # 8. Insert
-        return insert_candidate(supabase, payload, drive_file_id)
+        except Exception:
+            # Fallback to Threading since we don't have FastAPI BackgroundTasks in this context
+            import threading
+            threading.Thread(
+                target=process_cv,
+                kwargs={
+                    "candidate_id": candidate_id,
+                    "storage_path": storage_path,
+                    "job_id": job_id
+                },
+                daemon=True
+            ).start()
+        
+        return {"status": "processed", "candidate_id": candidate_id}
 
     except Exception as exc:
         logger.exception("Error processing Drive file %s", drive_file_id)
