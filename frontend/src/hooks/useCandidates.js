@@ -13,6 +13,10 @@ import {
   uploadCV,
   triggerDriveSync,
   getDriveSyncStatus,
+  triggerDriveIngest,
+  getDriveIngestStatus,
+  triggerAIProcessing,
+  getAIProcessingStatus,
 } from "../api/candidatesApi";
 
 // Processing statuses that mean "still in flight" — poll until we leave these.
@@ -182,6 +186,98 @@ export function useDriveSyncStatus(options = {}) {
       return failureCount < 2;
     },
     // Pause the polling interval when the query is in an error state.
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return false;
+      return options.refetchInterval ?? false;
+    },
+    ...options,
+  });
+}
+
+export function useDriveIngest() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: triggerDriveIngest,
+
+    onSuccess: () => {
+      toast.success("Importation Drive démarrée...", { duration: 4000 });
+      qc.invalidateQueries({ queryKey: ["driveIngestStatus"] });
+      qc.invalidateQueries({ queryKey: ["candidates"] });
+    },
+
+    onError: () => {
+      toast.error("Échec de l'importation Drive");
+    },
+  });
+}
+
+export function useDriveIngestStatus(options = {}) {
+  const isHydrated = useAuthStore((state) => state._hydrated);
+  const token = useAuthStore((state) => state.token);
+
+  return useQuery({
+    queryKey: ["driveIngestStatus"],
+    queryFn: async () => {
+      try {
+        const response = await getDriveIngestStatus();
+        return response.data;
+      } catch (err) {
+        if (err?.response?.status === 404) return null;
+        throw err;
+      }
+    },
+    enabled: isHydrated && !!token,
+    retry: (failureCount, err) => {
+      if (err?.response?.status === 404) return false;
+      return failureCount < 2;
+    },
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return false;
+      return options.refetchInterval ?? false;
+    },
+    ...options,
+  });
+}
+
+export function useAIProcessing() {
+  const qc = useQueryClient();
+
+  return useMutation({
+    mutationFn: triggerAIProcessing,
+
+    onSuccess: () => {
+      toast.success("Traitement IA démarré...", { duration: 4000 });
+      qc.invalidateQueries({ queryKey: ["aiProcessingStatus"] });
+      qc.invalidateQueries({ queryKey: ["candidates"] });
+    },
+
+    onError: () => {
+      toast.error("Échec du lancement du traitement IA");
+    },
+  });
+}
+
+export function useAIProcessingStatus(options = {}) {
+  const isHydrated = useAuthStore((state) => state._hydrated);
+  const token = useAuthStore((state) => state.token);
+
+  return useQuery({
+    queryKey: ["aiProcessingStatus"],
+    queryFn: async () => {
+      try {
+        const response = await getAIProcessingStatus();
+        return response.data;
+      } catch (err) {
+        if (err?.response?.status === 404) return null;
+        throw err;
+      }
+    },
+    enabled: isHydrated && !!token,
+    retry: (failureCount, err) => {
+      if (err?.response?.status === 404) return false;
+      return failureCount < 2;
+    },
     refetchInterval: (query) => {
       if (query.state.status === "error") return false;
       return options.refetchInterval ?? false;

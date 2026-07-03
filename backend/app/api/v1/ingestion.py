@@ -44,6 +44,14 @@ from app.tasks.drive_sync import (
     sync_drive_webhook_task,
     _run_full_sync_until_done,
 )
+from app.tasks.drive_ingestion import (
+    _run_full_ingest_until_done,
+    sync_drive_ingest_folder_task,
+)
+from app.tasks.ai_processing import (
+    process_queued_candidates,
+    process_queued_candidates_task,
+)
 
 router = APIRouter(
     prefix="/ingestion",
@@ -516,3 +524,62 @@ async def trigger_drive_sync(
         "message": "La synchronisation Google Drive a été lancée en arrière-plan et traitera tous les fichiers.",
         "worker": worker_type,
     }
+
+
+# =========================================================
+# DECOUPLED INGESTION & AI PROCESSING (PHASE 1 & 2)
+# =========================================================
+
+@router.post("/drive/ingest", status_code=status.HTTP_200_OK)
+async def trigger_drive_ingest(
+    background_tasks: BackgroundTasks,
+    job_id: str | None = None,
+    user: dict = Depends(require_role("admin", "recruiter")),
+):
+    """Phase 1: Import files from Drive to DB (queued status) without AI."""
+    if sync_drive_ingest_folder_task is not None:
+        try:
+            sync_drive_ingest_folder_task.delay(job_id=job_id)
+            return {"success": True, "worker": "celery"}
+        except Exception:
+            pass
+    background_tasks.add_task(_run_full_ingest_until_done, job_id)
+    return {"success": True, "worker": "background"}
+
+@router.get("/drive/ingest/status", status_code=status.HTTP_200_OK)
+async def get_drive_ingest_status(user: dict = Depends(get_current_user)):
+    supabase = get_supabase_admin()
+    try:
+        response = supabase.table("app_config").select("value").eq("key", "drive_ingest_status").execute()
+        if response.data:
+            return response.data[0]["value"]
+        return {"status": "idle", "message": "Aucune importation Drive n'a été lancée récemment."}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@router.post("/ai/process", status_code=status.HTTP_200_OK)
+async def trigger_ai_processing(
+    background_tasks: BackgroundTasks,
+    job_id: str | None = None,
+    user: dict = Depends(require_role("admin", "recruiter")),
+):
+    """Phase 2: Process all 'queued' candidates with AI."""
+    if process_queued_candidates_task is not None:
+        try:
+            process_queued_candidates_task.delay(job_id=job_id, batch_size=50)
+            return {"success": True, "worker": "celery"}
+        except Exception:
+            pass
+    background_tasks.add_task(process_queued_candidates, job_id=job_id, batch_size=50)
+    return {"success": True, "worker": "background"}
+
+@router.get("/ai/status", status_code=status.HTTP_200_OK)
+async def get_ai_processing_status_endpoint(user: dict = Depends(get_current_user)):
+    supabase = get_supabase_admin()
+    try:
+        response = supabase.table("app_config").select("value").eq("key", "ai_processing_status").execute()
+        if response.data:
+            return response.data[0]["value"]
+        return {"status": "idle", "message": "Aucun traitement IA n'a été lancé récemment."}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

@@ -2,14 +2,11 @@
 
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Search, Upload, RefreshCw, Trash2, ChevronDown, CheckCircle2, AlertTriangle, X } from "lucide-react";
+import { Search, Upload, RefreshCw, Trash2, ChevronDown, CheckCircle2, AlertTriangle, X, Sparkles } from "lucide-react";
 
-import {
   useCandidates,
   useDeleteCandidate,
   useDeleteAllCandidates,
-  useDriveSync,
-  useDriveSyncStatus,
 } from "../hooks/useCandidates";
 
 import { useSearchParams } from "react-router-dom";
@@ -19,6 +16,8 @@ import { useJobs } from "../hooks/useJobs";
 import StatusBadge from "../components/StatusBadge";
 import ScoreBadge from "../components/ScoreBadge";
 import UploadCVModal from "../components/UploadCVModal";
+import AIProcessingModal from "../components/AIProcessingModal";
+import DriveImportModal from "../components/DriveImportModal";
 // import { searchForWorkspaceRoot } from "vite";
 
 const STATUS_OPTIONS = [
@@ -39,6 +38,8 @@ export default function CandidateList() {
   const [searchParams]                        = useSearchParams();
   const [jobFilter,       setJobFilter]       = useState(searchParams.get("job") ?? ""); 
   const [showUpload,      setShowUpload]      = useState(false);
+  const [showAIModal,     setShowAIModal]     = useState(false);
+  const [showDriveModal,    setShowDriveModal]    = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
   const [candidateToDelete, setCandidateToDelete] = useState(null);
@@ -56,27 +57,6 @@ export default function CandidateList() {
   const { data: jobs = [] }                         = useJobs();
   const { mutate: deleteCandidate }                 = useDeleteCandidate();
   const { mutate: deleteAllCandidates } = useDeleteAllCandidates();
-  const { mutate: syncDrive, isPending: isSyncing } = useDriveSync();
-
-  const [dismissedSyncTime, setDismissedSyncTime] = useState(() => {
-    return localStorage.getItem("dismissed_drive_sync_time") || null;
-  });
-
-  const { data: syncStatus } = useDriveSyncStatus({
-    refetchInterval: 4000,
-  });
-
-  const isSyncActive = syncStatus?.status === "processing";
-  const showBanner = syncStatus && (
-    isSyncActive || 
-    (syncStatus.status !== "idle" && (!dismissedSyncTime || new Date(syncStatus.completed_at || syncStatus.started_at) > new Date(dismissedSyncTime)))
-  );
-
-  const handleDismissBanner = () => {
-    const now = new Date().toISOString();
-    setDismissedSyncTime(now);
-    localStorage.setItem("dismissed_drive_sync_time", now);
-  };
 
   const filtered = candidates
     .filter((c) => {
@@ -142,19 +122,25 @@ export default function CandidateList() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => syncDrive()}
-            disabled={isSyncing || isSyncActive}
-            className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={() => setShowDriveModal(true)}
+            className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors"
           >
-            <RefreshCw size={12} className={isSyncing || isSyncActive ? "animate-spin" : ""} />
-            {isSyncActive ? "Synchronisation…" : isSyncing ? "Sync…" : "Sync Drive"}
+            <RefreshCw size={12} />
+            Import Drive
           </button>
           <button
             onClick={() => setShowUpload(true)}
             className="flex items-center gap-2 rounded-lg bg-gray-900 hover:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white transition-colors"
           >
             <Upload size={12} />
-            Uploader un CV
+            Charger des CV
+          </button>
+          <button
+            onClick={() => setShowAIModal(true)}
+            className="flex items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 text-xs font-medium text-indigo-700 transition-colors"
+          >
+            <Sparkles size={12} />
+            Analyse IA
           </button>
           <button
               onClick={() => setShowDeleteAllModal(true)}
@@ -166,59 +152,6 @@ export default function CandidateList() {
         </div>
       </div>
 
-      {showBanner && (
-        <div className={`mb-6 p-4 rounded-2xl border flex items-start justify-between gap-4 transition-all duration-300 ${
-          isSyncActive 
-            ? "bg-blue-50 border-blue-200 text-blue-800" 
-            : syncStatus.status === "completed"
-              ? "bg-emerald-50 border-emerald-200 text-emerald-800"
-              : "bg-amber-50 border-amber-200 text-amber-800"
-        }`}>
-          <div className="flex gap-3">
-            <div className="mt-0.5">
-              {isSyncActive ? (
-                <RefreshCw className="h-5 w-5 text-blue-500 animate-spin" />
-              ) : syncStatus.status === "completed" ? (
-                <CheckCircle2 className="h-5 w-5 text-emerald-500" />
-              ) : (
-                <AlertTriangle className="h-5 w-5 text-amber-500" />
-              )}
-            </div>
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wider">
-                {isSyncActive ? "Synchronisation en cours" : "Synchronisation terminée"}
-              </p>
-              <p className="text-xs mt-1 leading-relaxed">
-                {syncStatus.message}
-              </p>
-              {isSyncActive && (
-                <div className="mt-3 w-full max-w-md">
-                  <div className="flex items-center justify-between text-[10px] font-semibold mb-1">
-                    <span className="text-blue-700">Téléchargement : {syncStatus.total_files > 0 ? Math.round(((syncStatus.total_files - syncStatus.remaining) / syncStatus.total_files) * 100) : 0}%</span>
-                    <span className="text-slate-500">{syncStatus.total_files - syncStatus.remaining} / {syncStatus.total_files} fichiers</span>
-                  </div>
-                  <div className="w-full bg-blue-200/60 rounded-full h-1.5 mb-2 overflow-hidden">
-                    <div className="bg-blue-600 h-1.5 rounded-full transition-all duration-500 ease-out" style={{ width: `${syncStatus.total_files > 0 ? Math.round(((syncStatus.total_files - syncStatus.remaining) / syncStatus.total_files) * 100) : 0}%` }}></div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-semibold">En attente IA: {syncStatus.processed}</span>
-                    {syncStatus.failed > 0 && <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-semibold">Échecs: {syncStatus.failed}</span>}
-                    {syncStatus.skipped > 0 && <span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-semibold">Ignorés: {syncStatus.skipped}</span>}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-          {!isSyncActive && (
-            <button 
-              onClick={handleDismissBanner}
-              className="p-1 rounded-lg hover:bg-black/5 transition-colors text-gray-500 hover:text-gray-700"
-            >
-              <X size={16} />
-            </button>
-          )}
-        </div>
-      )}
 
       {/* Filters */}
       <div className="flex flex-wrap gap-2 mb-5">
@@ -495,6 +428,8 @@ export default function CandidateList() {
         )}
 
       {showUpload && <UploadCVModal onClose={() => setShowUpload(false)} />}
+      {showAIModal && <AIProcessingModal onClose={() => setShowAIModal(false)} />}
+      {showDriveModal && <DriveImportModal onClose={() => setShowDriveModal(false)} />}
     </div>
   );
 }

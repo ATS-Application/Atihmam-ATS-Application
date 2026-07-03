@@ -58,3 +58,27 @@ export const triggerDriveSync = (job_id) =>
 
 export const getDriveSyncStatus = () =>
   axiosClient.get("/ingestion/drive/sync/status");
+
+export const triggerDriveIngest = (job_id) =>
+  axiosClient.post(
+    "/ingestion/drive/ingest",
+    null,
+    {
+      params: { job_id },
+    }
+  );
+
+export const getDriveIngestStatus = () =>
+  axiosClient.get("/ingestion/drive/ingest/status");
+
+export const triggerAIProcessing = (job_id) =>
+  axiosClient.post(
+    "/ingestion/ai/process",
+    null,
+    {
+      params: { job_id },
+    }
+  );
+
+export const getAIProcessingStatus = () =>
+  axiosClient.get("/ingestion/ai/status");

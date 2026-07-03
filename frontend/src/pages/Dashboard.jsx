@@ -1,12 +1,14 @@
 // frontend/src/pages/Dashboard.jsx
 
 import { useState, useMemo } from "react";
-import { RefreshCw, Upload, ChevronDown, ChevronRight, Briefcase, Users, TrendingUp, CheckCircle, CheckCircle2, AlertTriangle, X } from "lucide-react";
+import { RefreshCw, Upload, ChevronDown, ChevronRight, Briefcase, Users, TrendingUp, CheckCircle, CheckCircle2, AlertTriangle, X, Sparkles } from "lucide-react";
 
 import { useCandidates, useDriveSync, useDriveSyncStatus } from "../hooks/useCandidates";
 import { useJobs } from "../hooks/useJobs";
 import KanbanBoard from "../components/KanbanBoard";
 import UploadCVModal from "../components/UploadCVModal";
+import AIProcessingModal from "../components/AIProcessingModal";
+import DriveImportModal from "../components/DriveImportModal";
 import ScoreBadge from "../components/ScoreBadge";
 import ScorePanel from "../components/Scorepanel";
 
@@ -247,26 +249,12 @@ function ScorePanelDrawer({ candidate, onClose }) {
 export default function Dashboard() {
   const { data: candidates = [] } = useCandidates();
   const { data: jobs = [] } = useJobs();
-  const { mutate: syncDrive, isPending: isSyncing } = useDriveSync();
 
   const [showUpload, setShowUpload] = useState(false);
+  const [showAIModal, setShowAIModal] = useState(false);
+  const [showDriveModal, setShowDriveModal] = useState(false);
   const [activeJob, setActiveJob] = useState(null);
   const [selectedCandidate, setSelectedCandidate] = useState(null);
-  const [dismissedSyncTime, setDismissedSyncTime] = useState(() =>
-    localStorage.getItem("dismissed_drive_sync_time") || null
-  );
-
-  const { data: syncStatus } = useDriveSyncStatus({ refetchInterval: 4000 });
-  const isSyncActive = syncStatus?.status === "processing";
-  const showSyncBanner = syncStatus && (
-    isSyncActive ||
-    (syncStatus.status !== "idle" && (!dismissedSyncTime || new Date(syncStatus.completed_at || syncStatus.started_at) > new Date(dismissedSyncTime)))
-  );
-  const handleDismissBanner = () => {
-    const now = new Date().toISOString();
-    setDismissedSyncTime(now);
-    localStorage.setItem("dismissed_drive_sync_time", now);
-  };
 
   const stats = useMemo(() => ({
     total:      candidates.length,
@@ -304,72 +292,30 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => syncDrive()}
-            disabled={isSyncing || isSyncActive}
-            className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={() => setShowDriveModal(true)}
+            className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors"
           >
-            <RefreshCw size={12} className={isSyncing || isSyncActive ? "animate-spin" : ""} />
-            {isSyncActive ? "Synchronisation…" : isSyncing ? "Sync…" : "Sync Drive"}
+            <RefreshCw size={12} />
+            Import Drive
           </button>
           <button
             onClick={() => setShowUpload(true)}
             className="flex items-center gap-2 rounded-lg bg-gray-900 hover:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white transition-colors"
           >
             <Upload size={12} />
-            Ajouter des CV
+            Charger des CV
+          </button>
+          <button
+            onClick={() => setShowAIModal(true)}
+            className="flex items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 text-xs font-medium text-indigo-700 transition-colors"
+          >
+            <Sparkles size={12} />
+            Analyse IA
           </button>
         </div>
       </header>
 
-      {/* Drive sync status banner */}
-      {showSyncBanner && (
-        <div className={`px-6 lg:px-8 py-3 flex items-start justify-between gap-4 ${
-          isSyncActive
-            ? "bg-blue-50 border-b border-blue-200 text-blue-800"
-            : syncStatus.status === "completed"
-              ? "bg-emerald-50 border-b border-emerald-200 text-emerald-800"
-              : "bg-amber-50 border-b border-amber-200 text-amber-800"
-        }`}>
-          <div className="flex gap-3 items-start">
-            <div className="mt-0.5 shrink-0">
-              {isSyncActive ? (
-                <RefreshCw className="h-4 w-4 text-blue-500 animate-spin" />
-              ) : syncStatus.status === "completed" ? (
-                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-              ) : (
-                <AlertTriangle className="h-4 w-4 text-amber-500" />
-              )}
-            </div>
-            <div>
-              <p className="text-xs font-bold uppercase tracking-wider">
-                {isSyncActive ? "Synchronisation en cours" : "Synchronisation terminée"}
-              </p>
-              <p className="text-xs mt-0.5 leading-relaxed">{syncStatus.message}</p>
-              {isSyncActive && (
-                <div className="mt-3 w-full max-w-md">
-                  <div className="flex items-center justify-between text-[10px] font-semibold mb-1">
-                    <span className="text-blue-700">Téléchargement : {syncStatus.total_files > 0 ? Math.round(((syncStatus.total_files - syncStatus.remaining) / syncStatus.total_files) * 100) : 0}%</span>
-                    <span className="text-slate-500">{syncStatus.total_files - syncStatus.remaining} / {syncStatus.total_files} fichiers</span>
-                  </div>
-                  <div className="w-full bg-blue-200/60 rounded-full h-1.5 mb-2 overflow-hidden">
-                    <div className="bg-blue-600 h-1.5 rounded-full transition-all duration-500 ease-out" style={{ width: `${syncStatus.total_files > 0 ? Math.round(((syncStatus.total_files - syncStatus.remaining) / syncStatus.total_files) * 100) : 0}%` }}></div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-semibold">En attente IA: {syncStatus.processed}</span>
-                    {syncStatus.failed > 0 && <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-semibold">Échecs: {syncStatus.failed}</span>}
-                    {syncStatus.skipped > 0 && <span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-semibold">Ignorés: {syncStatus.skipped}</span>}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-          {!isSyncActive && (
-            <button onClick={handleDismissBanner} className="p-1 rounded-lg hover:bg-black/5 transition-colors text-current opacity-60 hover:opacity-100">
-              <X size={15} />
-            </button>
-          )}
-        </div>
-      )}
+
 
       <div className={selectedCandidate ? "lg:grid lg:grid-cols-[1fr_320px]" : ""}>
         <main className="min-w-0 px-6 lg:px-8 py-8 space-y-10">
@@ -474,6 +420,8 @@ export default function Dashboard() {
       </div>
 
       {showUpload && <UploadCVModal onClose={() => setShowUpload(false)} />}
+      {showAIModal && <AIProcessingModal onClose={() => setShowAIModal(false)} />}
+      {showDriveModal && <DriveImportModal onClose={() => setShowDriveModal(false)} />}
     </div>
   );
 }
