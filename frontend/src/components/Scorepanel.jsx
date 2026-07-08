@@ -447,9 +447,9 @@ export default function ScorePanel({ candidate }) {
   const processingStatus = candidate?.processing_status ?? null;
 
   const hasData = Object.values(dims).some((v) => v > 0);
-  const isPending    = processingStatus === "queued";
+  const isPending    = processingStatus === "queued" || processingStatus === "pending" || processingStatus === "retry_scheduled";
   const isProcessing = processingStatus === "processing";
-  const isFailed     = processingStatus === "failed";
+  const isFailed     = processingStatus === "failed" || processingStatus === "failed_quota";
   const isPartial    = !hasData && score !== null && !isPending && !isProcessing && !isFailed;
 
   // ── Actions ─────────────────────────────────────────────────────────────

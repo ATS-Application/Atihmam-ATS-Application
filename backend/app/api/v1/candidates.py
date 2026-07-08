@@ -97,6 +97,25 @@ def ensure_list(value: Any) -> list:
 def sanitize_candidate(candidate: dict) -> dict:
     for field in ("skills", "certifications", "extracted_skills"):
         candidate[field] = ensure_list(candidate.get(field))
+    
+    # Sanitize languages field to be a list of strings (handling potential dict objects)
+    langs = candidate.get("languages")
+    if isinstance(langs, list):
+        sanitized_langs = []
+        for item in langs:
+            if isinstance(item, dict):
+                lang = item.get("language") or item.get("name") or ""
+                level = item.get("level") or ""
+                if lang and level:
+                    sanitized_langs.append(f"{lang} ({level})")
+                elif lang:
+                    sanitized_langs.append(lang)
+            elif isinstance(item, str):
+                sanitized_langs.append(item)
+        candidate["languages"] = sanitized_langs
+    else:
+        candidate["languages"] = ensure_list(langs)
+
     if candidate.get("job_id"):
         candidate["job_id"] = str(candidate["job_id"])
     return candidate

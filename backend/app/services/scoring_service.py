@@ -54,7 +54,7 @@ def normalize_text(text: str) -> str:
     Normalise un texte pour le matching insensible aux accents, ligatures
     et variations de casse.
     """
-    return text.lower().translate(_ACCENT_TABLE)
+    return (text or "").lower().translate(_ACCENT_TABLE)
 
 
 # =============================================================================
@@ -581,7 +581,7 @@ def detect_hierarchy_level(title_lower: str) -> HierarchyLevel:
 # =============================================================================
 
 def detect_education_level(education_text: str) -> str:
-    text_lower = education_text.lower()
+    text_lower = (education_text or "").lower()
     best_level = "none"
     best_index = 0
 
@@ -687,7 +687,7 @@ def compute_leadership_score(
     if not profile.require_leadership:
         return 1.0, {"leadership_required": False, "score": 1.0}
 
-    text_lower = cv_text.lower()
+    text_lower = (cv_text or "").lower()
 
     verb_scores = [w for v, w in LEADERSHIP_ACTION_VERBS.items() if v in text_lower]
     verb_score = max(verb_scores) if verb_scores else 0.0
@@ -866,8 +866,9 @@ def compute_language_quality_score(
     if target_languages is None:
         target_languages = ["fr", "en"]
 
-    text_lower = cv_text.lower()
-    if len(cv_text) < 50:
+    safe_text = cv_text or ""
+    text_lower = safe_text.lower()
+    if len(safe_text) < 50:
         return 0.3, {"error": "Texte trop court"}
 
     fr_markers = ["le ", "la ", "les ", "des ", "une ", "un ", "est ", "dans ",
@@ -950,9 +951,9 @@ def score_candidate(
     if target_languages is None:
         target_languages = ["fr", "en"]
 
-    title_lower = job_title.lower()
-    jd_lower = job_description.lower()
-    cv_lower = cv_text.lower()
+    title_lower = (job_title or "").lower()
+    jd_lower = (job_description or "").lower()
+    cv_lower = (cv_text or "").lower()
 
     hierarchy_level = detect_hierarchy_level(title_lower)
     domain = detect_domain(title_lower, jd_lower)
@@ -1415,9 +1416,9 @@ def compute_candidate_score(
     }
 
 
-def classify_domain(job_title: str, job_description: str = "") -> str:
+def classify_domain(job_title: str = "", job_description: str = "") -> str:
     """Compatibility shim: returns domain as string."""
-    return detect_domain(job_title.lower(), job_description.lower()).value
+    return detect_domain((job_title or "").lower(), (job_description or "").lower()).value
 
 
 # Backwards-compat alias

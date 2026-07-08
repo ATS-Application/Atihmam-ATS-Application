@@ -20,7 +20,7 @@ import {
 } from "../api/candidatesApi";
 
 // Processing statuses that mean "still in flight" — poll until we leave these.
-const PENDING_STATUSES = new Set(["queued", "processing"]);
+const PENDING_STATUSES = new Set(["queued", "pending", "processing", "retry_scheduled"]);
 
 export function useCandidates(filters = {}) {
   return useQuery({

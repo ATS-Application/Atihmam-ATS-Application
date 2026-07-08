@@ -28,6 +28,13 @@ const PROC_META = {
     icon: Clock,
     label: "En file",
   },
+  pending: {
+    color: "text-amber-600",
+    bg: "bg-amber-50",
+    border: "border-amber-200",
+    icon: Clock,
+    label: "En file",
+  },
   processing: {
     color: "text-blue-600",
     bg: "bg-blue-50",
@@ -36,6 +43,13 @@ const PROC_META = {
     label: "En cours",
     spin: true,
   },
+  completed: {
+    color: "text-emerald-600",
+    bg: "bg-emerald-50",
+    border: "border-emerald-200",
+    icon: CheckCircle2,
+    label: "Traité",
+  },
   done: {
     color: "text-emerald-600",
     bg: "bg-emerald-50",
@@ -43,12 +57,33 @@ const PROC_META = {
     icon: CheckCircle2,
     label: "Traité",
   },
+  failed: {
+    color: "text-red-500",
+    bg: "bg-red-50",
+    border: "border-red-200",
+    icon: AlertTriangle,
+    label: "Échec",
+  },
   error: {
     color: "text-red-500",
     bg: "bg-red-50",
     border: "border-red-200",
     icon: AlertTriangle,
-    label: "Erreur",
+    label: "Échec",
+  },
+  failed_quota: {
+    color: "text-orange-500",
+    bg: "bg-orange-50",
+    border: "border-orange-200",
+    icon: AlertTriangle,
+    label: "Quota atteint",
+  },
+  retry_scheduled: {
+    color: "text-purple-600",
+    bg: "bg-purple-50",
+    border: "border-purple-200",
+    icon: RefreshCw,
+    label: "Réessai planifié",
   },
   skipped: {
     color: "text-gray-400",
@@ -106,10 +141,10 @@ export default function AIProcessingModal({ onClose }) {
 
   // ── Derived stats ──────────────────────────────────────────────────────────
   const total      = candidates.length;
-  const done       = candidates.filter(c => c.processing_status === "done").length;
+  const done       = candidates.filter(c => ["completed", "done"].includes(c.processing_status)).length;
   const processing = candidates.filter(c => c.processing_status === "processing").length;
-  const queued     = candidates.filter(c => c.processing_status === "queued").length;
-  const errors     = candidates.filter(c => c.processing_status === "error").length;
+  const queued     = candidates.filter(c => ["queued", "pending", "retry_scheduled"].includes(c.processing_status)).length;
+  const errors     = candidates.filter(c => ["failed", "error", "failed_quota"].includes(c.processing_status)).length;
   const allDone    = total > 0 && (done + errors) === total;
   const progress   = total > 0 ? Math.round(((done + errors) / total) * 100) : 0;
 

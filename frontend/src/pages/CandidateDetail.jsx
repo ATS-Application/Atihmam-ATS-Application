@@ -610,9 +610,9 @@ export default function CandidateDetail() {
   const reasoning = candidate?.score_reasoning ?? aiData?.score_reasoning ?? null;
   const processingStatus = candidate?.processing_status ?? null;
 
-  const isPendingJob  = processingStatus === "queued";
+  const isPendingJob  = processingStatus === "queued" || processingStatus === "pending" || processingStatus === "retry_scheduled";
   const isProcessing  = processingStatus === "processing";
-  const isFailed      = processingStatus === "failed";
+  const isFailed      = processingStatus === "failed" || processingStatus === "failed_quota";
 
   // FIX: renamed from `isPartial` — describes the actual condition more clearly
   const hasScoreButNoDimensions = !hasData && score !== null && !isPendingJob && !isProcessing && !isFailed;

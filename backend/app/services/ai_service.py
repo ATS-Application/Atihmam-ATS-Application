@@ -2,6 +2,11 @@
 """
 AI Service — multi-provider with fallback chain.
 Extraction structurée de CV (prompt strict) et délégation du scoring à scoring_service.
+
+v2.3 — Logique de secours multi-modèles Gemini (Failover) :
+  - La liste `GEMINI_MODELS_TO_TRY` définit l'ordre de priorité des modèles.
+  - En cas de quota épuisé (ResourceExhausted), le modèle suivant est tenté.
+  - Le client Gemini est initialisé une seule fois au démarrage (optimisation).
 """
 from __future__ import annotations
 
@@ -11,8 +16,8 @@ import re
 from datetime import date
 from typing import Any
 
-import google.generativeai as genai
 import requests
+from google.api_core.exceptions import ResourceExhausted
 
 from app.config import get_settings
 from app.services.cv_extractor import CVExtractor
@@ -21,6 +26,36 @@ from app.services.scoring_service import compute_candidate_score
 logger = logging.getLogger(__name__)
 
 MAX_CV_TEXT_LENGTH = 8_000
+
+# ---------------------------------------------------------------------------
+# Liste ordonnée des modèles Gemini à essayer en cas de quota épuisé.
+# Le premier disponible et non-saturé sera utilisé.
+# ---------------------------------------------------------------------------
+GEMINI_MODELS_TO_TRY = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+
+# ---------------------------------------------------------------------------
+# Client Gemini initialisé une seule fois au démarrage (optimisation).
+# ---------------------------------------------------------------------------
+_gemini_client = None
+
+
+def _get_gemini_client():
+    """Retourne le client Gemini, en l'initialisant une seule fois."""
+    global _gemini_client
+    if _gemini_client is None:
+        settings = get_settings()
+        if not settings.gemini_api_key:
+            raise RuntimeError("Missing Gemini API key")
+        from google import genai as new_genai
+        _gemini_client = new_genai.Client(api_key=settings.gemini_api_key)
+        logger.info("[Gemini] Client initialisé (une seule fois au démarrage).")
+    return _gemini_client
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +114,41 @@ def _normalize_extracted_cv(data: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _call_gemini(prompt: str, settings) -> str:
+    """
+    Tente l'appel Gemini en itérant sur GEMINI_MODELS_TO_TRY.
+    Passe au modèle suivant en cas de quota épuisé (ResourceExhausted).
+    Lève une exception si tous les modèles sont saturés.
+    """
     if not settings.gemini_api_key:
         raise RuntimeError("Missing Gemini API key")
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(prompt)
-    return response.text
+
+    client = _get_gemini_client()
+    last_exc: Exception | None = None
+
+    for model_name in GEMINI_MODELS_TO_TRY:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            print(f"Modèle utilisé avec succès : {model_name}")
+            return response.text
+        except ResourceExhausted as exc:
+            logger.warning(
+                "[Gemini] Quota épuisé pour le modèle '%s' — passage au suivant. Détail : %s",
+                model_name, exc,
+            )
+            last_exc = exc
+        except Exception as exc:
+            # Pour toute autre erreur (non-quota), on la propage immédiatement
+            # sans tenter les modèles suivants.
+            raise
+
+    raise RuntimeError(
+        f"Capacité quotidienne globale Gemini atteinte — "
+        f"tous les modèles sont saturés : {GEMINI_MODELS_TO_TRY}. "
+        f"Dernière erreur : {last_exc}"
+    )
 
 
 def _call_nvidia(prompt: str, settings) -> str:

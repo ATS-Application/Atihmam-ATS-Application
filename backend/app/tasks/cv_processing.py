@@ -307,7 +307,13 @@ def _enrich_ai_data(cv_info: dict, score_result: dict) -> dict:
 # PIPELINE PRINCIPAL DE TRAITEMENT
 # ============================================================================
 
-def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
+def process_cv(
+    candidate_id: str,
+    storage_path: str,
+    job_id: str | None = None,
+    skip_extraction: bool = False,
+    cached_cv_info: dict | None = None,
+):
     supabase = get_supabase_admin()
 
     try:
@@ -319,6 +325,7 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 
         update_candidate(supabase, candidate_id, {
             "processing_status": "processing",
+            "locked_at": utc_now(),
             "updated_at": utc_now(),
         })
 
@@ -326,8 +333,15 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
         pdf_bytes = supabase.storage.from_("cvs").download(storage_path)
         raw_text  = extract_text_safe(pdf_bytes)
 
-        # AI extraction
-        cv_info = extract_cv_info(raw_text)
+        # ── AI extraction (skip if already done) ─────────────────────────────
+        if skip_extraction and cached_cv_info and isinstance(cached_cv_info, dict):
+            logger.info(
+                "CV %s — skip_extraction=True, réutilisation des données IA existantes.",
+                candidate_id,
+            )
+            cv_info = cached_cv_info
+        else:
+            cv_info = extract_cv_info(raw_text)
 
         # Enrich with raw_text so all scorer dimensions have the full CV body
         enriched_cv = enrich_cv_data(cv_info, raw_text)
@@ -368,6 +382,11 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
             score_result=score_result,
             job_id=job_id,
         )
+
+        # Marquer l'extraction comme effectuée (ne sera plus rappelée pour ce candidat)
+        if not skip_extraction:
+            payload["extracted"] = True
+
         update_candidate(supabase, candidate_id, payload)
 
         logger.info("CV %s traité → Score : %s", candidate_id, score_result.get("score", 0))
@@ -375,12 +394,17 @@ def process_cv(candidate_id: str, storage_path: str, job_id: str | None = None):
 
     except Exception as exc:
         logger.exception("Échec CV %s", candidate_id)
+        error_msg = str(exc)
+        is_quota = "429" in error_msg or "quota" in error_msg.lower() or "ResourceExhausted" in error_msg
+        status_val = "failed_quota" if is_quota else "failed"
         update_candidate(supabase, candidate_id, {
-            "processing_status": "failed",
-            "processing_error":  str(exc)[:500],
+            "processing_status": status_val,
+            "processing_error":  error_msg[:500],
+            "locked_at":         None,
             "updated_at":        utc_now(),
         })
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": error_msg}
+
 
 
 # ============================================================================
@@ -542,11 +566,13 @@ def build_candidate_payload(
         "languages":      ensure_list(cv_info.get("languages")),
         "projects":       ensure_list(cv_info.get("projects")),
 
-        "experience_years": cv_info.get("experience_years", 0),
+        "experience_years": int(float(cv_info.get("experience_years") or 0)),
 
         **_build_score_payload(score_result),
 
         "processing_status": "completed",
+        "locked_at":         None,
+        "processing_error":  None,
         "updated_at":        utc_now(),
     }
 

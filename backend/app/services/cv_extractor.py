@@ -210,21 +210,34 @@ class CVExtractor:
         """
         Analyse une image de CV (photographiée ou scannée) et utilise la vision
         de Gemini pour en faire une retranscription OCR ultra-fidèle.
+
+        Logique de secours multi-modèles (Failover) :
+        En cas de quota épuisé (ResourceExhausted), passe automatiquement
+        au modèle suivant dans GEMINI_MODELS_TO_TRY.
         """
+        # Liste ordonnée des modèles Vision à essayer (identique à ai_service)
+        GEMINI_MODELS_TO_TRY = [
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        ]
+
         try:
             from app.config import get_settings
             settings = get_settings()
             api_key = settings.gemini_api_key or ""
-            
+
             if not api_key:
                 logger.error("[Extractor] Clé API Gemini manquante pour l'extraction OCR d'image.")
                 return ""
 
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
+            from google import genai as new_genai
+            from google.genai import types as genai_types
+            from google.api_core.exceptions import ResourceExhausted
 
-            # Utilisation de gemini-1.5-flash pour ses capacités rapides en vision et OCR
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            client = new_genai.Client(api_key=api_key)
 
             prompt = (
                 "Tu es un lecteur de document (OCR) de très haute précision pour un ATS de recrutement.\n"
@@ -233,19 +246,49 @@ class CVExtractor:
                 "Ne fais aucun résumé ni commentaire, retourne UNIQUEMENT les textes présents réels."
             )
 
-            image_part = {
-                "mime_type": mime_type,
-                "data": image_bytes
-            }
+            last_exc: Exception | None = None
 
-            logger.info(f"[Extractor] Envoi de l'image ({mime_type}) pour transcription OCR...")
-            response = model.generate_content([prompt, image_part])
-            
-            if response and response.text:
-                logger.info("[Extractor] Transcription OCR de l'image réussie avec succès.")
-                return CVExtractor.clean_text(response.text)
-            
+            for model_name in GEMINI_MODELS_TO_TRY:
+                try:
+                    logger.info(
+                        "[Extractor] Tentative OCR avec le modèle '%s' pour image (%s)...",
+                        model_name, mime_type,
+                    )
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            genai_types.Part.from_text(text=prompt),
+                            genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        ],
+                    )
+
+                    if response and response.text:
+                        print(f"Modèle utilisé avec succès : {model_name}")
+                        logger.info(
+                            "[Extractor] Transcription OCR réussie avec le modèle '%s'.",
+                            model_name,
+                        )
+                        return CVExtractor.clean_text(response.text)
+
+                    # Réponse vide mais pas d'exception → on continue avec le modèle suivant
+                    logger.warning("[Extractor] Réponse vide du modèle '%s', passage au suivant.", model_name)
+
+                except ResourceExhausted as exc:
+                    logger.warning(
+                        "[Extractor] Quota épuisé pour le modèle OCR '%s' — passage au suivant. Détail : %s",
+                        model_name, exc,
+                    )
+                    last_exc = exc
+                except Exception:
+                    # Toute autre erreur non-quota est propagée immédiatement
+                    raise
+
+            logger.error(
+                "[Extractor] Tous les modèles Gemini sont saturés pour l'OCR. Dernière erreur : %s",
+                last_exc,
+            )
             return ""
+
         except Exception as e:
             logger.error(f"[Extractor] Erreur critique lors de la transcription OCR de l'image : {e}")
             return ""
