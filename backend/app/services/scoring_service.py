@@ -1,6 +1,6 @@
 """
 scoring_service.py — Service de scoring ATS pour le marché francophone africain.
-Version 2.1 — Architecture hiérarchique à 4 niveaux avec leadership par actions.
+Version 2.2 — Architecture hiérarchique à 4 niveaux avec leadership par actions.
 Conçu pour Atihmam Conseils, adapté au contexte ivoirien et francophone.
 
 Changelog v2.1:
@@ -16,6 +16,16 @@ Changelog v2.1.1 (feedback loop fix):
   The old 8-key hierarchical-profile weight space was never consumed by
   compute_intelligent_score, so feedback never affected scoring. DEFAULT_WEIGHTS
   is kept as a backwards-compat alias.
+
+Changelog v2.2 (nouvelle formule de scoring):
+- Formule 1 — Score pondéré pur :
+    Score_brut = Σ(Score_i × Poids_i)
+  La somme des poids DOIT être égale à 1.0 (assertion à l'initialisation).
+- Formule 2 — Atténuation multiplicative (correction du bug de soustraction) :
+    Score_final = Score_brut × (1.0 - Facteur_Pénalité)
+  Le facteur de pénalité est borné entre 0.0 et 0.4 : il réduit sans annuler.
+  Les bonus additifs (depth, ecosystem, certifications, recruteur) sont
+  intégrés dans Score_brut avant l'atténuation.
 """
 
 # =============================================================================
@@ -1116,6 +1126,16 @@ INTELLIGENT_SCORE_DEFAULT_WEIGHTS: Dict[str, float] = {
     "domain_diversity":   0.10,
     "career_progression": 0.10,
 }
+
+# ── Vérification d'initialisation : Σ Poids_i doit être égal à 1.0 ────────
+# Conformément à la Formule 1 (scoring pondéré), la somme des poids DOIT
+# valoir exactement 1.0 pour que le score final reste sur une base de 100.
+_weights_sum = sum(INTELLIGENT_SCORE_DEFAULT_WEIGHTS.values())
+assert abs(_weights_sum - 1.0) < 1e-9, (
+    f"ERREUR CRITIQUE : La somme des poids INTELLIGENT_SCORE_DEFAULT_WEIGHTS "
+    f"doit être égale à 1.0, mais elle vaut {_weights_sum:.6f}. "
+    f"Vérifiez les clés : {list(INTELLIGENT_SCORE_DEFAULT_WEIGHTS.keys())}"
+)
 
 # Backwards-compat alias (old name kept in case other modules import it)
 DEFAULT_WEIGHTS = INTELLIGENT_SCORE_DEFAULT_WEIGHTS

@@ -175,22 +175,88 @@ async def list_candidates(
     user: dict = Depends(get_current_user),
 ):
     supabase = get_supabase()
-    query = supabase.table("candidates").select("*")
-
+    
     if job_id:
-        query = query.eq("job_id", str(job_id))
-    if status_filter:
-        query = query.eq("status", status_filter)
-    if min_score > 0:
-        query = query.gte("score", min_score)
+        # 1. Fetch job to get category
+        job_resp = supabase.table("jobs").select("category").eq("id", str(job_id)).execute()
+        job_category = job_resp.data[0].get("category") if job_resp.data else None
+        
+        # 2. Fetch active job IDs to determine if candidate's current job is active
+        active_jobs_resp = supabase.table("jobs").select("id").eq("is_active", True).execute()
+        active_job_ids = {j["id"] for j in active_jobs_resp.data or []}
+        
+        # 3. Fetch all completed candidates (or we can fetch all candidates)
+        candidates_resp = supabase.table("candidates").select("*").execute()
+        all_candidates = candidates_resp.data or []
+        
+        from app.tasks.auto_scoring import is_candidate_compatible_with_job
+        
+        filtered = []
+        for c in all_candidates:
+            c_job_id = c.get("job_id")
+            c_status = c.get("status")
+            
+            # Direct match
+            if c_job_id == str(job_id):
+                filtered.append(c)
+                continue
+                
+            # Compatibility match for early stage/unassigned candidates
+            if is_candidate_compatible_with_job(c.get("domain"), job_category):
+                is_available = (
+                    not c_job_id
+                    or c_job_id not in active_job_ids
+                    or c_status in ["applied", "screening"]
+                )
+                if is_available:
+                    filtered.append(c)
+        
+        # Override scores for the requested job
+        str_job_id = str(job_id)
+        import json
+        for c in filtered:
+            ai_data = c.get("ai_extracted_data") or {}
+            if isinstance(ai_data, str):
+                try:
+                    ai_data = json.loads(ai_data)
+                except Exception:
+                    ai_data = {}
+            
+            job_scores = ai_data.get("job_scores") or {}
+            if str_job_id in job_scores:
+                js = job_scores[str_job_id]
+                c["score"] = js.get("score", c.get("score"))
+                dims = js.get("dimension_scores")
+                if dims:
+                    c["dimension_scores"] = dims
+                    for k, v in dims.items():
+                        c[k] = v
+                c["score_confidence"] = js.get("score_confidence", c.get("score_confidence"))
+                c["score_reasoning"] = js.get("score_reasoning", c.get("score_reasoning"))
+                c["matched_keywords"] = js.get("matched_keywords", c.get("matched_keywords"))
+                c["missing_keywords"] = js.get("missing_keywords", c.get("missing_keywords"))
+                
+        # Filter by status if requested
+        if status_filter:
+            filtered = [c for c in filtered if c.get("status") == status_filter]
+            
+        # Filter by min_score if requested
+        if min_score > 0:
+            filtered = [c for c in filtered if (c.get("score") or 0) >= min_score]
+            
+        # Sort by score descending
+        filtered.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+        candidates = filtered
+    else:
+        query = supabase.table("candidates").select("*")
+        if status_filter:
+            query = query.eq("status", status_filter)
+        if min_score > 0:
+            query = query.gte("score", min_score)
+        candidates = query.order("score", desc=True).execute().data or []
 
-    candidates = (
-        query
-        .order("score", desc=True)   # ← score-first, not created_at
-        .execute()
-        .data or []
-    )
     return [sanitize_candidate(c) for c in candidates]
+
 
 
 @router.get("/{candidate_id}", response_model=CandidateResponse)

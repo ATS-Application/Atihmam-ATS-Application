@@ -10,6 +10,7 @@ from fastapi import (
     HTTPException,
     Response,
     status,
+    BackgroundTasks,
 )
 
 from app.core.security import (
@@ -23,6 +24,7 @@ from app.models.job import (
     JobUpdate,
 )
 from app.utils.sanitize import safe_screening_questions
+from app.tasks.auto_scoring import trigger_auto_scoring_for_new_job
 
 router = APIRouter(
     prefix="/jobs",
@@ -110,6 +112,7 @@ async def get_job(
 )
 async def create_job(
     payload: JobCreate,
+    background_tasks: BackgroundTasks,
     user: dict = Depends(
         require_role("admin", "recruiter")
     ),
@@ -117,6 +120,8 @@ async def create_job(
     supabase = get_supabase_admin()
 
     data = payload.model_dump()
+    # Exclude 'domain' from database write because it is not a DB column
+    data.pop("domain", None)
 
     # Ensure safe structure before insert
     data["screening_questions"] = safe_screening_questions(
@@ -145,6 +150,8 @@ async def create_job(
         job.get("screening_questions")
     )
 
+    background_tasks.add_task(trigger_auto_scoring_for_new_job, job["id"])
+
     return job
 
 
@@ -168,6 +175,8 @@ async def update_job(
     data = payload.model_dump(
         exclude_none=True
     )
+    # Exclude 'domain' from database write because it is not a DB column
+    data.pop("domain", None)
 
     if not data:
         raise HTTPException(

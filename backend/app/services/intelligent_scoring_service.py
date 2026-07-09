@@ -702,8 +702,15 @@ def compute_intelligent_score(
             candidate_skills, experience_years, recruiter_preferences
         )
 
-    # ── Score final pondéré ───────────────────────────────────
-    raw_score = (
+    # ══════════════════════════════════════════════════════════════════
+    # Formule 1 — Score brut pondéré (Scoring Pondéré Base)
+    #   Score_brut = Σ(Score_i × Poids_i)
+    #   Σ Poids_i = 1.0 (garanti par l'assertion dans scoring_service.py)
+    #   Les 6 dimensions sont déjà sur une base 0–100.
+    #   Les bonus additifs (depth, ecosystem, certifications, recruteur)
+    #   sont intégrés AVANT l'atténuation, capés à 100.
+    # ══════════════════════════════════════════════════════════════════
+    score_brut = (
         skill_score * w["skill_match"]
         + exp_score * w["experience"]
         + complexity_score * w["project_complexity"]
@@ -712,10 +719,24 @@ def compute_intelligent_score(
         + career_score * w["career_progression"]
     )
 
-    raw_score += depth_bonus + ecosystem_bonus + cert_bonus + recruiter_bonus
-    raw_score -= diversity_penalty + repetition_penalty
+    # Bonus additifs intégrés dans Score_brut (avant pénalité multiplicative)
+    score_brut += depth_bonus + ecosystem_bonus + cert_bonus + recruiter_bonus
+    score_brut = min(100.0, max(0.0, score_brut))   # borné [0, 100]
 
-    final_score = round(min(100.0, max(0.0, raw_score)), 1)
+    # ══════════════════════════════════════════════════════════════════
+    # Formule 2 — Atténuation multiplicative (Correction de l'expérience)
+    #   Score_final = Score_brut × (1.0 − Facteur_Pénalité)
+    #   Facteur_Pénalité ∈ [0.0, 0.4] : réduit sans annuler.
+    #     - 0.0  → aucune pénalité (score brut conservé)
+    #     - 0.4  → pénalité maximale (ex: candidat sans expérience)
+    #   Les pénalités de diversité et de répétition de projets
+    #   sont normalisées sur 100 puis combinées en Facteur_Pénalité.
+    # ══════════════════════════════════════════════════════════════════
+    # On convertit les pénalités (exprimées en pts sur 100) en facteur [0, 0.4]
+    total_penalty_pts = diversity_penalty + repetition_penalty          # pts bruts
+    facteur_penalite = min(0.40, total_penalty_pts / 100.0)            # normalisé
+
+    final_score = round(min(100.0, max(0.0, score_brut * (1.0 - facteur_penalite))), 1)
 
     # ── Génération du raisonnement ────────────────────────────
     reasoning_parts = []
@@ -752,32 +773,37 @@ def compute_intelligent_score(
         "missing_keywords": skill_result["missing"],
         "reasoning": reasoning,
         "score_breakdown": {
-            "skill_match": round(skill_score, 1),
-            "experience": round(exp_score, 1),
+            # ── Formule 1 : dimensions pondérées ──────────────────
+            "skill_match":        round(skill_score, 1),
+            "experience":         round(exp_score, 1),
             "project_complexity": round(complexity_score, 1),
-            "seniority": round(seniority_score, 1),
-            "domain_diversity": round(diversity_score, 1),
+            "seniority":          round(seniority_score, 1),
+            "domain_diversity":   round(diversity_score, 1),
             "career_progression": round(career_score, 1),
-            "depth_bonus": round(depth_bonus, 1),
-            "ecosystem_bonus": round(ecosystem_bonus, 1),
+            # Bonus additifs intégrés dans score_brut
+            "depth_bonus":        round(depth_bonus, 1),
+            "ecosystem_bonus":    round(ecosystem_bonus, 1),
             "certification_bonus": round(cert_bonus, 1),
             "recruiter_fit_bonus": round(recruiter_bonus, 1),
-            "diversity_penalty": round(diversity_penalty, 1),
+            # ── Formule 2 : atténuation multiplicative ────────────
+            "score_brut":         round(score_brut, 1),
+            "facteur_penalite":   round(facteur_penalite, 4),
+            "diversity_penalty":  round(diversity_penalty, 1),
             "repetition_penalty": round(repetition_penalty, 1),
         },
         # Weights actually applied to the 6 primary dimensions above
         # (defaults, or learned weights from app_config.ats_weights).
         "weights_used": w,
         "insights": {
-            "seniority_level": _get_seniority_label(seniority_mult),
-            "unique_domains": diversity_result["unique_domains"],
+            "seniority_level":  _get_seniority_label(seniority_mult),
+            "unique_domains":   diversity_result["unique_domains"],
             "complexity_level": _get_complexity_label(complexity_score),
-            "experience_note": exp_result.get("note", ""),
-            "effective_years": exp_result.get("effective_years"),
+            "experience_note":  exp_result.get("note", ""),
+            "effective_years":  exp_result.get("effective_years"),
             "project_dedup": {
-                "duplicates_removed": dedup_result["duplicates_removed"] if dedup_result else 0,
-                "real_duration_years": dedup_result["real_duration_years"] if dedup_result else None,
-                "diversity_ratio": dedup_result["diversity_ratio"] if dedup_result else 1.0,
+                "duplicates_removed":   dedup_result["duplicates_removed"] if dedup_result else 0,
+                "real_duration_years":  dedup_result["real_duration_years"] if dedup_result else None,
+                "diversity_ratio":      dedup_result["diversity_ratio"] if dedup_result else 1.0,
             } if dedup_result else None,
         },
         "recruiter_suggestions": (recruiter_preferences or {}).get("suggestions", []),
