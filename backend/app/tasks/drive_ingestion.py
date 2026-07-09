@@ -56,7 +56,6 @@ def process_drive_file_ingest(drive_file_id: str, supabase, job_id: str | None =
         )
 
         payload = {
-            "job_id": job_id,
             "status": "applied",
             "processing_status": "queued",
             "full_name": file_name,

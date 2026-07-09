@@ -553,7 +553,7 @@ export default function ScorePanel({ candidate }) {
         <Card className="p-4">
          {candidate.cv_file_url && (
             <button
-              onClick={() => openCV(candidate.cv_file_url)}
+              onClick={() => openCV(candidate.cv_file_url, candidate.id)}
               disabled={isOpeningCV}
               className="mt-6 flex w-full items-center justify-center gap-2 rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-700 transition-all hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700 disabled:opacity-50"
             >

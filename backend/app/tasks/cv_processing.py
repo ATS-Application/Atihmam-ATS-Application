@@ -538,6 +538,19 @@ def build_candidate_payload(
     # so ScorePanel can find dimension_scores at aiData.dimension_scores
     base_cv = enriched_cv if enriched_cv is not None else cv_info
     ai_data = sanitize_ai_data(_enrich_ai_data(base_cv, score_result))
+    if job_id:
+        job_scores = ai_data.get("job_scores")
+        if not isinstance(job_scores, dict):
+            job_scores = {}
+        job_scores[str(job_id)] = {
+            "score": score_result.get("score"),
+            "dimension_scores": score_result.get("dimension_scores", {}),
+            "score_confidence": score_result.get("confidence"),
+            "score_reasoning": score_result.get("reasoning"),
+            "matched_keywords": score_result.get("matched_keywords", []),
+            "missing_keywords": score_result.get("missing_keywords", []),
+        }
+        ai_data["job_scores"] = job_scores
 
     payload = {
         "cv_raw_text":       raw_text[:MAX_TEXT_LENGTH],
@@ -575,8 +588,5 @@ def build_candidate_payload(
         "processing_error":  None,
         "updated_at":        utc_now(),
     }
-
-    if job_id:
-        payload["job_id"] = job_id
 
     return payload

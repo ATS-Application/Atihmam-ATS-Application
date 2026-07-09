@@ -149,11 +149,7 @@ def trigger_auto_scoring_for_new_job(job_id: str):
         job_category = classify_domain(f"{job_title} {job_requirements[:300]}")
         logger.info("Job %s had no category — auto-classified as '%s'", job_id, job_category)
 
-    # ── 2. Active job IDs (to detect inactive assignments) ─────────────────
-    active_jobs_resp = supabase.table("jobs").select("id").eq("is_active", True).execute()
-    active_job_ids = {j["id"] for j in active_jobs_resp.data or []}
-
-    # ── 3. All candidates whose CV was fully processed ──────────────────────
+    # ── 2. All candidates whose CV was fully processed ──────────────────────
     candidates_resp = (
         supabase.table("candidates")
         .select("*")
@@ -174,25 +170,11 @@ def trigger_auto_scoring_for_new_job(job_id: str):
         if not is_candidate_compatible_with_job(cand_domain, job_category):
             continue
 
-        current_job_id = cand.get("job_id")
         ats_status     = cand.get("status", "applied")
 
-        # ── Availability check ──────────────────────────────────────────────
-        # Do NOT touch candidates already engaged (interview / offer / hired / rejected)
-        ENGAGED_STATUSES = {"interview", "offer", "hired", "rejected"}
-        if ats_status in ENGAGED_STATUSES:
-            continue
-
-        # Candidate is available if:
-        #   - no job assigned, OR
-        #   - assigned to an inactive/deleted job, OR
-        #   - still in applied / screening
-        is_available = (
-            not current_job_id
-            or current_job_id not in active_job_ids
-            or ats_status in {"applied", "screening"}
-        )
-        if not is_available:
+        # Rejected candidates stay out of recommendations, but active/hired
+        # profiles can still be visible in the talent pool for historical fit.
+        if ats_status == "rejected":
             continue
 
         # ── Score the candidate against this job ────────────────────────────
@@ -243,30 +225,6 @@ def trigger_auto_scoring_for_new_job(job_id: str):
                 "ai_extracted_data": enriched_ai
             }
 
-            # Conditionally set default/home job:
-            # - If candidate has no active job assignment, OR
-            # - If they match this new job strictly BETTER than their current default
-            is_unassigned = not current_job_id or current_job_id not in active_job_ids
-            if is_unassigned or new_score > current_score:
-                update_payload.update({
-                    "job_id":                   job_id,
-                    "score":                    score_result.get("score"),
-                    "dimension_scores":         dims,
-                    "score_confidence":         score_result.get("confidence"),
-                    "score_reasoning":          score_result.get("reasoning"),
-                    "matched_keywords":         score_result.get("matched_keywords", []),
-                    "missing_keywords":         score_result.get("missing_keywords", []),
-                    # Flat dimension columns
-                    "keyword_score":            dims.get("keyword_score"),
-                    "semantic_score":           dims.get("semantic_score"),
-                    "experience_score":         dims.get("experience_score"),
-                    "project_complexity_score": dims.get("project_complexity_score"),
-                    "education_score":          dims.get("education_score"),
-                    "certification_score":      dims.get("certification_score"),
-                    "leadership_score":         dims.get("leadership_score"),
-                    "language_score":           dims.get("language_score"),
-                })
-
             supabase.table("candidates").update(update_payload).eq("id", cand["id"]).execute()
 
             logger.info(
@@ -281,4 +239,3 @@ def trigger_auto_scoring_for_new_job(job_id: str):
     logger.info(
         "Auto-scoring done for job %s: %d candidate(s) processed.", job_id, matched_count
     )
-

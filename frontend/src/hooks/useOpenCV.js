@@ -1,5 +1,6 @@
 // src/hooks/useOpenCV.js
 import { useState, useCallback } from "react";
+import { getCandidateCVUrl } from "../api/candidatesApi";
 
 const BUCKET_BASE_URL =
   "https://nflmcuktfosaketloomh.supabase.co/storage/v1/object/public/cvs/";
@@ -7,7 +8,7 @@ const BUCKET_BASE_URL =
 export function useOpenCV() {
   const [isOpeningCV, setIsOpeningCV] = useState(false);
 
-  const openCV = useCallback((cvFileUrl) => {
+  const openCV = useCallback(async (cvFileUrl, candidateId = null) => {
     if (!cvFileUrl) {
       alert("CV introuvable.");
       return;
@@ -18,7 +19,10 @@ export function useOpenCV() {
     try {
       let finalUrl;
 
-      if (cvFileUrl.startsWith("http")) {
+      if (candidateId) {
+        const response = await getCandidateCVUrl(candidateId);
+        finalUrl = response.data?.url;
+      } else if (cvFileUrl.startsWith("http")) {
         finalUrl = cvFileUrl;
       } else {
         const cleanPath = cvFileUrl
@@ -27,6 +31,10 @@ export function useOpenCV() {
           .replace(/^public\//, "");
 
         finalUrl = `${BUCKET_BASE_URL}${cleanPath}`;
+      }
+
+      if (!finalUrl) {
+        throw new Error("No CV URL returned");
       }
 
       window.open(finalUrl, "_blank", "noopener,noreferrer");

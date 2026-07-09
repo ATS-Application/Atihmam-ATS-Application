@@ -314,7 +314,6 @@ async def upload_cv(
         supabase.table("candidates")
         .insert(
             {
-                "job_id": job_id,
                 "status": "applied",
                 "processing_status": "queued",
                 "cv_file_hash": file_hash,

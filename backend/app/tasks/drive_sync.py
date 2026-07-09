@@ -394,7 +394,6 @@ def process_drive_file(
 
         # 4. Insert into candidates table with 'queued' status
         payload = {
-            "job_id": job_id,
             "status": "applied",
             "processing_status": "queued",
             "full_name": file_name,  # temporary placeholder until AI extraction

@@ -121,6 +121,39 @@ def sanitize_candidate(candidate: dict) -> dict:
     return candidate
 
 
+def parse_ai_data(candidate: dict) -> dict:
+    ai_data = candidate.get("ai_extracted_data") or {}
+    if isinstance(ai_data, str):
+        try:
+            return json.loads(ai_data)
+        except Exception:
+            return {}
+    return ai_data if isinstance(ai_data, dict) else {}
+
+
+def store_job_score(candidate: dict, job_id: str, score_result: dict) -> dict:
+    """
+    Persist a per-job score without turning the candidate into a single-job
+    application. This keeps the CV database usable as a talent pool.
+    """
+    ai_data = parse_ai_data(candidate)
+    job_scores = ai_data.get("job_scores")
+    if not isinstance(job_scores, dict):
+        job_scores = {}
+
+    job_scores[str(job_id)] = {
+        "score": score_result.get("score"),
+        "dimension_scores": score_result.get("dimension_scores", {}),
+        "score_confidence": score_result.get("confidence"),
+        "score_reasoning": score_result.get("reasoning"),
+        "matched_keywords": score_result.get("matched_keywords", []),
+        "missing_keywords": score_result.get("missing_keywords", []),
+    }
+
+    ai_data["job_scores"] = job_scores
+    return ai_data
+
+
 def get_candidate_or_404(supabase, candidate_id: UUID) -> dict:
     resp = (
         supabase.table("candidates")
@@ -181,11 +214,8 @@ async def list_candidates(
         job_resp = supabase.table("jobs").select("category").eq("id", str(job_id)).execute()
         job_category = job_resp.data[0].get("category") if job_resp.data else None
         
-        # 2. Fetch active job IDs to determine if candidate's current job is active
-        active_jobs_resp = supabase.table("jobs").select("id").eq("is_active", True).execute()
-        active_job_ids = {j["id"] for j in active_jobs_resp.data or []}
-        
-        # 3. Fetch all completed candidates (or we can fetch all candidates)
+        # 2. Fetch the talent pool. A candidate can be recommended for many jobs;
+        # job_id is only a legacy/default match, not an exclusivity constraint.
         candidates_resp = supabase.table("candidates").select("*").execute()
         all_candidates = candidates_resp.data or []
         
@@ -194,33 +224,20 @@ async def list_candidates(
         filtered = []
         for c in all_candidates:
             c_job_id = c.get("job_id")
-            c_status = c.get("status")
-            
             # Direct match
             if c_job_id == str(job_id):
                 filtered.append(c)
                 continue
                 
-            # Compatibility match for early stage/unassigned candidates
+            # Compatibility match across the whole CV database.
             if is_candidate_compatible_with_job(c.get("domain"), job_category):
-                is_available = (
-                    not c_job_id
-                    or c_job_id not in active_job_ids
-                    or c_status in ["applied", "screening"]
-                )
-                if is_available:
-                    filtered.append(c)
+                filtered.append(c)
         
         # Override scores for the requested job
         str_job_id = str(job_id)
         import json
         for c in filtered:
-            ai_data = c.get("ai_extracted_data") or {}
-            if isinstance(ai_data, str):
-                try:
-                    ai_data = json.loads(ai_data)
-                except Exception:
-                    ai_data = {}
+            ai_data = parse_ai_data(c)
             
             job_scores = ai_data.get("job_scores") or {}
             if str_job_id in job_scores:
@@ -356,11 +373,7 @@ async def score_candidate_against_job(
         )
 
         supabase.table("candidates").update({
-            "score":            score_result["score"],
-            "dimension_scores": score_result["dimension_scores"],
-            "score_confidence": score_result.get("confidence"),
-            "score_reasoning":  score_result.get("reasoning"),
-            "job_id":           str(job_id),
+            "ai_extracted_data": store_job_score(candidate, str(job_id), score_result),
         }).eq("id", str(candidate_id)).execute()
 
         logger.info("Score calculated for candidate %s vs job %s", candidate_id, job_id)
@@ -371,6 +384,40 @@ async def score_candidate_against_job(
     except Exception as exc:
         logger.error("Scoring failed for candidate %s: %s", candidate_id, exc)
         raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}")
+
+
+@router.get("/{candidate_id}/cv-url")
+async def get_candidate_cv_url(
+    candidate_id: UUID,
+    user: dict = Depends(get_current_user),
+):
+    supabase = get_supabase_admin()
+    candidate = get_candidate_or_404(supabase, candidate_id)
+    cv_file_url = candidate.get("cv_file_url")
+
+    if not cv_file_url:
+        raise HTTPException(status_code=404, detail="CV not found")
+
+    if isinstance(cv_file_url, str) and cv_file_url.startswith("http"):
+        return {"url": cv_file_url}
+
+    storage_path = (
+        str(cv_file_url)
+        .replace("/storage/v1/object/public/cvs/", "")
+        .replace("cvs/", "", 1)
+        .lstrip("/")
+    )
+
+    try:
+        signed = supabase.storage.from_("cvs").create_signed_url(storage_path, 60 * 10)
+        signed_url = signed.get("signedURL") or signed.get("signedUrl") or signed.get("url")
+        if signed_url:
+            return {"url": signed_url}
+    except Exception as exc:
+        logger.warning("Signed CV URL failed for candidate %s: %s", candidate_id, exc)
+
+    public_url = supabase.storage.from_("cvs").get_public_url(storage_path)
+    return {"url": public_url}
 
 
 # ============================================================================

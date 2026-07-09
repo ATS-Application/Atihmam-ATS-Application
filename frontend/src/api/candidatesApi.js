@@ -8,6 +8,9 @@ export const getCandidates = (params) =>
 export const getCandidate = (id) =>
   axiosClient.get(`/candidates/${id}`);
 
+export const getCandidateCVUrl = (id) =>
+  axiosClient.get(`/candidates/${id}/cv-url`);
+
 export const createCandidate = (data) =>
   axiosClient.post("/candidates", data);
 

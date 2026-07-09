@@ -68,8 +68,7 @@ export default function CandidateList() {
         c.email?.toLowerCase().includes(q) ||
         c.current_position?.toLowerCase().includes(q) ||
         (c.skills ?? []).some((s) => s.toLowerCase().includes(q));
-      const matchesJob = !jobFilter || c.job_id === jobFilter;
-      return matchesSearch && matchesJob;
+      return matchesSearch;
     })
     .sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
 
