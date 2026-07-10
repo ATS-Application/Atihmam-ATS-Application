@@ -17,7 +17,15 @@ const COLUMNS = [
 export default function KanbanBoard({ candidates = [], filterJobId = null }) {
   const navigate = useNavigate();
 
-  const visible = candidates;
+  const visible = filterJobId
+    ? candidates.filter((c) => {
+        const isLegacyMatch = c.job_id === filterJobId;
+        const aiData = c.ai_extracted_data || {};
+        const jobScores = aiData.job_scores || {};
+        const hasJobScore = Object.keys(jobScores).includes(filterJobId);
+        return isLegacyMatch || hasJobScore;
+      })
+    : candidates;
 
   const byStatus = (status) => visible.filter((c) => c.status === status);
   const rejected = byStatus("rejected");

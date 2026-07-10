@@ -41,7 +41,12 @@ export default function DriveImportModal({ onClose }) {
   const progress = total > 0 ? Math.round(((total - remaining) / total) * 100) : 0;
 
   const handleStart = () => {
-    triggerIngest();
+    qc.setQueryData(["driveIngestStatus"], (old) => old ? { ...old, status: "processing" } : { status: "processing" });
+    triggerIngest(null, {
+      onSuccess: () => {
+        qc.invalidateQueries({ queryKey: ["driveIngestStatus"] });
+      }
+    });
   };
 
   const formatTime = (date) => {
@@ -161,17 +166,20 @@ export default function DriveImportModal({ onClose }) {
                 </div>
               </div>
 
-              {(!isActive && !isDone) && (
-                 <div className="flex justify-center pt-4">
-                   <button
-                     onClick={handleStart}
-                     disabled={isIngesting}
-                     className="px-5 py-2 bg-blue-600 text-white text-sm font-medium rounded-xl hover:bg-blue-700 transition-colors disabled:opacity-50"
-                   >
-                     Relancer l'importation
-                   </button>
-                 </div>
-              )}
+              {/* Action buttons */}
+              <div className="flex justify-center gap-3 pt-2">
+                {/* Re-run button — always visible once a run has ended */}
+                {(isDone || isStopped || hasError) && (
+                  <button
+                    onClick={handleStart}
+                    disabled={isIngesting}
+                    className="px-5 py-2 bg-blue-600 text-white text-sm font-medium rounded-xl hover:bg-blue-700 transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {isIngesting ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                    Nouvelle importation
+                  </button>
+                )}
+              </div>
             </>
           )}
 

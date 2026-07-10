@@ -366,7 +366,12 @@ def process_cv(
                 )
                 if best_result:
                     score_result = best_result
-                    job_id       = best_job_id
+                    # NOTE: do NOT write best_job_id to the job_id DB column.
+                    # The score is stored in ai_extracted_data.job_scores[best_job_id]
+                    # so the candidate stays in the global talent pool and can be matched
+                    # against any job. Pass best_job_id only to build_candidate_payload
+                    # so it stores the score in job_scores.
+                    job_id = best_job_id   # used only for job_scores, NOT for DB FK
 
         # Fallback: no job linked and no active jobs
         if not score_result:

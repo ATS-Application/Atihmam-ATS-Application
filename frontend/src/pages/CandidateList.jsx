@@ -34,24 +34,35 @@ const STATUS_OPTIONS = [
 export default function CandidateList() {
   const navigate = useNavigate();
 
-  const [search,          setSearch]          = useState("");
-  const [statusFilter,    setStatusFilter]    = useState("");
-  const [searchParams]                        = useSearchParams();
-  const [jobFilter,       setJobFilter]       = useState(searchParams.get("job") ?? ""); 
-  const [showUpload,      setShowUpload]      = useState(false);
-  const [showAIModal,     setShowAIModal]     = useState(false);
-  const [showDriveModal,    setShowDriveModal]    = useState(false);
-  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [search,             setSearch]             = useState("");
+  const [statusFilter,       setStatusFilter]       = useState("");
+  const [searchParams,       setSearchParams]       = useSearchParams();
+  const [showUpload,         setShowUpload]         = useState(false);
+  const [showAIModal,        setShowAIModal]        = useState(false);
+  const [showDriveModal,     setShowDriveModal]     = useState(false);
+  const [showDeleteModal,    setShowDeleteModal]    = useState(false);
   const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
-  const [candidateToDelete, setCandidateToDelete] = useState(null);
-  const [ minScore, setMinScore ] = useState(0);
+  const [candidateToDelete,  setCandidateToDelete]  = useState(null);
+  const [minScore,           setMinScore]           = useState(0);
+
+  // jobFilter is derived directly from the URL so navigation from JobList always works
+  const jobFilter = searchParams.get("job") ?? "";
+
+  const setJobFilter = (val) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (val) next.set("job", val);
+      else next.delete("job");
+      return next;
+    });
+  };
 
   const { data: candidates = [], isLoading } = useCandidates(
     Object.fromEntries(
       Object.entries({
         ...(statusFilter && { status: statusFilter }),
         ...(jobFilter    && { job_id: jobFilter }),
-        ...(minScore    && { min_score: minScore }),
+        ...(minScore     && { min_score: minScore }),
       })
     )
   );
@@ -104,6 +115,7 @@ export default function CandidateList() {
   };
 
   const hasFilters = search || statusFilter || jobFilter || minScore > 0;
+
 
   return (
     <div className="p-6 lg:p-8 bg-gray-50 min-h-screen">

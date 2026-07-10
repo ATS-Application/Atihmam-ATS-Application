@@ -386,7 +386,7 @@ export default function Dashboard() {
                     key={job.id}
                     job={job}
                     isActive={activeJob?.id === job.id}
-                    candidateCount={candidates.filter((c) => c.job_id === job.id).length}
+                    candidateCount={job.candidate_count ?? 0}
                     onClick={() => handleJobClick(job)}
                   />
                 ))}

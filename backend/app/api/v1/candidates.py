@@ -205,53 +205,62 @@ async def list_candidates(
     job_id: UUID | None = Query(None),
     status_filter: str | None = Query(default=None, alias="status"),
     min_score: float = Query(default=0),
-    user: dict = Depends(get_current_user),
 ):
-    supabase = get_supabase()
+    from app.db.supabase_client import get_supabase_admin
+    supabase = get_supabase_admin()
     
     if job_id:
-        # 1. Fetch job to get category
-        job_resp = supabase.table("jobs").select("category").eq("id", str(job_id)).execute()
-        job_category = job_resp.data[0].get("category") if job_resp.data else None
+        # 1. Fetch job metadata (category/domain) for domain-compatibility matching
+        job_resp = supabase.table("jobs").select("category, domain").eq("id", str(job_id)).execute()
+        job_row = job_resp.data[0] if job_resp.data else {}
+        # Use category if set, otherwise fall back to domain (both represent the same concept)
+        job_category = job_row.get("category") or job_row.get("domain") or None
         
-        # 2. Fetch the talent pool. A candidate can be recommended for many jobs;
-        # job_id is only a legacy/default match, not an exclusivity constraint.
+        # 2. Fetch all candidates from the talent pool
         candidates_resp = supabase.table("candidates").select("*").execute()
         all_candidates = candidates_resp.data or []
         
         from app.tasks.auto_scoring import is_candidate_compatible_with_job
+        import json as _json
         
-        filtered = []
-        for c in all_candidates:
-            c_job_id = c.get("job_id")
-            # Direct match
-            if c_job_id == str(job_id):
-                filtered.append(c)
-                continue
-                
-            # Compatibility match across the whole CV database.
-            if is_candidate_compatible_with_job(c.get("domain"), job_category):
-                filtered.append(c)
-        
-        # Override scores for the requested job
         str_job_id = str(job_id)
-        import json
-        for c in filtered:
+        filtered = []
+        seen_ids = set()
+
+        for c in all_candidates:
+            cid = c.get("id")
+            if cid in seen_ids:
+                continue
+
             ai_data = parse_ai_data(c)
-            
             job_scores = ai_data.get("job_scores") or {}
-            if str_job_id in job_scores:
-                js = job_scores[str_job_id]
-                c["score"] = js.get("score", c.get("score"))
-                dims = js.get("dimension_scores")
-                if dims:
-                    c["dimension_scores"] = dims
-                    for k, v in dims.items():
-                        c[k] = v
-                c["score_confidence"] = js.get("score_confidence", c.get("score_confidence"))
-                c["score_reasoning"] = js.get("score_reasoning", c.get("score_reasoning"))
-                c["matched_keywords"] = js.get("matched_keywords", c.get("matched_keywords"))
-                c["missing_keywords"] = js.get("missing_keywords", c.get("missing_keywords"))
+
+            # Rule 1: candidate has been explicitly scored against this job (primary)
+            has_job_score = str_job_id in job_scores
+
+            # Rule 2: candidate's domain is compatible with the job's category (talent pool)
+            is_compatible = is_candidate_compatible_with_job(c.get("domain"), job_category)
+
+            # Rule 3: legacy FK match (candidate was imported before talent-pool model)
+            is_legacy_match = c.get("job_id") == str_job_id
+
+            if has_job_score or is_compatible or is_legacy_match:
+                # Override score fields with this job's specific score data
+                if has_job_score:
+                    js = job_scores[str_job_id]
+                    c["score"] = js.get("score", c.get("score"))
+                    dims = js.get("dimension_scores")
+                    if dims:
+                        c["dimension_scores"] = dims
+                        for k, v in dims.items():
+                            c[k] = v
+                    c["score_confidence"] = js.get("score_confidence", c.get("score_confidence"))
+                    c["score_reasoning"] = js.get("score_reasoning", c.get("score_reasoning"))
+                    c["matched_keywords"] = js.get("matched_keywords", c.get("matched_keywords"))
+                    c["missing_keywords"] = js.get("missing_keywords", c.get("missing_keywords"))
+
+                filtered.append(c)
+                seen_ids.add(cid)
                 
         # Filter by status if requested
         if status_filter:
@@ -261,9 +270,12 @@ async def list_candidates(
         if min_score > 0:
             filtered = [c for c in filtered if (c.get("score") or 0) >= min_score]
             
-        # Sort by score descending
+        # Sort by score descending (unscored candidates go to the bottom)
         filtered.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
         candidates = filtered
+        
+        with open("diag_candidates.log", "a") as f:
+            f.write(f"job_id: {job_id}, min_score: {min_score}, returned: {len(candidates)}\n")
     else:
         query = supabase.table("candidates").select("*")
         if status_filter:

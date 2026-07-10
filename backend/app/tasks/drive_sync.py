@@ -245,12 +245,9 @@ def record_failed_drive_candidate(
             "processing_error": error_message[:500],
             "status": "applied",
         }
-        if job_id:
-            from uuid import UUID
-            try:
-                payload["job_id"] = str(UUID(job_id))
-            except ValueError:
-                pass
+        # NOTE: job_id is intentionally NOT written to the candidates table.
+        # Scores are stored exclusively in ai_extracted_data.job_scores so that
+        # a candidate remains in the global talent pool and is not locked to one job.
         supabase.table("candidates").insert(payload).execute()
         return {
             "status": "failed",

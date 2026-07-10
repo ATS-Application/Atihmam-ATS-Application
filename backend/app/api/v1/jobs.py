@@ -44,7 +44,7 @@ async def list_jobs(user: dict = Depends(get_current_user)):
     response = (
         supabase
         .table("jobs")
-        .select("*, candidates(count)")   # Supabase embeds FK count
+        .select("*")
         .eq("is_active", True)
         .order("created_at", desc=True)
         .execute()
@@ -52,10 +52,47 @@ async def list_jobs(user: dict = Depends(get_current_user)):
 
     jobs = response.data or []
 
+    # Count candidates who have a score entry for each job in ai_extracted_data.job_scores.
+    # This reflects the real talent-pool size for a job, regardless of the job_id FK column.
+    # We also include candidates whose job_id FK still points to this job (legacy records).
+    import json as _json
     for job in jobs:
-        # Supabase returns [{"count": N}] for embedded counts
-        count_embed = job.pop("candidates", [])
-        job["candidate_count"] = count_embed[0]["count"] if count_embed else 0
+        job_id_str = str(job["id"])
+
+        try:
+            # Stratégie 1: candidats scorés pour ce job via JSONB containment.
+            # On vérifie si la clé job_id_str existe dans ai_extracted_data -> job_scores
+            scored_resp = (
+                supabase
+                .table("candidates")
+                .select("id", count="exact")
+                .filter(
+                    "ai_extracted_data",
+                    "cs",
+                    _json.dumps({"job_scores": {job_id_str: {}}})
+                )
+                .execute()
+            )
+            scored_count = scored_resp.count if scored_resp.count is not None else 0
+        except Exception:
+            scored_count = 0
+
+        try:
+            # Stratégie 2: legacy candidates dont le job_id FK correspond au job
+            legacy_resp = (
+                supabase
+                .table("candidates")
+                .select("id", count="exact")
+                .eq("job_id", job_id_str)
+                .execute()
+            )
+            legacy_count = legacy_resp.count if legacy_resp.count is not None else 0
+        except Exception:
+            legacy_count = 0
+
+        # Somme ou maximum des deux (en évitant le double comptage si déjà dans job_scores)
+        job["candidate_count"] = max(scored_count, legacy_count)
+
         job["screening_questions"] = safe_screening_questions(
             job.get("screening_questions")
         )
