@@ -12,5 +12,6 @@ __pycache__/
 backend/.hf-cache/
 
 # Virtual environments
+.venv
 .venv/
 venv/
