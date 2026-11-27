@@ -1,4 +1,5 @@
 .env
+.env.example
 token.json
 oauth_credentials.json
 oauth_credentials.json.json
